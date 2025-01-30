@@ -39,6 +39,10 @@ public interface FileScanTask extends ContentScanTask<DataFile>, SplittableScanT
     return length() + deletes().stream().mapToLong(ContentFile::fileSizeInBytes).sum();
   }
 
+  default long rowsCount() {
+    return length() + deletes().stream().mapToLong(ContentFile::recordCount).sum();
+  }
+
   @Override
   default int filesCount() {
     return 1 + deletes().size();
