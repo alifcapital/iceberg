@@ -50,22 +50,21 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
 
 
   /**
- * The threshold for the minimum number of rows that a deleted data file must have to be considered for rewriting.
+ * The threshold for the minimum number of deleted rows that a data file must have to be considered for rewriting.
  * If a data file has a row count greater than or equal to the specified threshold, the file will be considered
  * for rewriting regardless of other size or delete-based criteria.
  *
- * <p>This property allows for controlling the rewrite of files based on row count, which can be useful when 
+ * <p>This property allows for controlling the rewrite of files based on deleted row count, which can be useful when 
  * the size of a file isn't the sole criterion, and large files with excessive rows should also be rewritten
  * for performance reasons or other optimization goals.
  *
  * <p>Defaults to 0, meaning this feature is disabled unless a specific threshold is set.
  */
-  public static final String ROW_COUNT_THRESHOLD = "row-count-threshold";
+  public static final String DELETED_ROW_COUNT_THRESHOLD = "row-count-threshold";
   
-  public static final int ROW_COUNT_THRESHOLD_DEFAULT = 0;
+  public static final int DELETED_ROW_COUNT_THRESHOLD_DEFAULT = 0;
   
-  private int rowCountThreshold;
-
+  private int deletedRowCountThreshold;
 
   protected SizeBasedDataRewriter(Table table) {
     super(table);
@@ -76,7 +75,7 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
     return ImmutableSet.<String>builder()
         .addAll(super.validOptions())
         .add(DELETE_FILE_THRESHOLD)
-        .add(ROW_COUNT_THRESHOLD)
+        .add(DELETED_ROW_COUNT_THRESHOLD)
         .build();
   }
 
@@ -84,16 +83,16 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
   public void init(Map<String, String> options) {
     super.init(options);
     this.deleteFileThreshold = deleteFileThreshold(options);
-    this.rowCountThreshold = rowCountThreshold(options);
+    this.deletedRowCountThreshold = deletedRowCountThreshold(options);
   }
 
   @Override
   protected Iterable<FileScanTask> filterFiles(Iterable<FileScanTask> tasks) {
-    return Iterables.filter(tasks, task -> wronglySized(task) || tooManyDeletes(task) || tooManyRows(task));
+    return Iterables.filter(tasks, task -> wronglySized(task) || tooManyDeletes(task) || tooManyDeletedRows(task) || exceedsDeleteRowRatio(task));
   }
 
-  private boolean tooManyRows(FileScanTask task) {
-    return task.rowsCount() >= rowCountThreshold;
+  private boolean tooManyDeletedRows(FileScanTask task) {
+    return task.deletedRowCount >= deletedRowCountThreshold;
   }
 
   private boolean tooManyDeletes(FileScanTask task) {
@@ -110,11 +109,11 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
         || enoughContent(group)
         || tooMuchContent(group)
         || anyTaskHasTooManyDeletes(group)
-        || anyTaskHasTooManyRows(group);
+        || anyTaskHasTooManyDeletedRows(group);
   }
 
-  private boolean anyTaskHasTooManyRows(List<FileScanTask> group) {
-    return group.stream().anyMatch(this::tooManyRows);
+  private boolean anyTaskHasTooManyDeletedRows(List<FileScanTask> group) {
+    return group.stream().anyMatch(this::tooManyDeletedRows);
   }
 
   private boolean anyTaskHasTooManyDeletes(List<FileScanTask> group) {
@@ -137,7 +136,7 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
     return value;
   }
 
-  private int rowCountThreshold(Map<String, String> options) {
+  private int deletedRowCountThreshold(Map<String, String> options) {
     int value =
         PropertyUtil.propertyAsInt(options, ROW_COUNT_THRESHOLD, ROW_COUNT_THRESHOLD_DEFAULT);
     Preconditions.checkArgument(
