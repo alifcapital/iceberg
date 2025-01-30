@@ -138,9 +138,9 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
 
   private int deletedRowCountThreshold(Map<String, String> options) {
     int value =
-        PropertyUtil.propertyAsInt(options, ROW_COUNT_THRESHOLD, ROW_COUNT_THRESHOLD_DEFAULT);
+        PropertyUtil.propertyAsInt(options, DELETED_ROW_COUNT_THRESHOLD, DELETED_ROW_COUNT_THRESHOLD_DEFAULT);
     Preconditions.checkArgument(
-        value >= 0, "'%s' is set to %s but must be >= 0", ROW_COUNT_THRESHOLD, value);
+        value >= 0, "'%s' is set to %s but must be >= 0", DELETED_ROW_COUNT_THRESHOLD, value);
     return value;
   }
 }
