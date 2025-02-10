@@ -45,6 +45,22 @@ public interface RewriteDataFiles
   boolean PARTIAL_PROGRESS_ENABLED_DEFAULT = false;
 
   /**
+   * The threshold for the minimum number of deleted rows that a data file must have to be considered for rewriting.
+   * Defaults to 0, meaning this feature is disabled unless a specific threshold is set.
+   */
+  String DELETED_ROW_COUNT_THRESHOLD = "row-count-threshold";
+
+  int DELETED_ROW_COUNT_THRESHOLD_DEFAULT = 0;
+
+  /**
+   * The threshold for the ratio of deleted rows to total rows in a data file.
+   * Defaults to 0.05 (5%).
+   */
+  String DELETE_ROW_RATIO = "delete-row-ratio";
+
+  double DELETE_ROW_RATIO_DEFAULT = 0.05;
+
+  /**
    * The maximum amount of Iceberg commits that this rewrite is allowed to produce if partial
    * progress is enabled. This setting has no effect if partial progress is disabled.
    */
