@@ -111,7 +111,7 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
   protected Iterable<FileScanTask> filterFiles(Iterable<FileScanTask> tasks) {
     return Iterables.filter(tasks, task -> wronglySized(task)
         || tooManyDeletes(task)
-        || tooManyRows(task)
+        || tooManyDeletedRows(task)
         || exceedsDeleteRowRatio(task));
   }
 
@@ -124,7 +124,7 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
    * @return true if the file has a delete-to-row ratio greater than or equal to the threshold
    */
   private boolean exceedsDeleteRowRatio(FileScanTask task) {
-    long totalRows = task.recordCount();
+    long totalRows = task.file().recordCount();
     long deletedRows = task.deletedRowCount();
     return totalRows > 0 && ((double) deletedRows / totalRows) >= deleteRowRatio;
   }
