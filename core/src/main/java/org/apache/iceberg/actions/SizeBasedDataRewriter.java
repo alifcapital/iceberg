@@ -62,7 +62,7 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
  */
   public static final String DELETED_ROW_COUNT_THRESHOLD = "row-count-threshold";
   
-  public static final int DELETED_ROW_COUNT_THRESHOLD_DEFAULT = 0;
+  public static final int DELETED_ROW_COUNT_THRESHOLD_DEFAULT = Integer.MAX_VALUE;
   
   private int deletedRowCountThreshold;
 
@@ -80,7 +80,7 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
    */
   public static final String DELETE_ROW_RATIO = "delete-row-ratio";
   
-  public static final double DELETE_ROW_RATIO_DEFAULT = 0.05;
+  public static final double DELETE_ROW_RATIO_DEFAULT = 1;
 
   private double deleteRowRatio;
 
@@ -126,10 +126,16 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
   private boolean exceedsDeleteRowRatio(FileScanTask task) {
     long totalRows = task.file().recordCount();
     long deletedRows = task.deletedRowCount();
+    System.out.println(String.format(
+            "Checking delete row ratio: file=%s, totalRows=%d, deletedRows=%d, ratio=%.4f, threshold=%.2f, exceeds=%b"
     return totalRows > 0 && ((double) deletedRows / totalRows) >= deleteRowRatio;
   }
 
   private boolean tooManyDeletedRows(FileScanTask task) {
+    System.out.println(String.format(
+            "Checking deleted rows: file=%s, deletedRows=%d, threshold=%d, exceeds=%b",
+            task.file().path(), deletedRows, deletedRowCountThreshold, result
+    ));
     return task.deletedRowCount() >= deletedRowCountThreshold;
   }
 

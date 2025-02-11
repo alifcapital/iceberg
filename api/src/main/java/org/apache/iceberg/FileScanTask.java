@@ -40,7 +40,7 @@ public interface FileScanTask extends ContentScanTask<DataFile>, SplittableScanT
   }
 
   default long deletedRowCount() {
-    return deletes().stream().mapToLong(ContentFile::recordCount).sum();
+    return deletes() == null ? 0 : deletes().stream().mapToLong(ContentFile::recordCount).sum();
   }
 
   @Override
