@@ -126,9 +126,15 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
   private boolean exceedsDeleteRowRatio(FileScanTask task) {
     long totalRows = task.file().recordCount();
     long deletedRows = task.deletedRowCount();
+    double ratio = (totalRows > 0) ? (double) deletedRows / totalRows : 0;
+    boolean result = ratio >= deleteRowRatio;
+
     System.out.println(String.format(
-            "Checking delete row ratio: file=%s, totalRows=%d, deletedRows=%d, ratio=%.4f, threshold=%.2f, exceeds=%b"
-    return totalRows > 0 && ((double) deletedRows / totalRows) >= deleteRowRatio;
+            "Checking delete row ratio: file=%s, totalRows=%d, deletedRows=%d, ratio=%.4f, threshold=%.2f, exceeds=%b",
+            task.file().path(), totalRows, deletedRows, ratio, deleteRowRatio, result
+    ));
+
+    return result;
   }
 
   private boolean tooManyDeletedRows(FileScanTask task) {
