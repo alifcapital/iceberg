@@ -138,12 +138,18 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
   }
 
   private boolean tooManyDeletedRows(FileScanTask task) {
+    long deletedRows = task.deletedRowCount();  // Считываем количество удаленных строк
+    boolean result = deletedRows >= deletedRowCountThreshold;  // Проверка на превышение порога
+
+    // Логирование
     System.out.println(String.format(
             "Checking deleted rows: file=%s, deletedRows=%d, threshold=%d, exceeds=%b",
             task.file().path(), deletedRows, deletedRowCountThreshold, result
     ));
-    return task.deletedRowCount() >= deletedRowCountThreshold;
+
+    return result;
   }
+
 
   private boolean tooManyDeletes(FileScanTask task) {
     return task.deletes() != null && task.deletes().size() >= deleteFileThreshold;
