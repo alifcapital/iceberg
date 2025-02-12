@@ -75,7 +75,6 @@ public class RewriteDataFilesSparkAction
   private static final Set<String> VALID_OPTIONS =
       ImmutableSet.of(
           MAX_CONCURRENT_FILE_GROUP_REWRITES,
-          DELETED_ROW_COUNT_THRESHOLD,
           MAX_FILE_GROUP_SIZE_BYTES,
           PARTIAL_PROGRESS_ENABLED,
           PARTIAL_PROGRESS_MAX_COMMITS,
