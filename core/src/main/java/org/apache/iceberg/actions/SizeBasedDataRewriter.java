@@ -60,29 +60,11 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
  *
  * <p>Defaults to 0, meaning this feature is disabled unless a specific threshold is set.
  */
-  public static final String DELETED_ROW_COUNT_THRESHOLD = "row-count-threshold";
+  public static final String DELETED_ROW_COUNT_THRESHOLD = "deleted-row-count-threshold";
   
   public static final int DELETED_ROW_COUNT_THRESHOLD_DEFAULT = Integer.MAX_VALUE;
   
   private int deletedRowCountThreshold;
-
-
-    /**
-   * The threshold for the ratio of deleted rows to total rows in a data file. This ratio is used
-   * to determine if a file should be considered for rewriting based on the proportion of deleted rows
-   * relative to the total number of rows in the file.
-   * <p>
-   * The value of this ratio should be between 0 and 1 (inclusive). If the ratio exceeds this threshold,
-   * the file will be flagged for rewriting.
-   * 
-   * <p>Defaults to 0.05, which means that files with more than 5% of their rows deleted will be considered
-   * for rewriting.
-   */
-  public static final String DELETE_ROW_RATIO = "delete-row-ratio";
-  
-  public static final double DELETE_ROW_RATIO_DEFAULT = 1;
-
-  private double deleteRowRatio;
 
 
   protected SizeBasedDataRewriter(Table table) {
@@ -95,7 +77,6 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
         .addAll(super.validOptions())
         .add(DELETE_FILE_THRESHOLD)
         .add(DELETED_ROW_COUNT_THRESHOLD)
-        .add(DELETE_ROW_RATIO)
         .build();
   }
 
@@ -104,44 +85,19 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
     super.init(options);
     this.deleteFileThreshold = deleteFileThreshold(options);
     this.deletedRowCountThreshold = deletedRowCountThreshold(options);
-    this.deleteRowRatio = deleteRowRatio(options);
   }
 
   @Override
   protected Iterable<FileScanTask> filterFiles(Iterable<FileScanTask> tasks) {
     return Iterables.filter(tasks, task -> wronglySized(task)
         || tooManyDeletes(task)
-        || tooManyDeletedRows(task)
-        || exceedsDeleteRowRatio(task));
-  }
-
-  /**
-   * Checks if the ratio of deleted rows to total rows in the given file exceeds the threshold 
-   * defined by {@link #DELETE_ROW_RATIO}. A file will be flagged for rewriting if the ratio 
-   * exceeds this threshold.
-   * 
-   * @param task the file scan task representing the data file
-   * @return true if the file has a delete-to-row ratio greater than or equal to the threshold
-   */
-  private boolean exceedsDeleteRowRatio(FileScanTask task) {
-    long totalRows = task.file().recordCount();
-    long deletedRows = task.deletedRowCount();
-    double ratio = (totalRows > 0) ? (double) deletedRows / totalRows : 0;
-    boolean result = ratio >= deleteRowRatio;
-
-    System.out.println(String.format(
-            "Checking delete row ratio: file=%s, totalRows=%d, deletedRows=%d, ratio=%.4f, threshold=%.2f, exceeds=%b",
-            task.file().path(), totalRows, deletedRows, ratio, deleteRowRatio, result
-    ));
-
-    return result;
+        || tooManyDeletedRows(task);
   }
 
   private boolean tooManyDeletedRows(FileScanTask task) {
-    long deletedRows = task.deletedRowCount();  // Считываем количество удаленных строк
-    boolean result = deletedRows >= deletedRowCountThreshold;  // Проверка на превышение порога
+    long deletedRows = task.deletedRowCount();
+    boolean result = deletedRows >= deletedRowCountThreshold;
 
-    // Логирование
     System.out.println(String.format(
             "Checking deleted rows: file=%s, deletedRows=%d, threshold=%d, exceeds=%b",
             task.file().path(), deletedRows, deletedRowCountThreshold, result
@@ -165,7 +121,6 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
         || enoughContent(group)
         || tooMuchContent(group)
         || anyTaskHasTooManyDeletes(group)
-        || anyTaskExceedsDeleteRowRatio(group)
         || anyTaskHasTooManyDeletedRows(group);
   }
 
@@ -175,10 +130,6 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
 
   private boolean anyTaskHasTooManyDeletes(List<FileScanTask> group) {
     return group.stream().anyMatch(this::tooManyDeletes);
-  }
-
-    private boolean anyTaskExceedsDeleteRowRatio(List<FileScanTask> group) {
-    return group.stream().anyMatch(this::exceedsDeleteRowRatio);
   }
 
   @Override
@@ -202,14 +153,6 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
         PropertyUtil.propertyAsInt(options, DELETED_ROW_COUNT_THRESHOLD, DELETED_ROW_COUNT_THRESHOLD_DEFAULT);
     Preconditions.checkArgument(
         value >= 0, "'%s' is set to %s but must be >= 0", DELETED_ROW_COUNT_THRESHOLD, value);
-    return value;
-  }
-
-    private double deleteRowRatio(Map<String, String> options) {
-    double value =
-        PropertyUtil.propertyAsDouble(options, DELETE_ROW_RATIO, DELETE_ROW_RATIO_DEFAULT);
-    Preconditions.checkArgument(
-        value >= 0 && value <= 1, "'%s' is set to %s but must be between 0 and 1", DELETE_ROW_RATIO, value);
     return value;
   }
 }
