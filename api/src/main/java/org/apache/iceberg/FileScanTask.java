@@ -40,7 +40,33 @@ public interface FileScanTask extends ContentScanTask<DataFile>, SplittableScanT
   }
 
   default long deletedRowCount() {
-    return deletes() == null ? 0 : deletes().stream().mapToLong(ContentFile::recordCount).sum();
+    long dataRows = 0;
+    long positionDeletesRows = 0;
+    long equalityDeletesRows = 0;
+
+    for (DeleteFile deleteFile : deletes()) {
+      switch (deleteFile.content()) {
+        case DATA:
+          dataRows += deleteFile.recordCount();
+          break;
+        case POSITION_DELETES:
+          positionDeletesRows += deleteFile.recordCount();
+          break;
+        case EQUALITY_DELETES:
+          equalityDeletesRows += deleteFile.recordCount();
+          break;
+        default:
+          break;
+      }
+    }
+
+    System.out.println(String.format(
+            "Deleted rows by content type: DATA=%d, POSITION_DELETES=%d, EQUALITY_DELETES=%d",
+            dataRows, positionDeletesRows, equalityDeletesRows
+    ));
+
+    // equalityDeletesRows * 10, because it's more resource-intensive to find equalityDeletesRows than positionDeletesRows.
+    return dataRows + positionDeletesRows + (equalityDeletesRows * 10);
   }
 
   @Override
