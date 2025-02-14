@@ -18,7 +18,9 @@
  */
 package org.apache.iceberg;
 
+import org.apache.iceberg.FileContent;
 import java.util.List;
+
 
 /** A scan task over a range of bytes in a single data file. */
 public interface FileScanTask extends ContentScanTask<DataFile>, SplittableScanTask<FileScanTask> {
@@ -39,34 +41,24 @@ public interface FileScanTask extends ContentScanTask<DataFile>, SplittableScanT
     return length() + deletes().stream().mapToLong(ContentFile::fileSizeInBytes).sum();
   }
 
-  default long deletedRowCount() {
-    long dataRows = 0;
-    long positionDeletesRows = 0;
-    long equalityDeletesRows = 0;
-
-    for (DeleteFile deleteFile : deletes()) {
-      switch (deleteFile.content()) {
-        case DATA:
-          dataRows += deleteFile.recordCount();
-          break;
-        case POSITION_DELETES:
-          positionDeletesRows += deleteFile.recordCount();
-          break;
-        case EQUALITY_DELETES:
-          equalityDeletesRows += deleteFile.recordCount();
-          break;
-        default:
-          break;
+  default long positionDeleteCount() {
+      long positionDeletesRows = 0;
+      for (DeleteFile deleteFile : deletes()) {
+          if (deleteFile.content() == FileContent.POSITION_DELETES) {
+              positionDeletesRows += deleteFile.recordCount();
+          }
       }
-    }
+      return positionDeletesRows;
+  }
 
-    System.out.println(String.format(
-            "Deleted rows by content type: DATA=%d, POSITION_DELETES=%d, EQUALITY_DELETES=%d",
-            dataRows, positionDeletesRows, equalityDeletesRows
-    ));
-
-    // equalityDeletesRows * 10, because it's more resource-intensive to find equalityDeletesRows than positionDeletesRows.
-    return dataRows + positionDeletesRows + (equalityDeletesRows * 10);
+  default long equalityDeleteCount() {
+      long equalityDeletesRows = 0;
+      for (DeleteFile deleteFile : deletes()) {
+          if (deleteFile.content() == FileContent.EQUALITY_DELETES) {
+              equalityDeletesRows += deleteFile.recordCount();
+          }
+      }
+      return equalityDeletesRows;
   }
 
   @Override
