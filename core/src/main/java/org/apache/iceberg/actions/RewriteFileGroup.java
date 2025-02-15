@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.RewriteJobOrder;
 import org.apache.iceberg.actions.RewriteDataFiles.FileGroupInfo;
@@ -103,6 +104,14 @@ public class RewriteFileGroup {
     return numFilesWithDeletes() - numFiles();
   }
 
+  public long affectedEqualityDeleteRows() {
+      return fileScanTasks.stream()
+          .filter(task -> task.deletes().stream()
+              .anyMatch(f -> f.content() == FileContent.EQUALITY_DELETES))
+          .mapToLong(task -> task.file().recordCount())
+          .sum();
+  }
+
   public static Comparator<RewriteFileGroup> comparator(RewriteJobOrder rewriteJobOrder) {
     switch (rewriteJobOrder) {
       case BYTES_ASC:
@@ -115,6 +124,8 @@ public class RewriteFileGroup {
         return Comparator.comparing(RewriteFileGroup::numFiles, Comparator.reverseOrder());
       case DELETES_DESC:
         return Comparator.comparing(RewriteFileGroup::numFilesWithDeletes, Comparator.reverseOrder());
+      case AFFECTED_EQ_DELETE_ROWS_DESC:
+        return Comparator.comparing(RewriteFileGroup::affectedEqualityDeleteRows, Comparator.reverseOrder());
       default:
         return (fileGroupOne, fileGroupTwo) -> 0;
     }
