@@ -22,7 +22,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.DataFile;
-import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
@@ -100,16 +99,16 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
   }
 
   private boolean tooManyDeletedRows(FileScanTask task) {
-      // Calculate affected data records similar to the first snippet
-      long dataRecordCount = task.file().recordCount();
-      boolean hasEqDeletes = task.deletes().stream()
-          .anyMatch(f -> f.content() == FileContent.EQUALITY_DELETES);
+      long positionDeletes = task.positionDeleteCount();
+      long equalityDeletes = task.equalityDeleteCount();
 
-      long affectedRecords = hasEqDeletes ? dataRecordCount : 0;
+      // Equality deletes are 10x more resource-intensive
+      long totalWeightedDeletes = positionDeletes + (equalityDeletes * 10);
+      boolean exceedsThreshold = totalWeightedDeletes >= deletedRowCountThreshold;
 
-      boolean exceedsThreshold = affectedRecords >= deletedRowCountThreshold;
-      LOG.debug("Task affected records: file={}, affected_records={}, threshold={}, exceeds={}",
-          task.file().path(), affectedRecords, deletedRowCountThreshold, exceedsThreshold);
+      LOG.debug("Task delete counts: file={}, position_deletes={}, equality_deletes={}, weighted_total={}, threshold={}, exceeds={}",
+          task.file().path(), positionDeletes, equalityDeletes, totalWeightedDeletes, deletedRowCountThreshold, exceedsThreshold);
+
       return exceedsThreshold;
   }
 
@@ -131,17 +130,24 @@ public abstract class SizeBasedDataRewriter extends SizeBasedFileRewriter<FileSc
   }
 
   private boolean combinedTasksHasTooManyDeletedRows(List<FileScanTask> group) {
-      long affectedRecords = group.stream()
-          .filter(task -> task.deletes().stream()
-              .anyMatch(f -> f.content() == FileContent.EQUALITY_DELETES))
-          .mapToLong(task -> task.file().recordCount())
+      long totalPositionDeletes = group.stream()
+          .mapToLong(FileScanTask::positionDeleteCount)
           .sum();
 
-      boolean exceedsThreshold = affectedRecords >= deletedRowCountThreshold;
-      LOG.debug("Group affected records: affected_records={}, threshold={}, exceeds={}",
-          affectedRecords, deletedRowCountThreshold, exceedsThreshold);
+      long totalEqualityDeletes = group.stream()
+          .mapToLong(FileScanTask::equalityDeleteCount)
+          .sum();
+
+      // Equality deletes are 10x more resource-intensive
+      long totalWeightedDeletes = totalPositionDeletes + (totalEqualityDeletes * 10);
+      boolean exceedsThreshold = totalWeightedDeletes >= deletedRowCountThreshold;
+
+      LOG.debug("Group delete counts: position_deletes={}, equality_deletes={}, weighted_total={}, threshold={}, exceeds={}",
+          totalPositionDeletes, totalEqualityDeletes, totalWeightedDeletes, deletedRowCountThreshold, exceedsThreshold);
+
       return exceedsThreshold;
   }
+
   private boolean anyTaskHasTooManyDeletes(List<FileScanTask> group) {
     return group.stream().anyMatch(this::tooManyDeletes);
   }
