@@ -43,7 +43,6 @@ public enum RewriteJobOrder {
   FILES_ASC("files-asc"),
   FILES_DESC("files-desc"),
   DELETES_DESC("deletes-desc"),
-  AFFECTED_EQ_DELETE_ROWS_DESC("affected-eq-delete-rows-desc"),
   NONE("none");
 
   private final String orderName;
@@ -61,7 +60,7 @@ public enum RewriteJobOrder {
     // Replace the hyphen in order name with underscore to map to the enum value. For example:
     // bytes-asc to BYTES_ASC
     try {
-      return RewriteJobOrder.valueOf(orderName.replaceAll("-", "_").toUpperCase(Locale.ENGLISH));
+      return RewriteJobOrder.valueOf(orderName.replaceFirst("-", "_").toUpperCase(Locale.ENGLISH));
     } catch (IllegalArgumentException e) {
       throw new IllegalArgumentException(
           String.format("Invalid rewrite job order name: %s", orderName), e);
