@@ -86,6 +86,16 @@ public interface RewriteDataFiles
   long MAX_FILE_GROUP_SIZE_BYTES_DEFAULT = 1024L * 1024L * 1024L * 100L; // 100 Gigabytes
 
   /**
+   * The maximum number of files that should be included in a single file group during rewriting.
+   * This helps with breaking down the rewriting of partitions with many small files which may
+   * cause resource constraints when processed all at once. For example, when dealing with thousands
+   * of small files, processing them in smaller groups helps avoid memory pressure.
+   */
+  String MAX_FILE_GROUP_SIZE_NUM = "max-file-group-size-num";
+
+  int MAX_FILE_GROUP_SIZE_NUM_DEFAULT = 1000;
+
+  /**
    * The max number of file groups to be simultaneously rewritten by the rewrite strategy. The
    * structure and contents of the group is determined by the rewrite strategy. Each file group will
    * be rewritten independently and asynchronously.
