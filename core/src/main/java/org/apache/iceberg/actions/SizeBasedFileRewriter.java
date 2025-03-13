@@ -22,12 +22,15 @@ import java.math.RoundingMode;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.ContentScanTask;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.math.LongMath;
 import org.apache.iceberg.util.BinPacking;
@@ -102,6 +105,15 @@ public abstract class SizeBasedFileRewriter<T extends ContentScanTask<F>, F exte
 
   public static final long MAX_FILE_GROUP_SIZE_BYTES_DEFAULT = 100L * 1024 * 1024 * 1024; // 100 GB
 
+  /**
+   * This option controls the maximum number of files that should be rewritten in a single file
+   * group. It helps with breaking down the rewriting of partitions with many small files which may not be
+   * rewritable otherwise due to the resource constraints of the cluster.
+   */
+  public static final String MAX_FILE_GROUP_SIZE_NUM = "max-file-group-size-num";
+
+  public static final int MAX_FILE_GROUP_SIZE_NUM_DEFAULT = 1000; // 1k files
+
   private static final long SPLIT_OVERHEAD = 5 * 1024;
 
   private final Table table;
@@ -111,6 +123,7 @@ public abstract class SizeBasedFileRewriter<T extends ContentScanTask<F>, F exte
   private int minInputFiles;
   private boolean rewriteAll;
   private long maxGroupSize;
+  private int maxGroupNumFiles;
 
   private int outputSpecId;
 
@@ -136,7 +149,8 @@ public abstract class SizeBasedFileRewriter<T extends ContentScanTask<F>, F exte
         MAX_FILE_SIZE_BYTES,
         MIN_INPUT_FILES,
         REWRITE_ALL,
-        MAX_FILE_GROUP_SIZE_BYTES);
+        MAX_FILE_GROUP_SIZE_BYTES,
+        MAX_FILE_GROUP_SIZE_NUM);
   }
 
   @Override
@@ -149,6 +163,7 @@ public abstract class SizeBasedFileRewriter<T extends ContentScanTask<F>, F exte
     this.minInputFiles = minInputFiles(options);
     this.rewriteAll = rewriteAll(options);
     this.maxGroupSize = maxGroupSize(options);
+    this.maxGroupNumFiles = maxGroupNumFiles(options);
     this.outputSpecId = outputSpecId(options);
 
     if (rewriteAll) {
@@ -163,8 +178,18 @@ public abstract class SizeBasedFileRewriter<T extends ContentScanTask<F>, F exte
   @Override
   public Iterable<List<T>> planFileGroups(Iterable<T> tasks) {
     Iterable<T> filteredTasks = rewriteAll ? tasks : filterFiles(tasks);
-    BinPacking.ListPacker<T> packer = new BinPacking.ListPacker<>(maxGroupSize, 1, false);
-    List<List<T>> groups = packer.pack(filteredTasks, ContentScanTask::length);
+
+    // First pack by size
+    BinPacking.ListPacker<T> sizePacker = new BinPacking.ListPacker<>(maxGroupSize, 1, false);
+    List<List<T>> sizeGroups = sizePacker.pack(filteredTasks, ContentScanTask::length);
+
+    // Then pack by count
+    BinPacking.ListPacker<T> countPacker = new BinPacking.ListPacker<>(maxGroupNumFiles, 1, false);
+    List<List<T>> groups = Lists.newArrayList();
+    for (List<T> sizeGroup : sizeGroups) {
+      groups.addAll(countPacker.pack(sizeGroup, item -> 1L));
+    }
+
     return rewriteAll ? groups : filterFileGroups(groups);
   }
 
@@ -334,6 +359,13 @@ public abstract class SizeBasedFileRewriter<T extends ContentScanTask<F>, F exte
             options, MAX_FILE_GROUP_SIZE_BYTES, MAX_FILE_GROUP_SIZE_BYTES_DEFAULT);
     Preconditions.checkArgument(
         value > 0, "'%s' is set to %s but must be > 0", MAX_FILE_GROUP_SIZE_BYTES, value);
+    return value;
+  }
+
+  private int maxGroupNumFiles(Map<String, String> options) {
+    int value = PropertyUtil.propertyAsInt(options, MAX_FILE_GROUP_SIZE_NUM, MAX_FILE_GROUP_SIZE_NUM_DEFAULT);
+    Preconditions.checkArgument(
+        value > 0, "'%s' is set to %s but must be > 0", MAX_FILE_GROUP_SIZE_NUM, value);
     return value;
   }
 
