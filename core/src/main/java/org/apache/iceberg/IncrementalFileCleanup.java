@@ -290,6 +290,7 @@ class IncrementalFileCleanup extends FileCleanupStrategy {
     boolean supportsBulkDeletes = fileIO instanceof SupportsBulkOperations;
     LOG.info("File IO {} bulk deletes", supportsBulkDeletes ? "supports" : "does not support");
 
+    LOG.info("Starting to delete files");
     deleteFiles(filesToDelete, "data");
     long dataDeleteEndTime = System.nanoTime();
     LOG.info("Deleted {} data files in {} ms", filesToDelete.size(),
@@ -331,6 +332,7 @@ class IncrementalFileCleanup extends FileCleanupStrategy {
 
     // First scan manifests with deletes
     long scanDeletesStartTime = System.nanoTime();
+    final AtomicInteger processedDeleteManifests = new AtomicInteger(0);
     Tasks.foreach(manifestsToScan)
         .retry(3)
         .suppressFailureWhenFinished()
@@ -355,6 +357,7 @@ class IncrementalFileCleanup extends FileCleanupStrategy {
               } catch (IOException e) {
                 throw new RuntimeIOException(e, "Failed to read manifest file: %s", manifest);
               }
+              logProgress(processedDeleteManifests, manifestsToScan.size(), "delete manifests");
             });
     long scanDeletesEndTime = System.nanoTime();
     LOG.info("Found {} files to delete from scanning DELETE entries in {} ms",
@@ -362,6 +365,7 @@ class IncrementalFileCleanup extends FileCleanupStrategy {
 
     // Then scan manifests to revert
     long scanRevertsStartTime = System.nanoTime();
+    final AtomicInteger processedRevertManifests = new AtomicInteger(0);
     Tasks.foreach(manifestsToRevert)
         .retry(3)
         .suppressFailureWhenFinished()
@@ -384,6 +388,7 @@ class IncrementalFileCleanup extends FileCleanupStrategy {
               } catch (IOException e) {
                 throw new RuntimeIOException(e, "Failed to read manifest file: %s", manifest);
               }
+              logProgress(processedRevertManifests, manifestsToRevert.size(), "revert manifests");
             });
     long scanRevertsEndTime = System.nanoTime();
     LOG.info("Found {} additional files to delete from scanning ADDED entries in reverted manifests in {} ms",
