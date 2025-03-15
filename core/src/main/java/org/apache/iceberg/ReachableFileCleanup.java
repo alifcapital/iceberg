@@ -27,6 +27,7 @@ import java.util.stream.Collectors;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.SupportsBulkOperations;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.Tasks;
 import org.slf4j.Logger;
@@ -50,6 +51,9 @@ class ReachableFileCleanup extends FileCleanupStrategy {
 
   @Override
   public void cleanFiles(TableMetadata beforeExpiration, TableMetadata afterExpiration) {
+    long startTime = System.nanoTime();
+    LOG.info("Starting reachable file cleanup");
+
     Set<String> manifestListsToDelete = Sets.newHashSet();
 
     Set<Snapshot> snapshotsBeforeExpiration = Sets.newHashSet(beforeExpiration.snapshots());
@@ -63,29 +67,69 @@ class ReachableFileCleanup extends FileCleanupStrategy {
         }
       }
     }
+
+    long readManifestsStartTime = System.nanoTime();
+    LOG.info("Starting to read manifests from {} expired snapshots", expiredSnapshots.size());
     Set<ManifestFile> deletionCandidates = readManifests(expiredSnapshots);
+    long readManifestsEndTime = System.nanoTime();
+    LOG.info("Completed reading manifests in {} ms, found {} candidates for deletion",
+        (readManifestsEndTime - readManifestsStartTime) / 1_000_000, deletionCandidates.size());
 
     if (!deletionCandidates.isEmpty()) {
       Set<ManifestFile> currentManifests = ConcurrentHashMap.newKeySet();
+
+      long pruneStartTime = System.nanoTime();
+      LOG.info("Starting to prune {} manifests", deletionCandidates.size());
       Set<ManifestFile> manifestsToDelete =
           pruneReferencedManifests(
               snapshotsAfterExpiration, deletionCandidates, currentManifests::add);
+      long pruneEndTime = System.nanoTime();
+      LOG.info("Completed pruning in {} ms, {} manifests remain after pruning",
+          (pruneEndTime - pruneStartTime) / 1_000_000, manifestsToDelete.size());
 
       if (!manifestsToDelete.isEmpty()) {
+        long findFilesStartTime = System.nanoTime();
+        LOG.info("Starting to find files to delete from {} manifests", manifestsToDelete.size());
         Set<String> dataFilesToDelete = findFilesToDelete(manifestsToDelete, currentManifests);
+        long findFilesEndTime = System.nanoTime();
+        LOG.info("Completed finding files in {} ms, found {} files to delete",
+            (findFilesEndTime - findFilesStartTime) / 1_000_000, dataFilesToDelete.size());
+
+        long deleteStartTime = System.nanoTime();
+        LOG.info("Found {} files to delete", dataFilesToDelete.size());
+
+        boolean supportsBulkDeletes = fileIO instanceof SupportsBulkOperations;
+        LOG.info("File IO {} bulk deletes", supportsBulkDeletes ? "supports" : "does not support");
+
         deleteFiles(dataFilesToDelete, "data");
+        long dataDeleteEndTime = System.nanoTime();
+        LOG.info("Deleted {} data files in {} ms", dataFilesToDelete.size(),
+            (dataDeleteEndTime - deleteStartTime) / 1_000_000);
+
         Set<String> manifestPathsToDelete =
             manifestsToDelete.stream().map(ManifestFile::path).collect(Collectors.toSet());
         deleteFiles(manifestPathsToDelete, "manifest");
+        long manifestDeleteEndTime = System.nanoTime();
+        LOG.info("Deleted {} manifest files in {} ms", manifestPathsToDelete.size(),
+            (manifestDeleteEndTime - dataDeleteEndTime) / 1_000_000);
+
+        deleteFiles(manifestListsToDelete, "manifest list");
+        long manifestListDeleteEndTime = System.nanoTime();
+        LOG.info("Deleted {} manifest list files in {} ms", manifestListsToDelete.size(),
+            (manifestListDeleteEndTime - manifestDeleteEndTime) / 1_000_000);
       }
     }
 
-    deleteFiles(manifestListsToDelete, "manifest list");
-
     if (hasAnyStatisticsFiles(beforeExpiration)) {
-      deleteFiles(
-          expiredStatisticsFilesLocations(beforeExpiration, afterExpiration), "statistics files");
+      Set<String> expiredStatisticsFiles = expiredStatisticsFilesLocations(beforeExpiration, afterExpiration);
+      deleteFiles(expiredStatisticsFiles, "statistics files");
+      long statsDeleteEndTime = System.nanoTime();
+      LOG.info("Deleted {} statistics files in {} ms", expiredStatisticsFiles.size(),
+          (statsDeleteEndTime - System.nanoTime()) / 1_000_000);
     }
+
+    long totalTime = System.nanoTime() - startTime;
+    LOG.info("Completed reachable file cleanup in {} ms", totalTime / 1_000_000);
   }
 
   private Set<ManifestFile> pruneReferencedManifests(
@@ -94,6 +138,9 @@ class ReachableFileCleanup extends FileCleanupStrategy {
       Consumer<ManifestFile> currentManifestCallback) {
     Set<ManifestFile> candidateSet = ConcurrentHashMap.newKeySet();
     candidateSet.addAll(deletionCandidates);
+
+    long pruneStartTime = System.nanoTime();
+    LOG.info("Starting to prune referenced manifests from {} snapshots", snapshots.size());
     Tasks.foreach(snapshots)
         .retry(3)
         .stopOnFailure()
@@ -119,12 +166,18 @@ class ReachableFileCleanup extends FileCleanupStrategy {
                     e, "Failed to close manifest list: %s", snapshot.manifestListLocation());
               }
             });
+    long pruneEndTime = System.nanoTime();
+    LOG.info("Completed pruning referenced manifests in {} ms, {} candidates remain",
+        (pruneEndTime - pruneStartTime) / 1_000_000, candidateSet.size());
 
     return candidateSet;
   }
 
   private Set<ManifestFile> readManifests(Set<Snapshot> snapshots) {
     Set<ManifestFile> manifestFiles = ConcurrentHashMap.newKeySet();
+
+    long readStartTime = System.nanoTime();
+    LOG.info("Starting to read manifests from {} snapshots", snapshots.size());
     Tasks.foreach(snapshots)
         .retry(3)
         .stopOnFailure()
@@ -145,6 +198,9 @@ class ReachableFileCleanup extends FileCleanupStrategy {
                     e, "Failed to close manifest list: %s", snapshot.manifestListLocation());
               }
             });
+    long readEndTime = System.nanoTime();
+    LOG.info("Completed reading manifests in {} ms, found {} manifests",
+        (readEndTime - readStartTime) / 1_000_000, manifestFiles.size());
 
     return manifestFiles;
   }

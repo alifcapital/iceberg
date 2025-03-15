@@ -172,8 +172,13 @@ class RemoveSnapshots implements ExpireSnapshots {
       return base;
     }
 
+    long startTime = System.nanoTime();
+    LOG.info("Starting metadata update phase");
+
     Set<Long> idsToRetain = Sets.newHashSet();
     // Identify refs that should be removed
+    long refsStartTime = System.nanoTime();
+    LOG.info("Starting to compute retained refs");
     Map<String, SnapshotRef> retainedRefs = computeRetainedRefs(base.refs());
     Map<Long, List<String>> retainedIdToRefs = Maps.newHashMap();
     for (Map.Entry<String, SnapshotRef> retainedRefEntry : retainedRefs.entrySet()) {
@@ -182,6 +187,8 @@ class RemoveSnapshots implements ExpireSnapshots {
       retainedIdToRefs.get(snapshotId).add(retainedRefEntry.getKey());
       idsToRetain.add(snapshotId);
     }
+    long refsEndTime = System.nanoTime();
+    LOG.info("Completed computing retained refs in {} ms", (refsEndTime - refsStartTime) / 1_000_000);
 
     for (long idToRemove : idsToRemove) {
       List<String> refsForId = retainedIdToRefs.get(idToRemove);
@@ -192,20 +199,41 @@ class RemoveSnapshots implements ExpireSnapshots {
           refsForId);
     }
 
+    long branchStartTime = System.nanoTime();
+    LOG.info("Starting to compute retained branch snapshots");
     idsToRetain.addAll(computeAllBranchSnapshotsToRetain(retainedRefs.values()));
+    long branchEndTime = System.nanoTime();
+    LOG.info("Completed computing retained branch snapshots in {} ms", (branchEndTime - branchStartTime) / 1_000_000);
+
+    long unrefStartTime = System.nanoTime();
+    LOG.info("Starting to compute unreferenced snapshots to retain");
     idsToRetain.addAll(unreferencedSnapshotsToRetain(retainedRefs.values()));
+    long unrefEndTime = System.nanoTime();
+    LOG.info("Completed computing unreferenced snapshots in {} ms", (unrefEndTime - unrefStartTime) / 1_000_000);
 
     TableMetadata.Builder updatedMetaBuilder = TableMetadata.buildFrom(base);
 
+    long removeRefsStartTime = System.nanoTime();
+    LOG.info("Starting to remove expired refs");
     base.refs().keySet().stream()
         .filter(ref -> !retainedRefs.containsKey(ref))
         .forEach(updatedMetaBuilder::removeRef);
+    long removeRefsEndTime = System.nanoTime();
+    LOG.info("Completed removing expired refs in {} ms", (removeRefsEndTime - removeRefsStartTime) / 1_000_000);
 
+    long removeSnapsStartTime = System.nanoTime();
+    LOG.info("Starting to remove expired snapshots");
     base.snapshots().stream()
         .map(Snapshot::snapshotId)
         .filter(snapshot -> !idsToRetain.contains(snapshot))
         .forEach(idsToRemove::add);
     updatedMetaBuilder.removeSnapshots(idsToRemove);
+    long removeSnapsEndTime = System.nanoTime();
+    LOG.info("Completed removing {} expired snapshots in {} ms",
+        idsToRemove.size(), (removeSnapsEndTime - removeSnapsStartTime) / 1_000_000);
+
+    long totalTime = System.nanoTime() - startTime;
+    LOG.info("Completed metadata update phase in {} ms", totalTime / 1_000_000);
 
     return updatedMetaBuilder.build();
   }
@@ -293,6 +321,9 @@ class RemoveSnapshots implements ExpireSnapshots {
 
   @Override
   public void commit() {
+    long startTime = System.nanoTime();
+    LOG.info("Starting commit");
+
     Tasks.foreach(ops)
         .retry(base.propertyAsInt(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
         .exponentialBackoff(
@@ -306,11 +337,20 @@ class RemoveSnapshots implements ExpireSnapshots {
               TableMetadata updated = internalApply();
               ops.commit(base, updated);
             });
-    LOG.info("Committed snapshot changes");
+
+    long commitEndTime = System.nanoTime();
+    LOG.info("Completed committing metadata changes in {} ms", (commitEndTime - startTime) / 1_000_000);
 
     if (cleanExpiredFiles) {
+      long cleanupStartTime = System.nanoTime();
+      LOG.info("Starting expired files cleanup");
       cleanExpiredSnapshots();
+      long cleanupEndTime = System.nanoTime();
+      LOG.info("Completed expired files cleanup in {} ms", (cleanupEndTime - cleanupStartTime) / 1_000_000);
     }
+
+    long totalTime = System.nanoTime() - startTime;
+    LOG.info("Completed expire snapshots operation in {} ms", totalTime / 1_000_000);
   }
 
   ExpireSnapshots withIncrementalCleanup(boolean useIncrementalCleanup) {
