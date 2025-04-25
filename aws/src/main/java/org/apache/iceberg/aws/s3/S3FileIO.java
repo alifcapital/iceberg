@@ -18,6 +18,9 @@
  */
 package org.apache.iceberg.aws.s3;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.stats.CacheStats;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
@@ -26,7 +29,9 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import org.apache.iceberg.aws.AwsClientFactory;
 import org.apache.iceberg.aws.S3FileIOAwsClientFactories;
@@ -37,6 +42,7 @@ import org.apache.iceberg.io.DelegateFileIO;
 import org.apache.iceberg.io.FileInfo;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.metrics.MetricsContext;
 import org.apache.iceberg.relocated.com.google.common.base.Joiner;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -78,6 +84,72 @@ public class S3FileIO implements CredentialSupplier, DelegateFileIO {
   private static final String DEFAULT_METRICS_IMPL =
       "org.apache.iceberg.hadoop.HadoopMetricsContext";
   private static volatile ExecutorService executorService;
+
+  // Cache configuration property names and defaults
+  public static final String MAX_CACHE_SIZE_MB_PROP = "iceberg.io.cache.max-size-mb";
+  public static final int MAX_CACHE_SIZE_MB_DEFAULT = 128; // 128MB total cache size
+
+  public static final String MAX_FILE_SIZE_MB_PROP = "iceberg.io.cache.max-file-size-mb";
+  public static final int MAX_FILE_SIZE_MB_DEFAULT = 10; // 10MB max file size
+
+  public static final String CACHE_EXPIRY_MINUTES_PROP = "iceberg.io.cache.expiry-minutes";
+  public static final int CACHE_EXPIRY_MINUTES_DEFAULT = 15;
+
+  // Cache for file data
+  private static volatile Cache<String, byte[]> fileCache;
+  private static volatile int maxFileSizeMB;
+  private static volatile boolean cacheInitialized = false;
+
+  // Static initialization only sets up default values
+  static {
+    maxFileSizeMB = MAX_FILE_SIZE_MB_DEFAULT;
+  }
+
+  // Lazy initialize cache on first access
+  private static synchronized void ensureCacheInitialized() {
+    if (fileCache == null) {
+      // Read system properties here where they are fully available
+      int maxCacheSizeMB = MAX_CACHE_SIZE_MB_DEFAULT;
+      int expiryMinutes = CACHE_EXPIRY_MINUTES_DEFAULT;
+
+      String sysCacheSize = System.getProperty(MAX_CACHE_SIZE_MB_PROP);
+      String sysFileSize = System.getProperty(MAX_FILE_SIZE_MB_PROP);
+      String sysExpiry = System.getProperty(CACHE_EXPIRY_MINUTES_PROP);
+
+      if (sysCacheSize != null) {
+        maxCacheSizeMB = Integer.parseInt(sysCacheSize);
+        LOG.info("Using system property {} = {}", MAX_CACHE_SIZE_MB_PROP, sysCacheSize);
+      }
+
+      if (sysFileSize != null) {
+        maxFileSizeMB = Integer.parseInt(sysFileSize);
+        LOG.info("Using system property {} = {}", MAX_FILE_SIZE_MB_PROP, sysFileSize);
+      }
+
+      if (sysExpiry != null) {
+        expiryMinutes = Integer.parseInt(sysExpiry);
+        LOG.info("Using system property {} = {}", CACHE_EXPIRY_MINUTES_PROP, sysExpiry);
+      }
+
+      fileCache = createCache(maxCacheSizeMB, expiryMinutes);
+      cacheInitialized = true;
+
+      LOG.info(
+          "Initialized S3 Parquet caching - maxCache={}MB, maxFile={}MB, expiry={}min",
+          maxCacheSizeMB,
+          maxFileSizeMB,
+          expiryMinutes);
+    }
+  }
+
+  private static Cache<String, byte[]> createCache(int maxSizeMB, int expiryMinutes) {
+    return Caffeine.newBuilder()
+        .maximumWeight(maxSizeMB * 1024 * 1024L) // Cache size in bytes
+        .weigher((String key, byte[] value) -> value.length) // Weight by byte array size
+        .expireAfterAccess(expiryMinutes, TimeUnit.MINUTES)
+        .recordStats()
+        .build();
+  }
 
   private String credential = null;
   private SerializableSupplier<S3Client> s3;
@@ -122,12 +194,30 @@ public class S3FileIO implements CredentialSupplier, DelegateFileIO {
 
   @Override
   public InputFile newInputFile(String path) {
-    return S3InputFile.fromLocation(path, client(), s3FileIOProperties, metrics);
+    if (path.endsWith(".parquet")) {
+      // For Parquet files, wrap with caching
+      LOG.debug("S3FileIO: Wrapping with cache for Parquet file: {}", path);
+      InputFile delegate = S3InputFile.fromLocation(path, client(), s3FileIOProperties, metrics);
+      return new CachingInputFile(path, delegate);
+    } else {
+      // For non-Parquet files, no caching
+      LOG.debug("S3FileIO: No caching for non-Parquet file: {}", path);
+      return S3InputFile.fromLocation(path, client(), s3FileIOProperties, metrics);
+    }
   }
 
   @Override
   public InputFile newInputFile(String path, long length) {
-    return S3InputFile.fromLocation(path, length, client(), s3FileIOProperties, metrics);
+    if (path.endsWith(".parquet")) {
+      // For Parquet files, wrap with caching
+      LOG.debug("S3FileIO: Wrapping with cache for Parquet file: {}", path);
+      InputFile delegate = S3InputFile.fromLocation(path, length, client(), s3FileIOProperties, metrics);
+      return new CachingInputFile(path, delegate);
+    } else {
+      // For non-Parquet files, no caching
+      LOG.debug("S3FileIO: No caching for non-Parquet file: {}", path);
+      return S3InputFile.fromLocation(path, length, client(), s3FileIOProperties, metrics);
+    }
   }
 
   @Override
@@ -376,6 +466,14 @@ public class S3FileIO implements CredentialSupplier, DelegateFileIO {
       }
     }
 
+    // Ensure cache is initialized now that system properties are available
+    ensureCacheInitialized();
+
+    // Log info about the current cache configuration
+    LOG.info("S3 Parquet cache configuration - maxCache={}MB, maxFile={}MB",
+        System.getProperty(MAX_CACHE_SIZE_MB_PROP, String.valueOf(MAX_CACHE_SIZE_MB_DEFAULT)),
+        System.getProperty(MAX_FILE_SIZE_MB_PROP, String.valueOf(maxFileSizeMB)));
+
     initMetrics(properties);
   }
 
@@ -418,6 +516,180 @@ public class S3FileIO implements CredentialSupplier, DelegateFileIO {
             Joiner.on("\n\t").join(Arrays.copyOfRange(createStack, 1, createStack.length));
         LOG.warn("Unclosed S3FileIO instance created by:\n\t{}", trace);
       }
+    }
+  }
+
+  /** A caching implementation of InputFile that uses the fileCache. */
+  private static class CachingInputFile implements InputFile {
+    private final String location;
+    private final InputFile delegate;
+
+    CachingInputFile(String location, InputFile delegate) {
+      this.location = location;
+      this.delegate = delegate;
+    }
+
+    @Override
+    public long getLength() {
+      return delegate.getLength();
+    }
+
+    @Override
+    public SeekableInputStream newStream() {
+      ensureCacheInitialized();
+
+      long fileSize = getLength();
+
+      // Check file size - don't cache if too large
+      if (fileSize > maxFileSizeMB * 1024 * 1024) {
+        LOG.info(
+            "S3 cache: file too large: {} ({} bytes > {} MB limit)",
+            location,
+            fileSize,
+            maxFileSizeMB);
+        return delegate.newStream();
+      }
+
+      // Check cache first
+      byte[] data = fileCache.getIfPresent(location);
+      if (data != null) {
+        LOG.debug("S3 cache: HIT for {}", location);
+        logCacheStats();
+        return new CachingSeekableInputStream(location, data);
+      }
+
+      // Cache miss - read the file
+      LOG.debug("S3 cache: MISS for {} (size: {} bytes), loading", location, fileSize);
+
+      try {
+        // Read the entire file
+        data = readFully(delegate.newStream(), (int) fileSize);
+
+        // Cache the data
+        fileCache.put(location, data);
+        logCacheStats();
+
+        return new CachingSeekableInputStream(location, data);
+      } catch (java.io.IOException e) {
+        LOG.warn("Failed to cache file {}", location, e);
+        // Fall back to uncached stream
+        return delegate.newStream();
+      }
+    }
+
+    private byte[] readFully(SeekableInputStream stream, int size) throws java.io.IOException {
+      byte[] data = new byte[size];
+      int bytesRead = 0;
+      while (bytesRead < size) {
+        int n = stream.read(data, bytesRead, size - bytesRead);
+        if (n <= 0) {
+          break;
+        }
+        bytesRead += n;
+      }
+      stream.close();
+      return data;
+    }
+
+    @Override
+    public String location() {
+      return location;
+    }
+
+    @Override
+    public boolean exists() {
+      return delegate.exists();
+    }
+  }
+
+  /** A seekable input stream backed by a byte array. */
+  private static class CachingSeekableInputStream extends SeekableInputStream {
+    private final String location;
+    private final byte[] data;
+    private int position;
+
+    CachingSeekableInputStream(String location, byte[] data) {
+      this.location = location;
+      this.data = data;
+      this.position = 0;
+    }
+
+    @Override
+    public int read() {
+      if (position >= data.length) {
+        return -1;
+      }
+      return data[position++] & 0xff;
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) {
+      if (position >= data.length) {
+        return -1;
+      }
+
+      int bytesToRead = Math.min(len, data.length - position);
+      System.arraycopy(data, position, b, off, bytesToRead);
+      position += bytesToRead;
+      return bytesToRead;
+    }
+
+    @Override
+    public long getPos() {
+      return position;
+    }
+
+    @Override
+    public void seek(long newPos) {
+      this.position = (int) newPos;
+    }
+
+    @Override
+    public long skip(long n) {
+      long bytesToSkip = Math.min(n, data.length - position);
+      position = (int) (position + bytesToSkip);
+      return bytesToSkip;
+    }
+
+    @Override
+    public void close() throws java.io.IOException {
+      // No-op for in-memory stream
+    }
+
+    @Override
+    public int available() {
+      return data.length - position;
+    }
+  }
+
+  /** Logs the current cache metrics */
+  private static void logCacheStats() {
+    ensureCacheInitialized();
+
+    if (fileCache != null) {
+      CacheStats stats = fileCache.stats();
+
+      LOG.info(
+          "S3 Cache Stats: hits={}, misses={}, hitRate={}, loadSuccess={}, loadFailure={}, " +
+          "totalLoadTime={}, evictions={}, evictionWeight={}, entries={}",
+          stats.hitCount(),
+          stats.missCount(),
+          String.format("%.2f", stats.hitRate()),
+          stats.loadSuccessCount(),
+          stats.loadFailureCount(),
+          stats.totalLoadTime(),
+          stats.evictionCount(),
+          stats.evictionWeight(),
+          fileCache.estimatedSize());
+    }
+  }
+
+  /** Manually clear the cache */
+  public static void clearCache() {
+    LOG.info("S3 Cache: clearing all cached files");
+    ensureCacheInitialized();
+    if (fileCache != null) {
+      fileCache.invalidateAll();
     }
   }
 }
