@@ -381,18 +381,56 @@ public class ConvertEqualityDeleteFilesSparkAction
       return new ConversionResult(Sets.newHashSet(), 0, 0);
     }
 
-    // Convert to serializable Set for broadcast
-    Set<List<Object>> deleteKeysSet = Sets.newHashSetWithExpectedSize(eqDeleteKeys.size());
-    for (StructLike key : eqDeleteKeys) {
-      List<Object> keyValues = Lists.newArrayListWithCapacity(deleteSchema.columns().size());
-      for (int i = 0; i < deleteSchema.columns().size(); i++) {
-        keyValues.add(key.get(i, Object.class));
-      }
-      deleteKeysSet.add(keyValues);
-    }
-
     JavaSparkContext jsc = JavaSparkContext.fromSparkContext(spark().sparkContext());
-    Broadcast<Set<List<Object>>> broadcastKeys = jsc.broadcast(deleteKeysSet);
+
+    // Determine optimized path based on column type
+    Types.NestedField firstCol = deleteSchema.columns().get(0);
+    org.apache.iceberg.types.Type.TypeID typeId = firstCol.type().typeId();
+    boolean isSingleColumn = deleteSchema.columns().size() == 1;
+    boolean isSingleLongColumn = isSingleColumn
+        && (typeId == org.apache.iceberg.types.Type.TypeID.LONG
+            || typeId == org.apache.iceberg.types.Type.TypeID.INTEGER);
+    boolean isSingleStringColumn = isSingleColumn
+        && typeId == org.apache.iceberg.types.Type.TypeID.STRING;
+
+    Broadcast<Set<Long>> broadcastLongKeys = null;
+    Broadcast<Set<String>> broadcastStringKeys = null;
+    Broadcast<Set<List<Object>>> broadcastKeys = null;
+
+    if (isSingleLongColumn) {
+      // Fast path: single long/int column - use Set<Long>
+      Set<Long> longKeysSet = Sets.newHashSetWithExpectedSize(eqDeleteKeys.size());
+      for (StructLike key : eqDeleteKeys) {
+        Object val = key.get(0, Object.class);
+        longKeysSet.add(val instanceof Integer ? ((Integer) val).longValue() : (Long) val);
+      }
+      broadcastLongKeys = jsc.broadcast(longKeysSet);
+      LOG.info("{} table={} group={} using optimized single-column LONG lookup",
+          LOG_PREFIX, table.name(), groupIndex);
+    } else if (isSingleStringColumn) {
+      // Fast path: single string column (UUID, etc) - use Set<String>
+      Set<String> stringKeysSet = Sets.newHashSetWithExpectedSize(eqDeleteKeys.size());
+      for (StructLike key : eqDeleteKeys) {
+        Object val = key.get(0, Object.class);
+        stringKeysSet.add(val != null ? val.toString() : null);
+      }
+      broadcastStringKeys = jsc.broadcast(stringKeysSet);
+      LOG.info("{} table={} group={} using optimized single-column STRING lookup",
+          LOG_PREFIX, table.name(), groupIndex);
+    } else {
+      // Generic path: multi-column or other types
+      Set<List<Object>> deleteKeysSet = Sets.newHashSetWithExpectedSize(eqDeleteKeys.size());
+      for (StructLike key : eqDeleteKeys) {
+        List<Object> keyValues = Lists.newArrayListWithCapacity(deleteSchema.columns().size());
+        for (int i = 0; i < deleteSchema.columns().size(); i++) {
+          keyValues.add(key.get(i, Object.class));
+        }
+        deleteKeysSet.add(keyValues);
+      }
+      broadcastKeys = jsc.broadcast(deleteKeysSet);
+      LOG.info("{} table={} group={} using generic multi-column lookup",
+          LOG_PREFIX, table.name(), groupIndex);
+    }
 
     // Step 2: Build list of data files to process
     List<DataFileInfo> dataFileInfos =
@@ -425,9 +463,17 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     JavaRDD<DataFileInfo> filesRDD = jsc.parallelize(dataFileInfos, dataFileInfos.size());
 
-    JavaRDD<PositionDeleteRecord> posDeletesRDD =
-        filesRDD.flatMap(
-            new ReadAndFilterFunction(tableBroadcast, projectionSchema, broadcastKeys));
+    JavaRDD<PositionDeleteRecord> posDeletesRDD;
+    if (isSingleLongColumn) {
+      posDeletesRDD = filesRDD.flatMap(
+          new ReadAndFilterLongFunction(tableBroadcast, projectionSchema, broadcastLongKeys));
+    } else if (isSingleStringColumn) {
+      posDeletesRDD = filesRDD.flatMap(
+          new ReadAndFilterStringFunction(tableBroadcast, projectionSchema, broadcastStringKeys));
+    } else {
+      posDeletesRDD = filesRDD.flatMap(
+          new ReadAndFilterFunction(tableBroadcast, projectionSchema, broadcastKeys));
+    }
 
     // Collect results
     List<PositionDeleteRecord> posDeletes = posDeletesRDD.collect();
@@ -497,7 +543,139 @@ public class ConvertEqualityDeleteFilesSparkAction
     }
   }
 
-  /** Function to read data file and filter by broadcast keys - runs on executors. */
+  /** Optimized function for single long/int column - no object allocation per record. */
+  private static class ReadAndFilterLongFunction
+      implements FlatMapFunction<DataFileInfo, PositionDeleteRecord> {
+
+    private final Broadcast<Table> tableBroadcast;
+    private final Schema projectionSchema;
+    private final Broadcast<Set<Long>> broadcastLongKeys;
+
+    ReadAndFilterLongFunction(
+        Broadcast<Table> tableBroadcast,
+        Schema projectionSchema,
+        Broadcast<Set<Long>> broadcastLongKeys) {
+      this.tableBroadcast = tableBroadcast;
+      this.projectionSchema = projectionSchema;
+      this.broadcastLongKeys = broadcastLongKeys;
+    }
+
+    @Override
+    public Iterator<PositionDeleteRecord> call(DataFileInfo fileInfo) throws Exception {
+      Table table = tableBroadcast.value();
+      Set<Long> deleteKeys = broadcastLongKeys.value();
+
+      List<PositionDeleteRecord> matches = Lists.newArrayList();
+      InputFile inputFile = table.io().newInputFile(fileInfo.path());
+
+      long pos = 0;
+      try (CloseableIterable<Record> reader =
+          openDataFile(inputFile, projectionSchema, fileInfo.format())) {
+        for (Record record : reader) {
+          // Direct primitive access - no List<Object> allocation
+          Object val = record.get(0);
+          long key = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+          if (deleteKeys.contains(key)) {
+            matches.add(new PositionDeleteRecord(fileInfo.path(), pos));
+          }
+          pos++;
+        }
+      }
+
+      return matches.iterator();
+    }
+
+    private CloseableIterable<Record> openDataFile(
+        InputFile inputFile, Schema schema, FileFormat format) {
+      switch (format) {
+        case PARQUET:
+          return Parquet.read(inputFile)
+              .project(schema)
+              .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
+              .build();
+        case ORC:
+          return ORC.read(inputFile)
+              .project(schema)
+              .createReaderFunc(fileSchema -> GenericOrcReader.buildReader(schema, fileSchema))
+              .build();
+        case AVRO:
+          return Avro.read(inputFile)
+              .project(schema)
+              .createReaderFunc(DataReader::create)
+              .build();
+        default:
+          throw new UnsupportedOperationException("Unsupported format: " + format);
+      }
+    }
+  }
+
+  /** Optimized function for single string column (UUID, etc) - no List allocation per record. */
+  private static class ReadAndFilterStringFunction
+      implements FlatMapFunction<DataFileInfo, PositionDeleteRecord> {
+
+    private final Broadcast<Table> tableBroadcast;
+    private final Schema projectionSchema;
+    private final Broadcast<Set<String>> broadcastStringKeys;
+
+    ReadAndFilterStringFunction(
+        Broadcast<Table> tableBroadcast,
+        Schema projectionSchema,
+        Broadcast<Set<String>> broadcastStringKeys) {
+      this.tableBroadcast = tableBroadcast;
+      this.projectionSchema = projectionSchema;
+      this.broadcastStringKeys = broadcastStringKeys;
+    }
+
+    @Override
+    public Iterator<PositionDeleteRecord> call(DataFileInfo fileInfo) throws Exception {
+      Table table = tableBroadcast.value();
+      Set<String> deleteKeys = broadcastStringKeys.value();
+
+      List<PositionDeleteRecord> matches = Lists.newArrayList();
+      InputFile inputFile = table.io().newInputFile(fileInfo.path());
+
+      long pos = 0;
+      try (CloseableIterable<Record> reader =
+          openDataFile(inputFile, projectionSchema, fileInfo.format())) {
+        for (Record record : reader) {
+          // Direct string access - no List<Object> allocation
+          Object val = record.get(0);
+          String key = val != null ? val.toString() : null;
+          if (deleteKeys.contains(key)) {
+            matches.add(new PositionDeleteRecord(fileInfo.path(), pos));
+          }
+          pos++;
+        }
+      }
+
+      return matches.iterator();
+    }
+
+    private CloseableIterable<Record> openDataFile(
+        InputFile inputFile, Schema schema, FileFormat format) {
+      switch (format) {
+        case PARQUET:
+          return Parquet.read(inputFile)
+              .project(schema)
+              .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
+              .build();
+        case ORC:
+          return ORC.read(inputFile)
+              .project(schema)
+              .createReaderFunc(fileSchema -> GenericOrcReader.buildReader(schema, fileSchema))
+              .build();
+        case AVRO:
+          return Avro.read(inputFile)
+              .project(schema)
+              .createReaderFunc(DataReader::create)
+              .build();
+        default:
+          throw new UnsupportedOperationException("Unsupported format: " + format);
+      }
+    }
+  }
+
+  /** Generic function for multi-column keys - runs on executors. */
   private static class ReadAndFilterFunction
       implements FlatMapFunction<DataFileInfo, PositionDeleteRecord> {
 
