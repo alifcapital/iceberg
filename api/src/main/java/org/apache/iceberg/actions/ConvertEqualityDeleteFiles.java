@@ -38,10 +38,16 @@ public interface ConvertEqualityDeleteFiles
 
   /** The action result that contains a summary of the execution. */
   interface Result {
-    /** Returns the count of the deletes that been converted. */
+    /** Returns the count of the equality delete files that have been converted. */
     int convertedEqualityDeleteFilesCount();
 
     /** Returns the count of the added position delete files. */
     int addedPositionDeleteFilesCount();
+
+    /** Returns the count of delete records read from equality delete files. */
+    long rewrittenDeleteRecordsCount();
+
+    /** Returns the count of position delete records written. */
+    long addedDeleteRecordsCount();
   }
 }

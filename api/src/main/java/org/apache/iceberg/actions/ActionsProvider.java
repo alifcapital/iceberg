@@ -70,4 +70,10 @@ public interface ActionsProvider {
     throw new UnsupportedOperationException(
         this.getClass().getName() + " does not implement rewritePositionDeletes");
   }
+
+  /** Instantiates an action to convert equality delete files to position delete files */
+  default ConvertEqualityDeleteFiles convertEqualityDeletes(Table table) {
+    throw new UnsupportedOperationException(
+        this.getClass().getName() + " does not implement convertEqualityDeletes");
+  }
 }
