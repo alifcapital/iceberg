@@ -21,6 +21,8 @@ package org.apache.iceberg.spark.actions;
 import static org.apache.spark.sql.functions.col;
 
 import java.io.IOException;
+import java.io.Serializable;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -66,14 +68,16 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
-import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.SparkSchemaUtil;
+import org.apache.iceberg.spark.source.SerializableTableWithSize;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.StructLikeSet;
 import org.apache.iceberg.util.Tasks;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.api.java.function.FlatMapFunction;
+import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
@@ -352,15 +356,12 @@ public class ConvertEqualityDeleteFilesSparkAction
         deleteColumnNames,
         partition);
 
-    for (DeleteFile eqFile : eqDeleteFiles) {
-      LOG.info(
-          "{} table={} group={} eq_delete_file={}", LOG_PREFIX, table.name(), groupIndex, eqFile.path());
-    }
-
-    // Read equality delete keys using Iceberg's FileIO
+    // Step 1: Read equality delete keys on driver and broadcast
     long readEqStartTime = System.currentTimeMillis();
-    Dataset<Row> eqDeletesDF = readEqualityDeleteKeys(eqDeleteFiles, deleteSchema, groupIndex);
-    long eqDeleteRecordsCount = eqDeletesDF.count();
+    DeleteLoader deleteLoader =
+        new BaseDeleteLoader(deleteFile -> table.io().newInputFile(deleteFile.path().toString()));
+    StructLikeSet eqDeleteKeys = deleteLoader.loadEqualityDeletes(eqDeleteFiles, deleteSchema);
+    long eqDeleteRecordsCount = eqDeleteKeys.size();
     long readEqDuration = System.currentTimeMillis() - readEqStartTime;
 
     LOG.info(
@@ -371,12 +372,35 @@ public class ConvertEqualityDeleteFilesSparkAction
         readEqDuration,
         eqDeleteRecordsCount);
 
-    // Read data files
-    List<String> dataFilePaths =
+    if (eqDeleteRecordsCount == 0) {
+      LOG.info(
+          "{} table={} group={} no equality delete records found",
+          LOG_PREFIX,
+          table.name(),
+          groupIndex);
+      return new ConversionResult(Sets.newHashSet(), 0, 0);
+    }
+
+    // Convert to serializable Set for broadcast
+    Set<List<Object>> deleteKeysSet = Sets.newHashSetWithExpectedSize(eqDeleteKeys.size());
+    for (StructLike key : eqDeleteKeys) {
+      List<Object> keyValues = Lists.newArrayListWithCapacity(deleteSchema.columns().size());
+      for (int i = 0; i < deleteSchema.columns().size(); i++) {
+        keyValues.add(key.get(i, Object.class));
+      }
+      deleteKeysSet.add(keyValues);
+    }
+
+    JavaSparkContext jsc = JavaSparkContext.fromSparkContext(spark().sparkContext());
+    Broadcast<Set<List<Object>>> broadcastKeys = jsc.broadcast(deleteKeysSet);
+
+    // Step 2: Build list of data files to process
+    List<DataFileInfo> dataFileInfos =
         dataFileTasks.stream()
-            .map(t -> t.file().path().toString())
+            .map(t -> new DataFileInfo(t.file().path().toString(), t.file().format().name()))
             .distinct()
             .collect(Collectors.toList());
+
     long totalDataFileSize =
         dataFileTasks.stream()
             .map(FileScanTask::file)
@@ -385,94 +409,160 @@ public class ConvertEqualityDeleteFilesSparkAction
             .sum();
 
     LOG.info(
-        "{} table={} group={} data_files={} data_size_bytes={} reading data files",
+        "{} table={} group={} data_files={} data_size_bytes={} reading on executors",
         LOG_PREFIX,
         table.name(),
         groupIndex,
-        dataFilePaths.size(),
+        dataFileInfos.size(),
         totalDataFileSize);
 
+    // Step 3: Distributed read on executors - read files and filter by broadcast keys
     long readDataStartTime = System.currentTimeMillis();
-    Dataset<Row> dataRowsWithPos =
-        readDataFilesWithPosition(dataFileTasks, deleteColumnNames, snapshotId);
-    long dataRowsCount = dataRowsWithPos.count();
+
+    Table serializableTable = SerializableTableWithSize.copyOf(table);
+    Broadcast<Table> tableBroadcast = jsc.broadcast(serializableTable);
+    Schema projectionSchema = deleteSchema;
+
+    JavaRDD<DataFileInfo> filesRDD = jsc.parallelize(dataFileInfos, dataFileInfos.size());
+
+    JavaRDD<PositionDeleteRecord> posDeletesRDD =
+        filesRDD.flatMap(
+            new ReadAndFilterFunction(tableBroadcast, projectionSchema, broadcastKeys));
+
+    // Collect results
+    List<PositionDeleteRecord> posDeletes = posDeletesRDD.collect();
     long readDataDuration = System.currentTimeMillis() - readDataStartTime;
 
     LOG.info(
-        "{} table={} group={} read_data_duration_ms={} data_rows={}",
+        "{} table={} group={} read_and_filter_duration_ms={} matched_rows={}",
         LOG_PREFIX,
         table.name(),
         groupIndex,
         readDataDuration,
-        dataRowsCount);
+        posDeletes.size());
 
-    // Join
-    LOG.info(
-        "{} table={} group={} build_side_records={} probe_side_records={} "
-            + "join_columns={} performing join",
-        LOG_PREFIX,
-        table.name(),
-        groupIndex,
-        eqDeleteRecordsCount,
-        dataRowsCount,
-        deleteColumnNames);
+    // Step 4: Write position delete files
+    return writePosDeleteFilesFromRecords(
+        posDeletes, specId, partition, snapshotId, eqDeleteRecordsCount, groupIndex);
+  }
 
-    // Debug: print schemas and sample data
-    LOG.info(
-        "{} table={} group={} eq_delete_schema={}",
-        LOG_PREFIX,
-        table.name(),
-        groupIndex,
-        eqDeletesDF.schema().simpleString());
-    LOG.info(
-        "{} table={} group={} data_schema={}",
-        LOG_PREFIX,
-        table.name(),
-        groupIndex,
-        dataRowsWithPos.schema().simpleString());
+  /** Serializable data file info for distribution to executors. */
+  private static class DataFileInfo implements Serializable {
+    private final String path;
+    private final String format;
 
-    if (eqDeleteRecordsCount > 0) {
-      Row[] eqSample = (Row[]) eqDeletesDF.take(3);
-      for (Row r : eqSample) {
-        LOG.info("{} table={} group={} eq_delete_sample={}", LOG_PREFIX, table.name(), groupIndex, r);
-      }
-    }
-    if (dataRowsCount > 0) {
-      Row[] dataSample = (Row[]) dataRowsWithPos.take(3);
-      for (Row r : dataSample) {
-        LOG.info("{} table={} group={} data_sample={}", LOG_PREFIX, table.name(), groupIndex, r);
-      }
+    DataFileInfo(String path, String format) {
+      this.path = path;
+      this.format = format;
     }
 
-    long joinStartTime = System.currentTimeMillis();
-    Dataset<Row> deletedRowPositions =
-        dataRowsWithPos.join(
-            eqDeletesDF.hint("broadcast"),
-            scala.collection.JavaConverters.asScalaBuffer(ImmutableList.copyOf(deleteColumnNames))
-                .toSeq(),
-            "leftsemi");
+    String path() {
+      return path;
+    }
 
-    Dataset<Row> positionDeletes =
-        deletedRowPositions
-            .select(
-                col(MetadataColumns.FILE_PATH.name()).as("file_path"),
-                col(MetadataColumns.ROW_POSITION.name()).as("pos"))
-            .orderBy("file_path", "pos");
+    FileFormat format() {
+      return FileFormat.fromString(format);
+    }
 
-    long matchedRowsCount = positionDeletes.count();
-    long joinDuration = System.currentTimeMillis() - joinStartTime;
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      DataFileInfo that = (DataFileInfo) o;
+      return path.equals(that.path);
+    }
 
-    LOG.info(
-        "{} table={} group={} join_duration_ms={} matched_rows={}",
-        LOG_PREFIX,
-        table.name(),
-        groupIndex,
-        joinDuration,
-        matchedRowsCount);
+    @Override
+    public int hashCode() {
+      return path.hashCode();
+    }
+  }
 
-    // Write
-    return writePosDeleteFiles(
-        positionDeletes, specId, partition, snapshotId, eqDeleteRecordsCount, groupIndex);
+  /** Serializable position delete record. */
+  private static class PositionDeleteRecord implements Serializable {
+    private final String filePath;
+    private final long pos;
+
+    PositionDeleteRecord(String filePath, long pos) {
+      this.filePath = filePath;
+      this.pos = pos;
+    }
+
+    String filePath() {
+      return filePath;
+    }
+
+    long pos() {
+      return pos;
+    }
+  }
+
+  /** Function to read data file and filter by broadcast keys - runs on executors. */
+  private static class ReadAndFilterFunction
+      implements FlatMapFunction<DataFileInfo, PositionDeleteRecord> {
+
+    private final Broadcast<Table> tableBroadcast;
+    private final Schema projectionSchema;
+    private final Broadcast<Set<List<Object>>> broadcastKeys;
+
+    ReadAndFilterFunction(
+        Broadcast<Table> tableBroadcast,
+        Schema projectionSchema,
+        Broadcast<Set<List<Object>>> broadcastKeys) {
+      this.tableBroadcast = tableBroadcast;
+      this.projectionSchema = projectionSchema;
+      this.broadcastKeys = broadcastKeys;
+    }
+
+    @Override
+    public Iterator<PositionDeleteRecord> call(DataFileInfo fileInfo) throws Exception {
+      Table table = tableBroadcast.value();
+      Set<List<Object>> deleteKeys = broadcastKeys.value();
+
+      List<PositionDeleteRecord> matches = Lists.newArrayList();
+      InputFile inputFile = table.io().newInputFile(fileInfo.path());
+
+      long pos = 0;
+      try (CloseableIterable<Record> reader =
+          openDataFile(inputFile, projectionSchema, fileInfo.format())) {
+        for (Record record : reader) {
+          List<Object> recordKey =
+              Lists.newArrayListWithCapacity(projectionSchema.columns().size());
+          for (int i = 0; i < projectionSchema.columns().size(); i++) {
+            recordKey.add(record.get(i));
+          }
+          if (deleteKeys.contains(recordKey)) {
+            matches.add(new PositionDeleteRecord(fileInfo.path(), pos));
+          }
+          pos++;
+        }
+      }
+
+      return matches.iterator();
+    }
+
+    private CloseableIterable<Record> openDataFile(
+        InputFile inputFile, Schema schema, FileFormat format) {
+      switch (format) {
+        case PARQUET:
+          return Parquet.read(inputFile)
+              .project(schema)
+              .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
+              .build();
+        case ORC:
+          return ORC.read(inputFile)
+              .project(schema)
+              .createReaderFunc(fileSchema -> GenericOrcReader.buildReader(schema, fileSchema))
+              .build();
+        case AVRO:
+          return Avro.read(inputFile)
+              .project(schema)
+              .createReaderFunc(DataReader::create)
+              .build();
+        default:
+          throw new UnsupportedOperationException("Unsupported format: " + format);
+      }
+    }
   }
 
   /**
@@ -675,6 +765,116 @@ public class ConvertEqualityDeleteFilesSparkAction
         String filePath = row.getString(0);
         long pos = row.getLong(1);
         posDelete.set(filePath, pos, null);
+        posDeleteWriter.write(posDelete);
+      }
+
+      posDeleteWriter.close();
+      DeleteWriteResult writeResult = posDeleteWriter.result();
+      result.addAll(writeResult.deleteFiles());
+
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to write position delete files", e);
+    }
+
+    long writeDuration = System.currentTimeMillis() - writeStartTime;
+    long totalWrittenBytes = result.stream().mapToLong(DeleteFile::fileSizeInBytes).sum();
+
+    LOG.info(
+        "{} table={} group={} write_duration_ms={} pos_delete_files={} written_bytes={}",
+        LOG_PREFIX,
+        table.name(),
+        groupIndex,
+        writeDuration,
+        result.size(),
+        totalWrittenBytes);
+
+    for (DeleteFile file : result) {
+      LOG.info(
+          "{} table={} group={} pos_delete_file={} size_bytes={} records={}",
+          LOG_PREFIX,
+          table.name(),
+          groupIndex,
+          file.path(),
+          file.fileSizeInBytes(),
+          file.recordCount());
+    }
+
+    return new ConversionResult(result, eqDeleteRecordsCount, posDeleteRecordsCount);
+  }
+
+  private ConversionResult writePosDeleteFilesFromRecords(
+      List<PositionDeleteRecord> posDeletes,
+      int specId,
+      StructLike partition,
+      long snapshotId,
+      long eqDeleteRecordsCount,
+      int groupIndex) {
+
+    Set<DeleteFile> result = Sets.newHashSet();
+
+    if (posDeletes.isEmpty()) {
+      LOG.info(
+          "{} table={} group={} pos_delete_records=0 nothing to write",
+          LOG_PREFIX,
+          table.name(),
+          groupIndex);
+      return new ConversionResult(result, eqDeleteRecordsCount, 0);
+    }
+
+    // Copy to mutable list and sort by file path and position for efficient writing
+    List<PositionDeleteRecord> sortedDeletes = Lists.newArrayList(posDeletes);
+    sortedDeletes.sort((a, b) -> {
+      int cmp = a.filePath().compareTo(b.filePath());
+      return cmp != 0 ? cmp : Long.compare(a.pos(), b.pos());
+    });
+
+    long posDeleteRecordsCount = sortedDeletes.size();
+
+    LOG.info(
+        "{} table={} group={} pos_delete_records={} partition={} writing",
+        LOG_PREFIX,
+        table.name(),
+        groupIndex,
+        posDeleteRecordsCount,
+        partition);
+
+    long writeStartTime = System.currentTimeMillis();
+
+    PartitionSpec spec = table.specs().get(specId);
+
+    String deleteFileFormatStr =
+        table
+            .properties()
+            .getOrDefault(
+                TableProperties.DELETE_DEFAULT_FILE_FORMAT,
+                TableProperties.DEFAULT_FILE_FORMAT_DEFAULT);
+    FileFormat deleteFileFormat = FileFormat.fromString(deleteFileFormatStr);
+
+    OutputFileFactory outputFileFactory =
+        OutputFileFactory.builderFor(table, 0, 0)
+            .format(deleteFileFormat)
+            .operationId(String.valueOf(snapshotId))
+            .suffix("pos-deletes")
+            .build();
+
+    GenericAppenderFactory appenderFactory = new GenericAppenderFactory(table.schema(), spec);
+    appenderFactory.setAll(table.properties());
+
+    FileWriter<PositionDelete<Record>, DeleteWriteResult> posDeleteWriter =
+        new SortingPositionOnlyDeleteWriter<>(
+            () -> {
+              EncryptedOutputFile outputFile =
+                  partition == null
+                      ? outputFileFactory.newOutputFile()
+                      : outputFileFactory.newOutputFile(spec, partition);
+              return appenderFactory.newPosDeleteWriter(outputFile, deleteFileFormat, partition);
+            },
+            DeleteGranularity.FILE);
+
+    try {
+      PositionDelete<Record> posDelete = PositionDelete.create();
+      for (PositionDeleteRecord rec : sortedDeletes) {
+        posDelete.set(rec.filePath(), rec.pos(), null);
         posDeleteWriter.write(posDelete);
       }
 
