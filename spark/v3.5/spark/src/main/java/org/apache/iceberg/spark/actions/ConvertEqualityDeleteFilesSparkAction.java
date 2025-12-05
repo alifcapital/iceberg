@@ -752,7 +752,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         new SortingPositionOnlyDeleteWriter<>(
             () -> {
               EncryptedOutputFile outputFile =
-                  partition == null
+                  spec.isUnpartitioned()
                       ? outputFileFactory.newOutputFile()
                       : outputFileFactory.newOutputFile(spec, partition);
               return appenderFactory.newPosDeleteWriter(outputFile, deleteFileFormat, partition);
@@ -864,7 +864,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         new SortingPositionOnlyDeleteWriter<>(
             () -> {
               EncryptedOutputFile outputFile =
-                  partition == null
+                  spec.isUnpartitioned()
                       ? outputFileFactory.newOutputFile()
                       : outputFileFactory.newOutputFile(spec, partition);
               return appenderFactory.newPosDeleteWriter(outputFile, deleteFileFormat, partition);
