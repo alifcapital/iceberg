@@ -739,9 +739,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     FileFormat deleteFileFormat = FileFormat.fromString(deleteFileFormatStr);
 
     OutputFileFactory outputFileFactory =
-        OutputFileFactory.builderFor(table, 0, 0)
+        OutputFileFactory.builderFor(table, 0, groupIndex)
             .format(deleteFileFormat)
-            .operationId(String.valueOf(snapshotId))
+            .operationId(String.valueOf(snapshotId) + "-g" + groupIndex)
             .suffix("pos-deletes")
             .build();
 
@@ -851,9 +851,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     FileFormat deleteFileFormat = FileFormat.fromString(deleteFileFormatStr);
 
     OutputFileFactory outputFileFactory =
-        OutputFileFactory.builderFor(table, 0, 0)
+        OutputFileFactory.builderFor(table, 0, groupIndex)
             .format(deleteFileFormat)
-            .operationId(String.valueOf(snapshotId))
+            .operationId(String.valueOf(snapshotId) + "-g" + groupIndex)
             .suffix("pos-deletes")
             .build();
 
