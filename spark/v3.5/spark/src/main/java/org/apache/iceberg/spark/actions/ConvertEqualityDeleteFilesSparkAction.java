@@ -461,15 +461,19 @@ public class ConvertEqualityDeleteFilesSparkAction
     Broadcast<Table> tableBroadcast = jsc.broadcast(serializableTable);
     Schema projectionSchema = deleteSchema;
 
+    // Accumulator for bloom filter skipped files
+    org.apache.spark.util.LongAccumulator filesSkipped = jsc.sc().longAccumulator("filesSkipped");
+
     JavaRDD<DataFileInfo> filesRDD = jsc.parallelize(dataFileInfos, dataFileInfos.size());
 
     JavaRDD<PositionDeleteRecord> posDeletesRDD;
+    String eqColumnName = firstCol.name();
     if (isSingleLongColumn) {
       posDeletesRDD = filesRDD.flatMap(
-          new ReadAndFilterLongFunction(tableBroadcast, projectionSchema, broadcastLongKeys));
+          new ReadAndFilterLongFunction(tableBroadcast, projectionSchema, broadcastLongKeys, eqColumnName, filesSkipped));
     } else if (isSingleStringColumn) {
       posDeletesRDD = filesRDD.flatMap(
-          new ReadAndFilterStringFunction(tableBroadcast, projectionSchema, broadcastStringKeys));
+          new ReadAndFilterStringFunction(tableBroadcast, projectionSchema, broadcastStringKeys, eqColumnName, filesSkipped));
     } else {
       posDeletesRDD = filesRDD.flatMap(
           new ReadAndFilterFunction(tableBroadcast, projectionSchema, broadcastKeys));
@@ -480,12 +484,13 @@ public class ConvertEqualityDeleteFilesSparkAction
     long readDataDuration = System.currentTimeMillis() - readDataStartTime;
 
     LOG.info(
-        "{} table={} group={} read_and_filter_duration_ms={} matched_rows={}",
+        "{} table={} group={} read_and_filter_duration_ms={} matched_rows={} files_skipped={}",
         LOG_PREFIX,
         table.name(),
         groupIndex,
         readDataDuration,
-        posDeletes.size());
+        posDeletes.size(),
+        filesSkipped.value());
 
     // Step 4: Write position delete files
     return writePosDeleteFilesFromRecords(
@@ -550,14 +555,20 @@ public class ConvertEqualityDeleteFilesSparkAction
     private final Broadcast<Table> tableBroadcast;
     private final Schema projectionSchema;
     private final Broadcast<Set<Long>> broadcastLongKeys;
+    private final String eqColumnName;
+    private final org.apache.spark.util.LongAccumulator filesSkipped;
 
     ReadAndFilterLongFunction(
         Broadcast<Table> tableBroadcast,
         Schema projectionSchema,
-        Broadcast<Set<Long>> broadcastLongKeys) {
+        Broadcast<Set<Long>> broadcastLongKeys,
+        String eqColumnName,
+        org.apache.spark.util.LongAccumulator filesSkipped) {
       this.tableBroadcast = tableBroadcast;
       this.projectionSchema = projectionSchema;
       this.broadcastLongKeys = broadcastLongKeys;
+      this.eqColumnName = eqColumnName;
+      this.filesSkipped = filesSkipped;
     }
 
     @Override
@@ -568,34 +579,46 @@ public class ConvertEqualityDeleteFilesSparkAction
       List<PositionDeleteRecord> matches = Lists.newArrayList();
       InputFile inputFile = table.io().newInputFile(fileInfo.path());
 
-      long pos = 0;
+      // Only use bloom filter if delete keys <= 10000 (avoid overhead with large IN expressions)
+      Expression bloomFilter = deleteKeys.size() <= 10000
+          ? Expressions.in(eqColumnName, deleteKeys)
+          : Expressions.alwaysTrue();
+
+      long rowsRead = 0;
       try (CloseableIterable<Record> reader =
-          openDataFile(inputFile, projectionSchema, fileInfo.format())) {
+          openDataFile(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
         for (Record record : reader) {
           // Direct primitive access - no List<Object> allocation
           Object val = record.get(0);
           long key = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
           if (deleteKeys.contains(key)) {
-            matches.add(new PositionDeleteRecord(fileInfo.path(), pos));
+            matches.add(new PositionDeleteRecord(fileInfo.path(), rowsRead));
           }
-          pos++;
+          rowsRead++;
         }
+      }
+
+      // Track bloom filter skipped files
+      if (rowsRead == 0) {
+        filesSkipped.add(1);
       }
 
       return matches.iterator();
     }
 
     private CloseableIterable<Record> openDataFile(
-        InputFile inputFile, Schema schema, FileFormat format) {
+        InputFile inputFile, Schema schema, FileFormat format, Expression filter) {
       switch (format) {
         case PARQUET:
           return Parquet.read(inputFile)
               .project(schema)
+              .filter(filter)
               .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
               .build();
         case ORC:
           return ORC.read(inputFile)
               .project(schema)
+              .filter(filter)
               .createReaderFunc(fileSchema -> GenericOrcReader.buildReader(schema, fileSchema))
               .build();
         case AVRO:
@@ -616,14 +639,20 @@ public class ConvertEqualityDeleteFilesSparkAction
     private final Broadcast<Table> tableBroadcast;
     private final Schema projectionSchema;
     private final Broadcast<Set<String>> broadcastStringKeys;
+    private final String eqColumnName;
+    private final org.apache.spark.util.LongAccumulator filesSkipped;
 
     ReadAndFilterStringFunction(
         Broadcast<Table> tableBroadcast,
         Schema projectionSchema,
-        Broadcast<Set<String>> broadcastStringKeys) {
+        Broadcast<Set<String>> broadcastStringKeys,
+        String eqColumnName,
+        org.apache.spark.util.LongAccumulator filesSkipped) {
       this.tableBroadcast = tableBroadcast;
       this.projectionSchema = projectionSchema;
       this.broadcastStringKeys = broadcastStringKeys;
+      this.eqColumnName = eqColumnName;
+      this.filesSkipped = filesSkipped;
     }
 
     @Override
@@ -634,34 +663,46 @@ public class ConvertEqualityDeleteFilesSparkAction
       List<PositionDeleteRecord> matches = Lists.newArrayList();
       InputFile inputFile = table.io().newInputFile(fileInfo.path());
 
-      long pos = 0;
+      // Only use bloom filter if delete keys <= 10000 (avoid overhead with large IN expressions)
+      Expression bloomFilter = deleteKeys.size() <= 10000
+          ? Expressions.in(eqColumnName, deleteKeys)
+          : Expressions.alwaysTrue();
+
+      long rowsRead = 0;
       try (CloseableIterable<Record> reader =
-          openDataFile(inputFile, projectionSchema, fileInfo.format())) {
+          openDataFile(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
         for (Record record : reader) {
           // Direct string access - no List<Object> allocation
           Object val = record.get(0);
           String key = val != null ? val.toString() : null;
           if (deleteKeys.contains(key)) {
-            matches.add(new PositionDeleteRecord(fileInfo.path(), pos));
+            matches.add(new PositionDeleteRecord(fileInfo.path(), rowsRead));
           }
-          pos++;
+          rowsRead++;
         }
+      }
+
+      // Track bloom filter skipped files
+      if (rowsRead == 0) {
+        filesSkipped.add(1);
       }
 
       return matches.iterator();
     }
 
     private CloseableIterable<Record> openDataFile(
-        InputFile inputFile, Schema schema, FileFormat format) {
+        InputFile inputFile, Schema schema, FileFormat format, Expression filter) {
       switch (format) {
         case PARQUET:
           return Parquet.read(inputFile)
               .project(schema)
+              .filter(filter)
               .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
               .build();
         case ORC:
           return ORC.read(inputFile)
               .project(schema)
+              .filter(filter)
               .createReaderFunc(fileSchema -> GenericOrcReader.buildReader(schema, fileSchema))
               .build();
         case AVRO:
