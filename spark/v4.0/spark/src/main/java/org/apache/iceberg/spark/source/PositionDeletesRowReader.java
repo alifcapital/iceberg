@@ -33,6 +33,8 @@ import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.primitives.Ints;
+import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.spark.rdd.InputFileBlockHolder;
@@ -111,10 +113,26 @@ class PositionDeletesRowReader extends BaseRowReader<PositionDeletesScanTask>
   }
 
   private Set<Integer> nonConstantFieldIds(Map<Integer, ?> idToConstant) {
-    Set<Integer> fields = expectedSchema().idToName().keySet();
+    Schema schema = expectedSchema();
+    Map<Integer, Integer> idToParent = TypeUtil.indexParents(schema.asStruct());
+    Set<Integer> fields = schema.idToName().keySet();
     return fields.stream()
-        .filter(id -> expectedSchema().findField(id).type().isPrimitiveType())
+        .filter(id -> schema.findField(id).type().isPrimitiveType())
         .filter(id -> !idToConstant.containsKey(id))
+        .filter(id -> hasOnlyStructAncestors(schema, idToParent, id))
         .collect(Collectors.toSet());
+  }
+
+  private boolean hasOnlyStructAncestors(
+      Schema schema, Map<Integer, Integer> idToParent, int fieldId) {
+    Integer parentId = idToParent.get(fieldId);
+    while (parentId != null) {
+      Type parentType = schema.findType(parentId);
+      if (parentType == null || !parentType.isStructType()) {
+        return false;
+      }
+      parentId = idToParent.get(parentId);
+    }
+    return true;
   }
 }
