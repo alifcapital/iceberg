@@ -75,6 +75,7 @@ public class RewriteDataFilesSparkAction
           MAX_CONCURRENT_FILE_GROUP_REWRITES,
           MAX_FILE_GROUP_SIZE_BYTES,
           MAX_FILE_GROUP_SIZE_NUM,
+          MAX_FILE_GROUP_COUNT,
           PARTIAL_PROGRESS_ENABLED,
           PARTIAL_PROGRESS_MAX_COMMITS,
           TARGET_FILE_SIZE_BYTES,
@@ -92,6 +93,7 @@ public class RewriteDataFilesSparkAction
   private Expression filter = Expressions.alwaysTrue();
   private int maxConcurrentFileGroupRewrites;
   private int maxCommits;
+  private int maxFileGroupCount;
   private boolean partialProgressEnabled;
   private boolean removeDanglingDeletes;
   private boolean useStartingSequenceNumber;
@@ -174,6 +176,15 @@ public class RewriteDataFilesSparkAction
       return EMPTY_RESULT;
     }
 
+    if (maxFileGroupCount < plan.totalGroupCount()) {
+      LOG.info(
+          "Limiting rewrite to {} of {} file groups in {} due to {}",
+          maxFileGroupCount,
+          plan.totalGroupCount(),
+          table.name(),
+          MAX_FILE_GROUP_COUNT);
+    }
+
     Builder resultBuilder =
         partialProgressEnabled
             ? doExecuteWithPartialProgress(plan, commitManager(startingSnapshotId))
@@ -240,8 +251,9 @@ public class RewriteDataFilesSparkAction
 
     ConcurrentLinkedQueue<RewriteFileGroup> rewrittenGroups = Queues.newConcurrentLinkedQueue();
 
+    Iterable<RewriteFileGroup> groupsToRewrite = Iterables.limit(plan.groups(), maxFileGroupCount);
     Tasks.Builder<RewriteFileGroup> rewriteTaskBuilder =
-        Tasks.foreach(plan.groups())
+        Tasks.foreach(groupsToRewrite)
             .executeWith(rewriteService)
             .stopOnFailure()
             .noRetry()
@@ -303,15 +315,17 @@ public class RewriteDataFilesSparkAction
     ExecutorService rewriteService = rewriteService();
 
     // start commit service
-    int groupsPerCommit = IntMath.divide(plan.totalGroupCount(), maxCommits, RoundingMode.CEILING);
+    int effectiveGroupCount = Math.min(plan.totalGroupCount(), maxFileGroupCount);
+    int groupsPerCommit = IntMath.divide(effectiveGroupCount, maxCommits, RoundingMode.CEILING);
     RewriteDataFilesCommitManager.CommitService commitService =
         commitManager.service(groupsPerCommit);
     commitService.start();
 
     Collection<FileGroupFailureResult> rewriteFailures = new ConcurrentLinkedQueue<>();
 
+    Iterable<RewriteFileGroup> groupsToRewrite = Iterables.limit(plan.groups(), maxFileGroupCount);
     Tasks.Builder<RewriteFileGroup> rewriteTaskBuilder =
-        Tasks.foreach(plan.groups())
+        Tasks.foreach(groupsToRewrite)
             .executeWith(rewriteService)
             .stopOnFailure()
             .noRetry()
@@ -378,6 +392,9 @@ public class RewriteDataFilesSparkAction
             MAX_CONCURRENT_FILE_GROUP_REWRITES,
             MAX_CONCURRENT_FILE_GROUP_REWRITES_DEFAULT);
 
+    maxFileGroupCount =
+        PropertyUtil.propertyAsInt(options(), MAX_FILE_GROUP_COUNT, MAX_FILE_GROUP_COUNT_DEFAULT);
+
     maxCommits =
         PropertyUtil.propertyAsInt(
             options(), PARTIAL_PROGRESS_MAX_COMMITS, PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT);
@@ -399,6 +416,12 @@ public class RewriteDataFilesSparkAction
         "Cannot set %s to %s, the value must be positive.",
         MAX_CONCURRENT_FILE_GROUP_REWRITES,
         maxConcurrentFileGroupRewrites);
+
+    Preconditions.checkArgument(
+        maxFileGroupCount >= 1,
+        "Cannot set %s to %s, the value must be positive.",
+        MAX_FILE_GROUP_COUNT,
+        maxFileGroupCount);
 
     Preconditions.checkArgument(
         !partialProgressEnabled || maxCommits > 0,
