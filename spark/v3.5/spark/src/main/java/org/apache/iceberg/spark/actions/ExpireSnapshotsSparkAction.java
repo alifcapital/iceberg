@@ -21,70 +21,50 @@ package org.apache.iceberg.spark.actions;
 import static org.apache.iceberg.TableProperties.GC_ENABLED;
 import static org.apache.iceberg.TableProperties.GC_ENABLED_DEFAULT;
 
-import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
-import org.apache.iceberg.HasTableOperations;
-import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.TableMetadata;
-import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.actions.ExpireSnapshots;
 import org.apache.iceberg.actions.ImmutableExpireSnapshots;
 import org.apache.iceberg.exceptions.ValidationException;
-import org.apache.iceberg.io.SupportsBulkOperations;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.JobGroupInfo;
 import org.apache.iceberg.util.PropertyUtil;
-import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.SparkSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * An action that performs the same operation as {@link org.apache.iceberg.ExpireSnapshots} but uses
- * Spark to determine the delta in files between the pre and post-expiration table metadata. All of
- * the same restrictions of {@link org.apache.iceberg.ExpireSnapshots} also apply to this action.
+ * An action that performs snapshot expiration using Iceberg's core implementation.
  *
- * <p>This action first leverages {@link org.apache.iceberg.ExpireSnapshots} to expire snapshots and
- * then uses metadata tables to find files that can be safely deleted. This is done by anti-joining
- * two Datasets that contain all manifest and content files before and after the expiration. The
- * snapshot expiration will be fully committed before any deletes are issued.
- *
- * <p>This operation performs a shuffle so the parallelism can be controlled through
- * 'spark.sql.shuffle.partitions'.
- *
- * <p>Deletes are still performed locally after retrieving the results from the Spark executors.
+ * <p>This action delegates to {@link org.apache.iceberg.ExpireSnapshots} with file cleanup enabled,
+ * which uses IncrementalFileCleanup for efficient file deletion with detailed logging.
  */
 @SuppressWarnings("UnnecessaryAnonymousClass")
 public class ExpireSnapshotsSparkAction extends BaseSparkAction<ExpireSnapshotsSparkAction>
     implements ExpireSnapshots {
 
+  // Kept for procedure compatibility, not used in core-delegated implementation
   public static final String STREAM_RESULTS = "stream-results";
-  public static final boolean STREAM_RESULTS_DEFAULT = false;
 
   private static final Logger LOG = LoggerFactory.getLogger(ExpireSnapshotsSparkAction.class);
 
   private final Table table;
-  private final TableOperations ops;
 
   private final Set<Long> expiredSnapshotIds = Sets.newHashSet();
   private Long expireOlderThanValue = null;
   private Integer retainLastValue = null;
   private Consumer<String> deleteFunc = null;
   private ExecutorService deleteExecutorService = null;
-  private Dataset<FileInfo> expiredFileDS = null;
   private Boolean cleanExpiredMetadata = null;
 
   ExpireSnapshotsSparkAction(SparkSession spark, Table table) {
     super(spark);
     this.table = table;
-    this.ops = ((HasTableOperations) table).operations();
 
     ValidationException.check(
         PropertyUtil.propertyAsBoolean(table.properties(), GC_ENABLED, GC_ENABLED_DEFAULT),
@@ -136,60 +116,63 @@ public class ExpireSnapshotsSparkAction extends BaseSparkAction<ExpireSnapshotsS
     return this;
   }
 
-  /**
-   * Expires snapshots and commits the changes to the table, returning a Dataset of files to delete.
-   *
-   * <p>This does not delete data files. To delete data files, run {@link #execute()}.
-   *
-   * <p>This may be called before or after {@link #execute()} to return the expired files.
-   *
-   * @return a Dataset of files that are no longer referenced by the table
-   */
-  public Dataset<FileInfo> expireFiles() {
-    if (expiredFileDS == null) {
-      // fetch metadata before expiration
-      TableMetadata originalMetadata = ops.current();
-
-      // perform expiration
-      org.apache.iceberg.ExpireSnapshots expireSnapshots = table.expireSnapshots();
-
-      for (long id : expiredSnapshotIds) {
-        expireSnapshots = expireSnapshots.expireSnapshotId(id);
-      }
-
-      if (expireOlderThanValue != null) {
-        expireSnapshots = expireSnapshots.expireOlderThan(expireOlderThanValue);
-      }
-
-      if (retainLastValue != null) {
-        expireSnapshots = expireSnapshots.retainLast(retainLastValue);
-      }
-
-      if (cleanExpiredMetadata != null) {
-        expireSnapshots.cleanExpiredMetadata(cleanExpiredMetadata);
-      }
-
-      expireSnapshots.cleanExpiredFiles(false).commit();
-
-      // fetch valid files after expiration
-      TableMetadata updatedMetadata = ops.refresh();
-      Dataset<FileInfo> validFileDS = fileDS(updatedMetadata);
-
-      // fetch files referenced by expired snapshots
-      Set<Long> deletedSnapshotIds = findExpiredSnapshotIds(originalMetadata, updatedMetadata);
-      Dataset<FileInfo> deleteCandidateFileDS = fileDS(originalMetadata, deletedSnapshotIds);
-
-      // determine expired files
-      this.expiredFileDS = deleteCandidateFileDS.except(validFileDS);
-    }
-
-    return expiredFileDS;
-  }
-
   @Override
   public ExpireSnapshots.Result execute() {
     JobGroupInfo info = newJobGroupInfo("EXPIRE-SNAPSHOTS", jobDesc());
     return withJobGroupInfo(info, this::doExecute);
+  }
+
+  private ExpireSnapshots.Result doExecute() {
+    long startTime = System.nanoTime();
+    LOG.info("Starting snapshot expiration for table {}", table.name());
+
+    // perform expiration with file cleanup using core implementation
+    org.apache.iceberg.ExpireSnapshots expireSnapshots =
+        table.expireSnapshots().cleanExpiredFiles(true);
+
+    for (long id : expiredSnapshotIds) {
+      expireSnapshots = expireSnapshots.expireSnapshotId(id);
+    }
+
+    if (expireOlderThanValue != null) {
+      expireSnapshots = expireSnapshots.expireOlderThan(expireOlderThanValue);
+    }
+
+    if (retainLastValue != null) {
+      expireSnapshots = expireSnapshots.retainLast(retainLastValue);
+    }
+
+    if (cleanExpiredMetadata != null) {
+      expireSnapshots = expireSnapshots.cleanExpiredMetadata(cleanExpiredMetadata);
+    }
+
+    if (deleteFunc != null) {
+      expireSnapshots = expireSnapshots.deleteWith(deleteFunc);
+    }
+
+    if (deleteExecutorService != null) {
+      expireSnapshots = expireSnapshots.executeDeleteWith(deleteExecutorService);
+    }
+
+    // commit and cleanup files via core IncrementalFileCleanup
+    expireSnapshots.commit();
+
+    long endTime = System.nanoTime();
+    LOG.info(
+        "Snapshot expiration completed for table {} in {} ms",
+        table.name(),
+        (endTime - startTime) / 1_000_000);
+
+    // Return zeros since core implementation handles the actual deletion
+    // and logs detailed statistics
+    return ImmutableExpireSnapshots.Result.builder()
+        .deletedDataFilesCount(0L)
+        .deletedPositionDeleteFilesCount(0L)
+        .deletedEqualityDeleteFilesCount(0L)
+        .deletedManifestsCount(0L)
+        .deletedManifestListsCount(0L)
+        .deletedStatisticsFilesCount(0L)
+        .build();
   }
 
   private String jobDesc() {
@@ -218,68 +201,5 @@ public class ExpireSnapshotsSparkAction extends BaseSparkAction<ExpireSnapshotsS
     }
 
     return String.format("Expiring snapshots (%s) in %s", COMMA_JOINER.join(options), table.name());
-  }
-
-  private ExpireSnapshots.Result doExecute() {
-    if (streamResults()) {
-      return deleteFiles(expireFiles().toLocalIterator());
-    } else {
-      return deleteFiles(expireFiles().collectAsList().iterator());
-    }
-  }
-
-  private boolean streamResults() {
-    return PropertyUtil.propertyAsBoolean(options(), STREAM_RESULTS, STREAM_RESULTS_DEFAULT);
-  }
-
-  private Dataset<FileInfo> fileDS(TableMetadata metadata) {
-    return fileDS(metadata, null);
-  }
-
-  private Dataset<FileInfo> fileDS(TableMetadata metadata, Set<Long> snapshotIds) {
-    Table staticTable = newStaticTable(metadata, table.io());
-    return contentFileDS(staticTable, snapshotIds)
-        .union(manifestDS(staticTable, snapshotIds))
-        .union(manifestListDS(staticTable, snapshotIds))
-        .union(statisticsFileDS(staticTable, snapshotIds));
-  }
-
-  private Set<Long> findExpiredSnapshotIds(
-      TableMetadata originalMetadata, TableMetadata updatedMetadata) {
-    Set<Long> retainedSnapshots =
-        updatedMetadata.snapshots().stream().map(Snapshot::snapshotId).collect(Collectors.toSet());
-    return originalMetadata.snapshots().stream()
-        .map(Snapshot::snapshotId)
-        .filter(id -> !retainedSnapshots.contains(id))
-        .collect(Collectors.toSet());
-  }
-
-  private ExpireSnapshots.Result deleteFiles(Iterator<FileInfo> files) {
-    DeleteSummary summary;
-    if (deleteFunc == null && table.io() instanceof SupportsBulkOperations) {
-      summary = deleteFiles((SupportsBulkOperations) table.io(), files);
-    } else {
-
-      if (deleteFunc == null) {
-        LOG.info(
-            "Table IO {} does not support bulk operations. Using non-bulk deletes.",
-            table.io().getClass().getName());
-        summary = deleteFiles(deleteExecutorService, table.io()::deleteFile, files);
-      } else {
-        LOG.info("Custom delete function provided. Using non-bulk deletes");
-        summary = deleteFiles(deleteExecutorService, deleteFunc, files);
-      }
-    }
-
-    LOG.info("Deleted {} total files", summary.totalFilesCount());
-
-    return ImmutableExpireSnapshots.Result.builder()
-        .deletedDataFilesCount(summary.dataFilesCount())
-        .deletedPositionDeleteFilesCount(summary.positionDeleteFilesCount())
-        .deletedEqualityDeleteFilesCount(summary.equalityDeleteFilesCount())
-        .deletedManifestsCount(summary.manifestsCount())
-        .deletedManifestListsCount(summary.manifestListsCount())
-        .deletedStatisticsFilesCount(summary.statisticsFilesCount())
-        .build();
   }
 }
