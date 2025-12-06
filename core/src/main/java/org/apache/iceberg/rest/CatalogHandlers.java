@@ -25,14 +25,17 @@ import static org.apache.iceberg.TableProperties.COMMIT_TOTAL_RETRY_TIME_MS_DEFA
 
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import org.apache.iceberg.BaseMetadataTable;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.BaseTransaction;
+import org.apache.iceberg.MetadataUpdate.UpgradeFormatVersion;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
@@ -69,6 +72,7 @@ import org.apache.iceberg.rest.responses.ListTablesResponse;
 import org.apache.iceberg.rest.responses.LoadTableResponse;
 import org.apache.iceberg.rest.responses.LoadViewResponse;
 import org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse;
+import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.view.BaseView;
 import org.apache.iceberg.view.SQLViewRepresentation;
@@ -80,7 +84,7 @@ import org.apache.iceberg.view.ViewRepresentation;
 
 public class CatalogHandlers {
   private static final Schema EMPTY_SCHEMA = new Schema();
-  private static final String INTIAL_PAGE_TOKEN = "";
+  private static final String INITIAL_PAGE_TOKEN = "";
 
   private CatalogHandlers() {}
 
@@ -106,6 +110,20 @@ public class CatalogHandlers {
     }
   }
 
+  private static <T> Pair<List<T>, String> paginate(List<T> list, String pageToken, int pageSize) {
+    boolean isFirstPage = pageToken == null || pageToken.equals(INITIAL_PAGE_TOKEN);
+    int pageStart = isFirstPage ? 0 : Integer.parseInt(pageToken);
+    if (pageStart >= list.size()) {
+      return Pair.of(Collections.emptyList(), null);
+    }
+
+    int end = Math.min(pageStart + pageSize, list.size());
+    List<T> subList = list.subList(pageStart, end);
+    String nextPageToken = end >= list.size() ? null : String.valueOf(end);
+
+    return Pair.of(subList, nextPageToken);
+  }
+
   public static ListNamespacesResponse listNamespaces(
       SupportsNamespaces catalog, Namespace parent) {
     List<Namespace> results;
@@ -121,7 +139,6 @@ public class CatalogHandlers {
   public static ListNamespacesResponse listNamespaces(
       SupportsNamespaces catalog, Namespace parent, String pageToken, String pageSize) {
     List<Namespace> results;
-    List<Namespace> subResults;
 
     if (parent.isEmpty()) {
       results = catalog.listNamespaces();
@@ -129,16 +146,12 @@ public class CatalogHandlers {
       results = catalog.listNamespaces(parent);
     }
 
-    int start = INTIAL_PAGE_TOKEN.equals(pageToken) ? 0 : Integer.parseInt(pageToken);
-    int end = start + Integer.parseInt(pageSize);
-    subResults = results.subList(start, end);
-    String nextToken = String.valueOf(end);
+    Pair<List<Namespace>, String> page = paginate(results, pageToken, Integer.parseInt(pageSize));
 
-    if (end >= results.size()) {
-      nextToken = null;
-    }
-
-    return ListNamespacesResponse.builder().addAll(subResults).nextPageToken(nextToken).build();
+    return ListNamespacesResponse.builder()
+        .addAll(page.first())
+        .nextPageToken(page.second())
+        .build();
   }
 
   public static CreateNamespaceResponse createNamespace(
@@ -149,6 +162,12 @@ public class CatalogHandlers {
         .withNamespace(namespace)
         .setProperties(catalog.loadNamespaceMetadata(namespace))
         .build();
+  }
+
+  public static void namespaceExists(SupportsNamespaces catalog, Namespace namespace) {
+    if (!catalog.namespaceExists(namespace)) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
+    }
   }
 
   public static GetNamespaceResponse loadNamespace(
@@ -201,18 +220,11 @@ public class CatalogHandlers {
   public static ListTablesResponse listTables(
       Catalog catalog, Namespace namespace, String pageToken, String pageSize) {
     List<TableIdentifier> results = catalog.listTables(namespace);
-    List<TableIdentifier> subResults;
 
-    int start = INTIAL_PAGE_TOKEN.equals(pageToken) ? 0 : Integer.parseInt(pageToken);
-    int end = start + Integer.parseInt(pageSize);
-    subResults = results.subList(start, end);
-    String nextToken = String.valueOf(end);
+    Pair<List<TableIdentifier>, String> page =
+        paginate(results, pageToken, Integer.parseInt(pageSize));
 
-    if (end >= results.size()) {
-      nextToken = null;
-    }
-
-    return ListTablesResponse.builder().addAll(subResults).nextPageToken(nextToken).build();
+    return ListTablesResponse.builder().addAll(page.first()).nextPageToken(page.second()).build();
   }
 
   public static LoadTableResponse stageTableCreate(
@@ -306,6 +318,13 @@ public class CatalogHandlers {
     }
   }
 
+  public static void tableExists(Catalog catalog, TableIdentifier ident) {
+    boolean exists = catalog.tableExists(ident);
+    if (!exists) {
+      throw new NoSuchTableException("Table does not exist: %s", ident);
+    }
+  }
+
   public static LoadTableResponse loadTable(Catalog catalog, TableIdentifier ident) {
     Table table = catalog.loadTable(ident);
 
@@ -373,10 +392,15 @@ public class CatalogHandlers {
   private static TableMetadata create(TableOperations ops, UpdateTableRequest request) {
     // the only valid requirement is that the table will be created
     request.requirements().forEach(requirement -> requirement.validate(ops.current()));
+    Optional<Integer> formatVersion =
+        request.updates().stream()
+            .filter(update -> update instanceof UpgradeFormatVersion)
+            .map(update -> ((UpgradeFormatVersion) update).formatVersion())
+            .findFirst();
 
-    TableMetadata.Builder builder = TableMetadata.buildFromEmpty();
+    TableMetadata.Builder builder =
+        formatVersion.map(TableMetadata::buildFromEmpty).orElseGet(TableMetadata::buildFromEmpty);
     request.updates().forEach(update -> update.applyTo(builder));
-
     // create transactions do not retry. if the table exists, retrying is not a solution
     ops.commit(null, builder.build());
 
@@ -441,18 +465,11 @@ public class CatalogHandlers {
   public static ListTablesResponse listViews(
       ViewCatalog catalog, Namespace namespace, String pageToken, String pageSize) {
     List<TableIdentifier> results = catalog.listViews(namespace);
-    List<TableIdentifier> subResults;
 
-    int start = INTIAL_PAGE_TOKEN.equals(pageToken) ? 0 : Integer.parseInt(pageToken);
-    int end = start + Integer.parseInt(pageSize);
-    subResults = results.subList(start, end);
-    String nextToken = String.valueOf(end);
+    Pair<List<TableIdentifier>, String> page =
+        paginate(results, pageToken, Integer.parseInt(pageSize));
 
-    if (end >= results.size()) {
-      nextToken = null;
-    }
-
-    return ListTablesResponse.builder().addAll(subResults).nextPageToken(nextToken).build();
+    return ListTablesResponse.builder().addAll(page.first()).nextPageToken(page.second()).build();
   }
 
   public static LoadViewResponse createView(
@@ -495,6 +512,12 @@ public class CatalogHandlers {
         .metadata(metadata)
         .metadataLocation(metadata.metadataFileLocation())
         .build();
+  }
+
+  public static void viewExists(ViewCatalog catalog, TableIdentifier viewIdentifier) {
+    if (!catalog.viewExists(viewIdentifier)) {
+      throw new NoSuchViewException("View does not exist: %s", viewIdentifier);
+    }
   }
 
   public static LoadViewResponse loadView(ViewCatalog catalog, TableIdentifier viewIdentifier) {

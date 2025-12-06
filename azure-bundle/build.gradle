@@ -19,7 +19,7 @@
 
 project(":iceberg-azure-bundle") {
 
-  apply plugin: 'com.github.johnrengelman.shadow'
+  apply plugin: 'com.gradleup.shadow'
 
   tasks.jar.dependsOn tasks.shadowJar
 

@@ -103,6 +103,14 @@ create_nightly () {
   # Update version information within the 'nightly' documentation
   update_version "nightly"  
   cd -
+
+  # Remove any existing javadoc 'nightly' link
+  rm -fr docs/javadoc/nightly
+
+  # Create symbolic link to 'nightly' javadoc
+  cd docs/javadoc
+  ln -s latest nightly
+  cd -
 }
 
 # Finds and retrieves the latest version of the documentation based on the directory structure.
@@ -145,6 +153,14 @@ create_latest () {
   # Update version information within the 'latest' documentation
   update_version "latest"  
   cd -
+
+  # Remove any javadoc 'latest' symbolic link
+  rm -rf docs/javadoc/latest
+
+  # Create symbolic link for the 'latest' javadoc
+  cd docs/javadoc
+  ln -s "${ICEBERG_VERSION}" latest
+  cd -
 }
 
 # Updates version information within the mkdocs.yml file for a specified ICEBERG_VERSION.
@@ -161,8 +177,8 @@ update_version () {
   # Update version information within the mkdocs.yml file using sed commands
   if [ "$(uname)" == "Darwin" ]
   then
-    sed -i '' -E "s/(^site\_name:[[:space:]]+docs\/).*$/\1${ICEBERG_VERSION}/" ${ICEBERG_VERSION}/mkdocs.yml
-    sed -i '' -E "s/(^[[:space:]]*-[[:space:]]+Javadoc:.*\/javadoc\/).*$/\1${ICEBERG_VERSION}/" ${ICEBERG_VERSION}/mkdocs.yml
+    /usr/bin/sed -i '' -E "s/(^site\_name:[[:space:]]+docs\/).*$/\1${ICEBERG_VERSION}/" ${ICEBERG_VERSION}/mkdocs.yml
+    /usr/bin/sed -i '' -E "s/(^[[:space:]]*-[[:space:]]+Javadoc:.*\/javadoc\/).*$/\1${ICEBERG_VERSION}/" ${ICEBERG_VERSION}/mkdocs.yml
   elif [ "$(expr substr $(uname -s) 1 5)" == "Linux" ]
   then
     sed -i'' -E "s/(^site_name:[[:space:]]+docs\/)[^[:space:]]+/\1${ICEBERG_VERSION}/" "${ICEBERG_VERSION}/mkdocs.yml"
@@ -197,9 +213,12 @@ pull_versioned_docs () {
   # Ensure the remote repository for documentation exists and is up-to-date
   create_or_update_docs_remote  
 
-  # Add local worktrees for documentation and javadoc from the remote repository
-  git worktree add -f docs/docs "${REMOTE}/docs"
-  git worktree add -f docs/javadoc "${REMOTE}/javadoc"
+  # Add local worktrees for documentation and javadoc either from the remote repository
+  # or from a local branch.
+  local docs_branch="${ICEBERG_VERSIONED_DOCS_BRANCH:-${REMOTE}/docs}"
+  local javadoc_branch="${ICEBERG_VERSIONED_JAVADOC_BRANCH:-${REMOTE}/javadoc}"
+  git worktree add -f docs/docs "${docs_branch}"
+  git worktree add -f docs/javadoc "${javadoc_branch}"
   
   # Retrieve the latest version of documentation for processing
   local latest_version=$(get_latest_version)  

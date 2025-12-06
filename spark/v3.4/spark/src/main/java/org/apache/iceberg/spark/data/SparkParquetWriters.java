@@ -262,9 +262,6 @@ public class SparkParquetWriters {
       switch (primitive.getPrimitiveTypeName()) {
         case FIXED_LEN_BYTE_ARRAY:
         case BINARY:
-          if (LogicalTypeAnnotation.uuidType().equals(primitive.getLogicalTypeAnnotation())) {
-            return uuids(desc);
-          }
           return byteArrays(desc);
         case BOOLEAN:
           return ParquetValueWriters.booleans(desc);
@@ -561,7 +558,7 @@ public class SparkParquetWriters {
 
     private InternalRowWriter(List<ParquetValueWriter<?>> writers, List<DataType> types) {
       super(writers);
-      this.types = types.toArray(new DataType[types.size()]);
+      this.types = types.toArray(new DataType[0]);
     }
 
     @Override

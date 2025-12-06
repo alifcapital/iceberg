@@ -22,6 +22,7 @@ import static org.apache.iceberg.PartitionSpec.builderFor;
 import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
@@ -63,6 +64,7 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.hadoop.ConfigProperties;
@@ -86,7 +88,7 @@ public class TestHiveCommitLocks {
   private static HiveClientPool spyClientPool = null;
   private static CachedClientPool spyCachedClientPool = null;
   private static Configuration overriddenHiveConf;
-  private static AtomicReference<IMetaStoreClient> spyClientRef = new AtomicReference<>();
+  private static final AtomicReference<IMetaStoreClient> SPY_CLIENT_REF = new AtomicReference<>();
   private static IMetaStoreClient spyClient = null;
   HiveTableOperations ops = null;
   TableMetadata metadataV1 = null;
@@ -100,9 +102,9 @@ public class TestHiveCommitLocks {
 
   private static final String DB_NAME = "hivedb";
   private static final String TABLE_NAME = "tbl";
-  private static final Schema schema =
+  private static final Schema SCHEMA =
       new Schema(Types.StructType.of(required(1, "id", Types.LongType.get())).fields());
-  private static final PartitionSpec partitionSpec = builderFor(schema).identity("id").build();
+  private static final PartitionSpec PARTITION_SPEC = builderFor(SCHEMA).identity("id").build();
   static final TableIdentifier TABLE_IDENTIFIER = TableIdentifier.of(DB_NAME, TABLE_NAME);
 
   @RegisterExtension
@@ -143,8 +145,8 @@ public class TestHiveCommitLocks {
               // cannot spy on RetryingHiveMetastoreClient as it is a proxy
               IMetaStoreClient client =
                   spy(new HiveMetaStoreClient(HIVE_METASTORE_EXTENSION.hiveConf()));
-              spyClientRef.set(client);
-              return spyClientRef.get();
+              SPY_CLIENT_REF.set(client);
+              return SPY_CLIENT_REF.get();
             });
 
     spyClientPool.run(IMetaStoreClient::isLocalMetaStore); // To ensure new client is created.
@@ -153,15 +155,15 @@ public class TestHiveCommitLocks {
         spy(new CachedClientPool(HIVE_METASTORE_EXTENSION.hiveConf(), Collections.emptyMap()));
     when(spyCachedClientPool.clientPool()).thenAnswer(invocation -> spyClientPool);
 
-    assertThat(spyClientRef.get()).isNotNull();
+    assertThat(SPY_CLIENT_REF.get()).isNotNull();
 
-    spyClient = spyClientRef.get();
+    spyClient = SPY_CLIENT_REF.get();
   }
 
   @BeforeEach
   public void before() throws Exception {
     this.tableLocation =
-        new Path(catalog.createTable(TABLE_IDENTIFIER, schema, partitionSpec).location());
+        new Path(catalog.createTable(TABLE_IDENTIFIER, SCHEMA, PARTITION_SPEC).location());
     Table table = catalog.loadTable(TABLE_IDENTIFIER);
     ops = (HiveTableOperations) ((HasTableOperations) table).operations();
     String dbName = TABLE_IDENTIFIER.namespace().level(0);
@@ -203,6 +205,37 @@ public class TestHiveCommitLocks {
     } catch (Throwable t) {
       // Ignore any exception
     }
+  }
+
+  @Test
+  public void testMultipleAlterTableForNoLock() throws Exception {
+    Table table = catalog.loadTable(TABLE_IDENTIFIER);
+    table.updateProperties().set(TableProperties.HIVE_LOCK_ENABLED, "false").commit();
+    spyOps.refresh();
+    TableMetadata metadataV3 = spyOps.current();
+    AtomicReference<Throwable> alterTableException = new AtomicReference<>(null);
+    doAnswer(
+            i -> {
+              try {
+                // mock a situation where alter table is unexpectedly invoked more than once
+                i.callRealMethod();
+                return i.callRealMethod();
+              } catch (Throwable e) {
+                alterTableException.compareAndSet(null, e);
+                throw e;
+              }
+            })
+        .when(spyClient)
+        .alter_table_with_environmentContext(anyString(), anyString(), any(), any());
+    spyOps.commit(metadataV3, metadataV1);
+    verify(spyClient, times(1))
+        .alter_table_with_environmentContext(anyString(), anyString(), any(), any());
+    assertThat(alterTableException)
+        .as("Expecting to trigger an exception indicating table has been modified")
+        .hasValueMatching(
+            t ->
+                t.getMessage()
+                    .contains("The table has been modified. The parameter value for key '"));
   }
 
   @Test
@@ -387,7 +420,7 @@ public class TestHiveCommitLocks {
 
   /** Wraps an ArgumentCaptor to provide data based on the request */
   private class ShowLocksResponseElementWrapper extends ShowLocksResponseElement {
-    private ArgumentCaptor<LockRequest> wrapped;
+    private final ArgumentCaptor<LockRequest> wrapped;
 
     private ShowLocksResponseElementWrapper(ArgumentCaptor<LockRequest> wrapped) {
       this.wrapped = wrapped;

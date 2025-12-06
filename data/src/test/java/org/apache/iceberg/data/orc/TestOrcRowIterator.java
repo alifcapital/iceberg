@@ -37,11 +37,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
 import org.apache.orc.OrcConf;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 public class TestOrcRowIterator {
 
@@ -59,14 +57,13 @@ public class TestOrcRowIterator {
     }
   }
 
-  @Rule public TemporaryFolder temp = new TemporaryFolder();
+  @TempDir private File tempDir;
 
   private File testFile;
 
-  @Before
+  @BeforeEach
   public void writeFile() throws IOException {
-    testFile = temp.newFile();
-    Assert.assertTrue("Delete should succeed", testFile.delete());
+    testFile = new File(tempDir, "junit" + System.nanoTime());
 
     try (FileAppender<Record> writer =
         ORC.write(Files.localOutput(testFile))

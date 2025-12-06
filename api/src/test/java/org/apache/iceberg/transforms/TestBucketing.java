@@ -166,6 +166,62 @@ public class TestBucketing {
   }
 
   @Test
+  public void testTimestampNanoPromotion() {
+    Types.TimestampType tsType = Types.TimestampType.withoutZone();
+    Types.TimestampNanoType tsNsType = Types.TimestampNanoType.withoutZone();
+    Bucket<Object> tsNsBucket = Bucket.get(tsNsType, 1);
+    Bucket<Object> tsBucket = Bucket.get(tsType, 1);
+
+    // Values from spec Appendix B: 32-bit Hash Requirements
+    assertThat(tsBucket.hash(Literal.of("2017-11-16T22:31:08").to(tsType).value()))
+        .as(
+            "Spec example: hash(2017-11-16T22:31:08) = -2047944441 for Timestamp and TimestampNano should match")
+        .isEqualTo(-2047944441);
+    assertThat(tsNsBucket.hash(Literal.of("2017-11-16T22:31:08").to(tsNsType).value()))
+        .as(
+            "Spec example: hash(2017-11-16T22:31:08) = -2047944441 for Timestamp and TimestampNano should match")
+        .isEqualTo(-2047944441);
+
+    assertThat(tsBucket.hash(Literal.of("2017-11-16T22:31:08.000001").to(tsType).value()))
+        .as(
+            "Spec example: hash(2017-11-16T22:31:08.000001) = -1207196810 for Timestamp and TimestampNano should match")
+        .isEqualTo(-1207196810);
+    assertThat(tsNsBucket.hash(Literal.of("2017-11-16T22:31:08.000001001").to(tsNsType).value()))
+        .as(
+            "Spec example: hash(2017-11-16T22:31:08.000001) = -1207196810 for Timestamp and TimestampNano should match")
+        .isEqualTo(-1207196810);
+  }
+
+  @Test
+  public void testTimestampTzNanoPromotion() {
+    Types.TimestampType tsTzType = Types.TimestampType.withZone();
+    Types.TimestampNanoType tsTzNsType = Types.TimestampNanoType.withZone();
+    Bucket<Object> tsTzNsBucket = Bucket.get(tsTzNsType, 1);
+    Bucket<Object> tsTzBucket = Bucket.get(tsTzType, 1);
+
+    // Values from spec Appendix B: 32-bit Hash Requirements
+    assertThat(tsTzBucket.hash(Literal.of("2017-11-16T14:31:08-08:00").to(tsTzType).value()))
+        .as(
+            "Spec example: hash(2017-11-16T14:31:08-08:00) = -2047944441 for Timestamp and TimestampNano should match")
+        .isEqualTo(-2047944441);
+    assertThat(tsTzNsBucket.hash(Literal.of("2017-11-16T14:31:08-08:00").to(tsTzNsType).value()))
+        .as(
+            "Spec example: hash(2017-11-16T14:31:08-08:00) = -2047944441 for Timestamp and TimestampNano should match")
+        .isEqualTo(-2047944441);
+
+    assertThat(tsTzBucket.hash(Literal.of("2017-11-16T14:31:08.000001-08:00").to(tsTzType).value()))
+        .as(
+            "Spec example: hash(2017-11-16T14:31:08.000001-08:00) = -1207196810 for Timestamp and TimestampNano should match")
+        .isEqualTo(-1207196810);
+    assertThat(
+            tsTzNsBucket.hash(
+                Literal.of("2017-11-16T14:31:08.000001001-08:00").to(tsTzNsType).value()))
+        .as(
+            "Spec example: hash(2017-11-16T14:31:08.000001-08:00) = -1207196810 for Timestamp and TimestampNano should match")
+        .isEqualTo(-1207196810);
+  }
+
+  @Test
   public void testIntegerTypePromotion() {
     int randomInt = testRandom.nextInt();
 
@@ -361,6 +417,62 @@ public class TestBucketing {
         .hasMessage("Invalid number of buckets: 0 (must be > 0)");
   }
 
+  @Test
+  public void testVariantUnsupported() {
+    assertThatThrownBy(() -> Transforms.bucket(Types.VariantType.get(), 3))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("Cannot bucket by type: variant");
+
+    Transform<Object, Integer> bucket = Transforms.bucket(3);
+    assertThatThrownBy(() -> bucket.bind(Types.VariantType.get()))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("Cannot bucket by type: variant");
+
+    assertThat(bucket.canTransform(Types.VariantType.get())).isFalse();
+  }
+
+  @Test
+  public void testGeometryUnsupported() {
+    assertThatThrownBy(() -> Transforms.bucket(Types.GeometryType.crs84(), 3))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Cannot bucket by type: geometry");
+
+    Transform<Object, Integer> bucket = Transforms.bucket(3);
+    assertThatThrownBy(() -> bucket.bind(Types.GeometryType.crs84()))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Cannot bucket by type: geometry");
+
+    assertThat(bucket.canTransform(Types.GeometryType.crs84())).isFalse();
+  }
+
+  @Test
+  public void testGeographyUnsupported() {
+    assertThatThrownBy(() -> Transforms.bucket(Types.GeographyType.crs84(), 3))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Cannot bucket by type: geography");
+
+    Transform<Object, Integer> bucket = Transforms.bucket(3);
+    assertThatThrownBy(() -> bucket.bind(Types.GeographyType.crs84()))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Cannot bucket by type: geography");
+
+    assertThat(bucket.canTransform(Types.GeographyType.crs84())).isFalse();
+  }
+
+  @Test
+  public void testUnknownUnsupported() {
+    assertThatThrownBy(() -> Transforms.bucket(Types.UnknownType.get(), 3))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("Cannot bucket by type: unknown");
+
+    Transform<Object, Integer> bucket = Transforms.bucket(3);
+    assertThatThrownBy(() -> bucket.bind(Types.UnknownType.get()))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("Cannot bucket by type: unknown");
+
+    assertThat(bucket.canTransform(Types.UnknownType.get())).isFalse();
+  }
+
   private byte[] randomBytes(int length) {
     byte[] bytes = new byte[length];
     testRandom.nextBytes(bytes);
@@ -383,7 +495,7 @@ public class TestBucketing {
    */
   private static UUID newUUID(byte[] bytes) {
     try {
-      return uuidBytesConstructor.newInstance((Object) bytes);
+      return uuidBytesConstructor.newInstance(bytes);
     } catch (InstantiationException | IllegalAccessException | InvocationTargetException e) {
       throw new RuntimeException(e);
     }

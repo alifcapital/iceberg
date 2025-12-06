@@ -135,6 +135,7 @@ class ManifestGroup {
 
   ManifestGroup ignoreResiduals() {
     this.ignoreResiduals = true;
+    deleteIndexBuilder.ignoreResiduals();
     return this;
   }
 
@@ -184,7 +185,7 @@ class ManifestGroup {
     DeleteFileIndex deleteFiles = deleteIndexBuilder.scanMetrics(scanMetrics).build();
 
     boolean dropStats = ManifestReader.dropStats(columns);
-    if (!deleteFiles.isEmpty()) {
+    if (deleteFiles.hasEqualityDeletes()) {
       select(ManifestReader.withStatsColumns(columns));
     }
 

@@ -33,6 +33,7 @@ import org.apache.avro.generic.GenericFixed;
 import org.apache.avro.specific.SpecificData;
 import org.apache.iceberg.avro.AvroSchemaVisitor;
 import org.apache.iceberg.avro.UUIDConversion;
+import org.apache.iceberg.avro.VariantConversion;
 import org.apache.iceberg.relocated.com.google.common.base.Objects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -192,10 +193,12 @@ class ParquetAvro {
         private final Conversion<?> intDecimalConversion = new IntDecimalConversion();
         private final Conversion<?> longDecimalConversion = new LongDecimalConversion();
         private final Conversion<?> uuidConversion = new UUIDConversion();
+        private final Conversion<?> variantConversion = new VariantConversion();
 
         {
           addLogicalTypeConversion(fixedDecimalConversion);
           addLogicalTypeConversion(uuidConversion);
+          addLogicalTypeConversion(variantConversion);
         }
 
         @Override
@@ -299,9 +302,14 @@ class ParquetAvro {
     }
 
     @Override
+    public Schema variant(Schema variant, Schema metadataResult, Schema valueResult) {
+      return variant;
+    }
+
+    @Override
     public Schema primitive(Schema primitive) {
       LogicalType logicalType = primitive.getLogicalType();
-      if (logicalType != null && logicalType instanceof LogicalTypes.Decimal) {
+      if (logicalType instanceof LogicalTypes.Decimal) {
         LogicalTypes.Decimal decimal = (LogicalTypes.Decimal) logicalType;
         if (decimal.getPrecision() <= 9) {
           return new ParquetDecimal(decimal.getPrecision(), decimal.getScale())

@@ -298,11 +298,9 @@ abstract class BaseDistributedDataScan
               DataFile dataFile = fileTask.file();
               List<DeleteFile> deleteFiles = fileTask.deletes();
 
-              // Count both files and records
+              // Count delete files per data file
               long eqDeleteFileCount = 0;
               long posDeleteFileCount = 0;
-              long eqDeleteRecordCount = 0;
-              long posDeleteRecordCount = 0;
 
               for (DeleteFile deleteFile : deleteFiles) {
                   if (deleteFile.content() == FileContent.EQUALITY_DELETES) {
@@ -482,8 +480,14 @@ abstract class BaseDistributedDataScan
     return count == null || !count.equals("0");
   }
 
-  // a monitor pool that enables planing data and deletes concurrently if remote planning is used
+  /**
+   * Creates a monitor pool that enables planing data and deletes concurrently if remote planning is
+   * used
+   *
+   * <p><b>Important:</b> Callers are responsible for shutting down the returned executor service
+   * when it is no longer needed
+   */
   private ExecutorService newMonitorPool() {
-    return ThreadPools.newWorkerPool("iceberg-planning-monitor-service", MONITOR_POOL_SIZE);
+    return ThreadPools.newFixedThreadPool("iceberg-planning-monitor-service", MONITOR_POOL_SIZE);
   }
 }

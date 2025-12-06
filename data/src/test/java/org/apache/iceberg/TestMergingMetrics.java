@@ -20,16 +20,15 @@ package org.apache.iceberg;
 
 import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
+import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.File;
 import java.nio.ByteBuffer;
-import java.util.Collection;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.stream.Collectors;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.RandomGenericData;
 import org.apache.iceberg.data.Record;
@@ -41,14 +40,11 @@ import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.NaNUtil;
-import org.junit.Assert;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
 
-@RunWith(Parameterized.class)
+@ExtendWith(ParameterizedTestExtension.class)
 public abstract class TestMergingMetrics<T> {
 
   // all supported fields, except for UUID which is on deprecation path: see
@@ -91,8 +87,7 @@ public abstract class TestMergingMetrics<T> {
               optional(27, "timestamp", Types.TimestampType.withZone())));
 
   private static final Map<Types.NestedField, Integer> FIELDS_WITH_NAN_COUNT_TO_ID =
-      ImmutableMap.of(
-          FLOAT_FIELD, 3, DOUBLE_FIELD, 4, FLOAT_LIST, 10, MAP_FIELD_1, 18, MAP_FIELD_2, 22);
+      ImmutableMap.of(FLOAT_FIELD, 3, DOUBLE_FIELD, 4);
 
   // create a schema with all supported fields
   protected static final Schema SCHEMA =
@@ -110,22 +105,17 @@ public abstract class TestMergingMetrics<T> {
           MAP_FIELD_2,
           STRUCT_FIELD);
 
-  protected final FileFormat fileFormat;
-
-  @Parameterized.Parameters(name = "fileFormat = {0}")
-  public static Object[] parameters() {
-    return new Object[] {FileFormat.PARQUET, FileFormat.ORC};
-  }
-
-  public TestMergingMetrics(FileFormat fileFormat) {
-    this.fileFormat = fileFormat;
-  }
-
   protected abstract FileAppender<T> writeAndGetAppender(List<Record> records) throws Exception;
 
-  @Rule public TemporaryFolder temp = new TemporaryFolder();
+  @Parameters(name = "fileFormat = {0}")
+  public static List<Object> parameters() {
+    return Arrays.asList(FileFormat.PARQUET, FileFormat.ORC);
+  }
 
-  @Test
+  @Parameter protected FileFormat fileFormat;
+  @TempDir protected File tempDir;
+
+  @TestTemplate
   public void verifySingleRecordMetric() throws Exception {
     Record record = GenericRecord.create(SCHEMA);
     record.setField(ID_FIELD.name(), 3);
@@ -147,26 +137,18 @@ public abstract class TestMergingMetrics<T> {
     Map<Integer, ByteBuffer> upperBounds = metrics.upperBounds();
     Map<Integer, ByteBuffer> lowerBounds = metrics.lowerBounds();
 
+    assertThat(nanValueCount).hasSize(2);
     assertNaNCountMatch(1L, nanValueCount, FLOAT_FIELD);
     assertNaNCountMatch(1L, nanValueCount, DOUBLE_FIELD);
-    assertNaNCountMatch(2L, nanValueCount, FLOAT_LIST);
-    assertNaNCountMatch(1L, nanValueCount, MAP_FIELD_1);
-    assertNaNCountMatch(3L, nanValueCount, MAP_FIELD_2);
 
-    assertBoundValueMatch(null, upperBounds, FLOAT_FIELD);
-    assertBoundValueMatch(null, upperBounds, DOUBLE_FIELD);
-    assertBoundValueMatch(3.3F, upperBounds, FLOAT_LIST);
-    assertBoundValueMatch(0F, upperBounds, MAP_FIELD_1);
-    assertBoundValueMatch(2D, upperBounds, MAP_FIELD_2);
+    assertThat(upperBounds).hasSize(1);
+    assertBoundValueMatch(3, upperBounds, ID_FIELD);
 
-    assertBoundValueMatch(null, lowerBounds, FLOAT_FIELD);
-    assertBoundValueMatch(null, lowerBounds, DOUBLE_FIELD);
-    assertBoundValueMatch(-25.1F, lowerBounds, FLOAT_LIST);
-    assertBoundValueMatch(0F, lowerBounds, MAP_FIELD_1);
-    assertBoundValueMatch(0D, lowerBounds, MAP_FIELD_2);
+    assertThat(lowerBounds).hasSize(1);
+    assertBoundValueMatch(3, lowerBounds, ID_FIELD);
   }
 
-  @Test
+  @TestTemplate
   public void verifyRandomlyGeneratedRecordsMetric() throws Exception {
     // too big of the record count will more likely to make all upper/lower bounds +/-infinity,
     // which makes the tests easier to pass
@@ -192,32 +174,25 @@ public abstract class TestMergingMetrics<T> {
         .map(Types.NestedField::fieldId)
         .forEach(
             id ->
-                Assert.assertNull(
-                    "NaN count for field %s should be null", metrics.nanValueCounts().get(id)));
+                assertThat(metrics.nanValueCounts().get(id))
+                    .as("NaN count for field %s should be null")
+                    .isNull());
   }
 
   private void assertNaNCountMatch(
       Long expected, Map<Integer, Long> nanValueCount, Types.NestedField field) {
-    Assert.assertEquals(
-        String.format("NaN count for field %s does not match expected", field.name()),
-        expected,
-        nanValueCount.get(FIELDS_WITH_NAN_COUNT_TO_ID.get(field)));
+    assertThat(nanValueCount)
+        .as(String.format("NaN count for field %s does not match expected", field.name()))
+        .containsEntry(field.fieldId(), expected);
   }
 
   private void assertBoundValueMatch(
       Number expected, Map<Integer, ByteBuffer> boundMap, Types.NestedField field) {
-    if (field.type().isNestedType() && fileFormat == FileFormat.ORC) {
-      // we don't update floating column bounds values within ORC nested columns
-      return;
-    }
-
-    int actualFieldId = FIELDS_WITH_NAN_COUNT_TO_ID.get(field);
-    ByteBuffer byteBuffer = boundMap.get(actualFieldId);
-    Type type = SCHEMA.findType(actualFieldId);
-    Assert.assertEquals(
-        String.format("Bound value for field %s must match", field.name()),
-        expected,
-        byteBuffer == null ? null : Conversions.fromByteBuffer(type, byteBuffer));
+    ByteBuffer byteBuffer = boundMap.get(field.fieldId());
+    Type type = SCHEMA.findType(field.fieldId());
+    assertThat(byteBuffer == null ? null : Conversions.<T>fromByteBuffer(type, byteBuffer))
+        .as(String.format("Bound value for field %s must match", field.name()))
+        .isEqualTo(expected);
   }
 
   private void populateExpectedValues(
@@ -242,47 +217,7 @@ public abstract class TestMergingMetrics<T> {
           expectedNaNCount,
           DOUBLE_FIELD,
           (Double) record.getField(DOUBLE_FIELD.name()));
-
-      List<Float> floatList = (List<Float>) record.getField(FLOAT_LIST.name());
-      if (floatList != null) {
-        updateExpectedValueFromRecords(
-            upperBounds, lowerBounds, expectedNaNCount, FLOAT_LIST, floatList);
-      }
-
-      Map<Float, ?> map1 = (Map<Float, ?>) record.getField(MAP_FIELD_1.name());
-      if (map1 != null) {
-        updateExpectedValueFromRecords(
-            upperBounds, lowerBounds, expectedNaNCount, MAP_FIELD_1, map1.keySet());
-      }
-
-      Map<?, Double> map2 = (Map<?, Double>) record.getField(MAP_FIELD_2.name());
-      if (map2 != null) {
-        updateExpectedValueFromRecords(
-            upperBounds, lowerBounds, expectedNaNCount, MAP_FIELD_2, map2.values());
-      }
     }
-  }
-
-  private <T1 extends Number> void updateExpectedValueFromRecords(
-      Map<Types.NestedField, AtomicReference<Number>> upperBounds,
-      Map<Types.NestedField, AtomicReference<Number>> lowerBounds,
-      Map<Types.NestedField, AtomicLong> expectedNaNCount,
-      Types.NestedField key,
-      Collection<T1> vals) {
-    List<Number> nonNullNumbers =
-        vals.stream().filter(v -> !NaNUtil.isNaN(v)).collect(Collectors.toList());
-    Optional<Number> maxOptional =
-        nonNullNumbers.stream()
-            .filter(Objects::nonNull)
-            .reduce((v1, v2) -> getMinOrMax(v1, v2, true));
-    Optional<Number> minOptional =
-        nonNullNumbers.stream()
-            .filter(Objects::nonNull)
-            .reduce((v1, v2) -> getMinOrMax(v1, v2, false));
-
-    expectedNaNCount.get(key).addAndGet(vals.size() - nonNullNumbers.size());
-    maxOptional.ifPresent(max -> updateBound(key, max, upperBounds, true));
-    minOptional.ifPresent(min -> updateBound(key, min, lowerBounds, false));
   }
 
   private void updateExpectedValuePerRecord(

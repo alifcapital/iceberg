@@ -20,6 +20,9 @@ package org.apache.iceberg.rest;
 
 import static java.lang.String.format;
 
+import jakarta.servlet.http.HttpServlet;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.Reader;
@@ -30,15 +33,12 @@ import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-import javax.servlet.http.HttpServlet;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 import org.apache.hc.core5.http.ContentType;
 import org.apache.hc.core5.http.HttpHeaders;
 import org.apache.iceberg.exceptions.RESTException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.io.CharStreams;
-import org.apache.iceberg.rest.RESTCatalogAdapter.HTTPMethod;
+import org.apache.iceberg.rest.HTTPRequest.HTTPMethod;
 import org.apache.iceberg.rest.RESTCatalogAdapter.Route;
 import org.apache.iceberg.rest.responses.ErrorResponse;
 import org.apache.iceberg.util.Pair;
@@ -96,15 +96,17 @@ public class RESTCatalogServlet extends HttpServlet {
     }
 
     try {
-      Object responseBody =
-          restCatalogAdapter.execute(
+
+      HTTPRequest request =
+          restCatalogAdapter.buildRequest(
               context.method(),
               context.path(),
               context.queryParams(),
-              context.body(),
-              context.route().responseClass(),
               context.headers(),
-              handle(response));
+              context.body());
+      Object responseBody =
+          restCatalogAdapter.execute(
+              request, context.route().responseClass(), handle(response), h -> {});
 
       if (responseBody != null) {
         RESTObjectMapper.mapper().writeValue(response.getWriter(), responseBody);

@@ -36,7 +36,7 @@ public class BucketUtil {
   private BucketUtil() {}
 
   public static int hash(int value) {
-    return MURMUR3.hashLong((long) value).asInt();
+    return MURMUR3.hashLong(value).asInt();
   }
 
   public static int hash(long value) {
@@ -56,7 +56,7 @@ public class BucketUtil {
   }
 
   public static int hash(float value) {
-    return MURMUR3.hashLong(doubleToLongBits((double) value)).asInt();
+    return MURMUR3.hashLong(doubleToLongBits(value)).asInt();
   }
 
   public static int hash(double value) {
@@ -65,6 +65,10 @@ public class BucketUtil {
 
   public static int hash(CharSequence value) {
     return MURMUR3.hashString(value, StandardCharsets.UTF_8).asInt();
+  }
+
+  public static int hash(byte[] value) {
+    return MURMUR3.hashBytes(value).asInt();
   }
 
   public static int hash(ByteBuffer value) {

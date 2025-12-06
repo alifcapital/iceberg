@@ -23,7 +23,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
-import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.expressions.Binder;
 import org.apache.iceberg.expressions.BoundReference;
@@ -34,6 +33,7 @@ import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -52,7 +52,8 @@ public class AllManifestsTable extends BaseMetadataTable {
   public static final Types.NestedField REF_SNAPSHOT_ID =
       Types.NestedField.required(18, "reference_snapshot_id", Types.LongType.get());
 
-  private static final Schema MANIFEST_FILE_SCHEMA =
+  @VisibleForTesting
+  static final Schema MANIFEST_FILE_SCHEMA =
       new Schema(
           Types.NestedField.required(14, "content", Types.IntegerType.get()),
           Types.NestedField.required(1, "path", Types.StringType.get()),
@@ -119,6 +120,7 @@ public class AllManifestsTable extends BaseMetadataTable {
     protected CloseableIterable<FileScanTask> doPlanFiles() {
       FileIO io = table().io();
       Map<Integer, PartitionSpec> specs = Maps.newHashMap(table().specs());
+      Schema dataTableSchema = table().schema();
       Expression filter = shouldIgnoreResiduals() ? Expressions.alwaysTrue() : filter();
 
       SnapshotEvaluator snapshotEvaluator =
@@ -132,7 +134,13 @@ public class AllManifestsTable extends BaseMetadataTable {
               snap -> {
                 if (snap.manifestListLocation() != null) {
                   return new ManifestListReadTask(
-                      io, schema(), specs, snap.manifestListLocation(), filter, snap.snapshotId());
+                      dataTableSchema,
+                      io,
+                      schema(),
+                      specs,
+                      snap.manifestListLocation(),
+                      filter,
+                      snap.snapshotId());
                 } else {
                   return StaticDataTask.of(
                       io.newInputFile(
@@ -149,6 +157,7 @@ public class AllManifestsTable extends BaseMetadataTable {
   }
 
   static class ManifestListReadTask implements DataTask {
+    private final Schema dataTableSchema;
     private final FileIO io;
     private final Schema schema;
     private final Map<Integer, PartitionSpec> specs;
@@ -158,12 +167,14 @@ public class AllManifestsTable extends BaseMetadataTable {
     private DataFile lazyDataFile = null;
 
     ManifestListReadTask(
+        Schema dataTableSchema,
         FileIO io,
         Schema schema,
         Map<Integer, PartitionSpec> specs,
         String manifestListLocation,
         Expression residual,
         long referenceSnapshotId) {
+      this.dataTableSchema = dataTableSchema;
       this.io = io;
       this.schema = schema;
       this.specs = specs;
@@ -180,13 +191,11 @@ public class AllManifestsTable extends BaseMetadataTable {
     @Override
     public CloseableIterable<StructLike> rows() {
       try (CloseableIterable<ManifestFile> manifests =
-          Avro.read(io.newInputFile(manifestListLocation))
-              .rename("manifest_file", GenericManifestFile.class.getName())
-              .rename("partitions", GenericPartitionFieldSummary.class.getName())
-              .rename("r508", GenericPartitionFieldSummary.class.getName())
+          InternalData.read(FileFormat.AVRO, io.newInputFile(manifestListLocation))
+              .setRootType(GenericManifestFile.class)
+              .setCustomType(
+                  ManifestFile.PARTITION_SUMMARIES_ELEMENT_ID, GenericPartitionFieldSummary.class)
               .project(ManifestFile.schema())
-              .classLoader(GenericManifestFile.class.getClassLoader())
-              .reuseContainers(false)
               .build()) {
 
         CloseableIterable<StructLike> rowIterable =
@@ -243,6 +252,31 @@ public class AllManifestsTable extends BaseMetadataTable {
     @Override
     public Iterable<FileScanTask> split(long splitSize) {
       return ImmutableList.of(this); // don't split
+    }
+
+    @Override
+    public Schema schema() {
+      return schema;
+    }
+
+    Schema dataTableSchema() {
+      return dataTableSchema;
+    }
+
+    FileIO io() {
+      return io;
+    }
+
+    Map<Integer, PartitionSpec> specsById() {
+      return specs;
+    }
+
+    String manifestListLocation() {
+      return manifestListLocation;
+    }
+
+    long referenceSnapshotId() {
+      return referenceSnapshotId;
     }
   }
 

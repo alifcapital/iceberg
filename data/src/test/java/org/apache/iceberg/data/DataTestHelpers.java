@@ -22,29 +22,62 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
 import java.util.Map;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
-import org.junit.Assert;
+import org.apache.iceberg.variants.Variant;
+import org.apache.iceberg.variants.VariantTestUtil;
 
 public class DataTestHelpers {
   private DataTestHelpers() {}
 
   public static void assertEquals(Types.StructType struct, Record expected, Record actual) {
-    List<Types.NestedField> fields = struct.fields();
-    for (int i = 0; i < fields.size(); i += 1) {
-      Type fieldType = fields.get(i).type();
+    assertEquals(struct, expected, actual, null, -1);
+  }
 
-      Object expectedValue = expected.get(i);
-      Object actualValue = actual.get(i);
+  public static void assertEquals(
+      Types.StructType struct,
+      Record expected,
+      Record actual,
+      Map<Integer, Object> idToConstant,
+      int pos) {
+    Types.StructType expectedType = expected.struct();
+    for (Types.NestedField field : struct.fields()) {
+      Types.NestedField expectedField = expectedType.field(field.fieldId());
+      Object expectedValue;
+      if (expectedField != null) {
+        int id = expectedField.fieldId();
+        if (id == MetadataColumns.ROW_ID.fieldId()) {
+          expectedValue = expected.getField(expectedField.name());
+          if (expectedValue == null && idToConstant != null) {
+            expectedValue = (Long) idToConstant.get(id) + pos;
+          }
 
-      assertEquals(fieldType, expectedValue, actualValue);
+        } else if (id == MetadataColumns.LAST_UPDATED_SEQUENCE_NUMBER.fieldId()) {
+          expectedValue = expected.getField(expectedField.name());
+          if (expectedValue == null && idToConstant != null) {
+            expectedValue = idToConstant.get(id);
+          }
+
+        } else {
+          expectedValue = expected.getField(expectedField.name());
+        }
+
+        assertEquals(field.type(), expectedValue, actual.getField(field.name()));
+
+      } else {
+        assertEquals(
+            field.type(),
+            GenericDataUtil.internalToGeneric(field.type(), field.initialDefault()),
+            actual.getField(field.name()));
+      }
     }
   }
 
   public static void assertEquals(Types.ListType list, List<?> expected, List<?> actual) {
     Type elementType = list.elementType();
 
-    Assert.assertEquals("List size should match", expected.size(), actual.size());
+    assertThat(actual).as("List size should match").hasSameSizeAs(expected);
 
     for (int i = 0; i < expected.size(); i += 1) {
       Object expectedValue = expected.get(i);
@@ -57,7 +90,7 @@ public class DataTestHelpers {
   public static void assertEquals(Types.MapType map, Map<?, ?> expected, Map<?, ?> actual) {
     Type valueType = map.valueType();
 
-    Assert.assertEquals("Map size should match", expected.size(), actual.size());
+    assertThat(actual).as("Map size should match").hasSameSizeAs(expected);
 
     for (Object expectedKey : expected.keySet()) {
       Object expectedValue = expected.get(expectedKey);
@@ -73,6 +106,7 @@ public class DataTestHelpers {
     }
 
     switch (type.typeId()) {
+      case UNKNOWN:
       case BOOLEAN:
       case INTEGER:
       case LONG:
@@ -82,17 +116,24 @@ public class DataTestHelpers {
       case DATE:
       case TIME:
       case TIMESTAMP:
+      case TIMESTAMP_NANO:
       case UUID:
       case BINARY:
       case DECIMAL:
-        Assert.assertEquals(
-            "Primitive value should be equal to expected for type " + type, expected, actual);
+        assertThat(actual)
+            .as("Primitive value should be equal to expected for type " + type)
+            .isEqualTo(expected);
+        break;
+      case VARIANT:
+        assertThat(expected).as("Expected should be a Variant").isInstanceOf(Variant.class);
+        assertThat(actual).as("Actual should be a Variant").isInstanceOf(Variant.class);
+        VariantTestUtil.assertEqual(((Variant) expected).metadata(), ((Variant) actual).metadata());
+        VariantTestUtil.assertEqual(((Variant) expected).value(), ((Variant) actual).value());
         break;
       case FIXED:
         assertThat(expected).as("Expected should be a byte[]").isInstanceOf(byte[].class);
-        assertThat(expected).as("Actual should be a byte[]").isInstanceOf(byte[].class);
-        Assert.assertArrayEquals(
-            "Array contents should be equal", (byte[]) expected, (byte[]) actual);
+        assertThat(actual).as("Actual should be a byte[]").isInstanceOf(byte[].class);
+        assertThat(actual).as("Array contents should be equal").isEqualTo(expected);
         break;
       case STRUCT:
         assertThat(expected).as("Expected should be a Record").isInstanceOf(Record.class);

@@ -32,36 +32,66 @@ import org.apache.iceberg.util.DateTimeUtil;
 import org.apache.iceberg.util.SerializableFunction;
 
 enum Timestamps implements Transform<Long, Integer> {
-  YEAR(ChronoUnit.YEARS, "year"),
-  MONTH(ChronoUnit.MONTHS, "month"),
-  DAY(ChronoUnit.DAYS, "day"),
-  HOUR(ChronoUnit.HOURS, "hour");
+  MICROS_TO_YEAR(ChronoUnit.YEARS, "year", TimestampUnit.MICROS),
+  MICROS_TO_MONTH(ChronoUnit.MONTHS, "month", TimestampUnit.MICROS),
+  MICROS_TO_DAY(ChronoUnit.DAYS, "day", TimestampUnit.MICROS),
+  MICROS_TO_HOUR(ChronoUnit.HOURS, "hour", TimestampUnit.MICROS),
+
+  NANOS_TO_YEAR(ChronoUnit.YEARS, "year", TimestampUnit.NANOS),
+  NANOS_TO_MONTH(ChronoUnit.MONTHS, "month", TimestampUnit.NANOS),
+  NANOS_TO_DAY(ChronoUnit.DAYS, "day", TimestampUnit.NANOS),
+  NANOS_TO_HOUR(ChronoUnit.HOURS, "hour", TimestampUnit.NANOS);
+
+  enum TimestampUnit {
+    MICROS,
+    NANOS
+  }
 
   @Immutable
   static class Apply implements SerializableFunction<Long, Integer> {
     private final ChronoUnit granularity;
+    private final TimestampUnit timestampUnit;
 
-    Apply(ChronoUnit granularity) {
+    Apply(ChronoUnit granularity, TimestampUnit timestampUnit) {
       this.granularity = granularity;
+      this.timestampUnit = timestampUnit;
     }
 
     @Override
-    public Integer apply(Long timestampMicros) {
-      if (timestampMicros == null) {
+    public Integer apply(Long timestamp) {
+      if (timestamp == null) {
         return null;
       }
 
-      switch (granularity) {
-        case YEARS:
-          return DateTimeUtil.microsToYears(timestampMicros);
-        case MONTHS:
-          return DateTimeUtil.microsToMonths(timestampMicros);
-        case DAYS:
-          return DateTimeUtil.microsToDays(timestampMicros);
-        case HOURS:
-          return DateTimeUtil.microsToHours(timestampMicros);
+      switch (timestampUnit) {
+        case MICROS:
+          switch (granularity) {
+            case YEARS:
+              return DateTimeUtil.microsToYears(timestamp);
+            case MONTHS:
+              return DateTimeUtil.microsToMonths(timestamp);
+            case DAYS:
+              return DateTimeUtil.microsToDays(timestamp);
+            case HOURS:
+              return DateTimeUtil.microsToHours(timestamp);
+            default:
+              throw new UnsupportedOperationException("Unsupported time unit: " + granularity);
+          }
+        case NANOS:
+          switch (granularity) {
+            case YEARS:
+              return DateTimeUtil.nanosToYears(timestamp);
+            case MONTHS:
+              return DateTimeUtil.nanosToMonths(timestamp);
+            case DAYS:
+              return DateTimeUtil.nanosToDays(timestamp);
+            case HOURS:
+              return DateTimeUtil.nanosToHours(timestamp);
+            default:
+              throw new UnsupportedOperationException("Unsupported time unit: " + granularity);
+          }
         default:
-          throw new UnsupportedOperationException("Unsupported time unit: " + granularity);
+          throw new UnsupportedOperationException("Unsupported time unit: " + timestampUnit);
       }
     }
   }
@@ -70,15 +100,23 @@ enum Timestamps implements Transform<Long, Integer> {
   private final String name;
   private final Apply apply;
 
-  Timestamps(ChronoUnit granularity, String name) {
-    this.granularity = granularity;
+  Timestamps(ChronoUnit granularity, String name, TimestampUnit timestampUnit) {
     this.name = name;
-    this.apply = new Apply(granularity);
+    this.granularity = granularity;
+    this.apply = new Apply(granularity, timestampUnit);
   }
 
+  /**
+   * Transforms a value to its corresponding partition value.
+   *
+   * @param timestamp a source value
+   * @return a transformed partition value
+   * @deprecated will be removed in 2.0.0; use {@link #bind(Type)} instead
+   */
+  @Deprecated
   @Override
-  public Integer apply(Long timestampMicros) {
-    return apply.apply(timestampMicros);
+  public Integer apply(Long timestamp) {
+    return apply.apply(timestamp);
   }
 
   @Override
@@ -89,7 +127,7 @@ enum Timestamps implements Transform<Long, Integer> {
 
   @Override
   public boolean canTransform(Type type) {
-    return type.typeId() == Type.TypeID.TIMESTAMP;
+    return type.typeId() == Type.TypeID.TIMESTAMP || type.typeId() == Type.TypeID.TIMESTAMP_NANO;
   }
 
   @Override
@@ -98,6 +136,10 @@ enum Timestamps implements Transform<Long, Integer> {
       return Types.DateType.get();
     }
     return Types.IntegerType.get();
+  }
+
+  ChronoUnit granularity() {
+    return granularity;
   }
 
   @Override
@@ -111,12 +153,12 @@ enum Timestamps implements Transform<Long, Integer> {
       return true;
     }
 
-    if (other instanceof Timestamps) {
-      // test the granularity, in hours. hour(ts) => 1 hour, day(ts) => 24 hours, and hour satisfies
-      // the order of day
-      Timestamps otherTransform = (Timestamps) other;
-      return granularity.getDuration().toHours()
-          <= otherTransform.granularity.getDuration().toHours();
+    if (other instanceof Dates) {
+      return TransformUtil.satisfiesOrderOf(granularity, ((Dates) other).granularity());
+    } else if (other instanceof Timestamps) {
+      return TransformUtil.satisfiesOrderOf(granularity, ((Timestamps) other).granularity());
+    } else if (other instanceof TimeTransform) {
+      return TransformUtil.satisfiesOrderOf(granularity, ((TimeTransform<?>) other).granularity());
     }
 
     return false;

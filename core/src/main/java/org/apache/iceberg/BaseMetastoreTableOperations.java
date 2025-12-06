@@ -18,11 +18,12 @@
  */
 package org.apache.iceberg;
 
-import java.util.Set;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import org.apache.iceberg.BaseMetastoreOperations.CommitStatus;
 import org.apache.iceberg.encryption.EncryptionManager;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
@@ -33,7 +34,6 @@ import org.apache.iceberg.io.LocationProvider;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Objects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
-import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.LocationUtil;
 import org.apache.iceberg.util.Tasks;
 import org.slf4j.Logger;
@@ -124,7 +124,7 @@ public abstract class BaseMetastoreTableOperations extends BaseMetastoreOperatio
 
     long start = System.currentTimeMillis();
     doCommit(base, metadata);
-    deleteRemovedMetadataFiles(base, metadata);
+    CatalogUtil.deleteRemovedMetadataFiles(io(), base, metadata);
     requestRefresh();
 
     LOG.info(
@@ -283,14 +283,23 @@ public abstract class BaseMetastoreTableOperations extends BaseMetastoreOperatio
   }
 
   /**
-   * @deprecated since 1.6.0, will be removed in 1.7.0; Use {@link
-   *     BaseMetastoreOperations.CommitStatus} instead
+   * Attempt to load the table and see if any current or past metadata location matches the one we
+   * were attempting to set. This is used as a last resort when we are dealing with exceptions that
+   * may indicate the commit has failed but are not proof that this is the case. Past locations must
+   * also be searched on the chance that a second committer was able to successfully commit on top
+   * of our commit. When the {@code newMetadataLocation} is not found, the method returns {@link
+   * CommitStatus#UNKNOWN}.
+   *
+   * @param newMetadataLocation the path of the new commit file
+   * @param config metadata to use for configuration
+   * @return Commit Status of Success, Unknown
    */
-  @Deprecated
-  protected enum CommitStatus {
-    FAILURE,
-    SUCCESS,
-    UNKNOWN
+  protected CommitStatus checkCommitStatus(String newMetadataLocation, TableMetadata config) {
+    return checkCommitStatus(
+        tableName(),
+        newMetadataLocation,
+        config.properties(),
+        () -> checkCurrentMetadataLocation(newMetadataLocation));
   }
 
   /**
@@ -298,20 +307,19 @@ public abstract class BaseMetastoreTableOperations extends BaseMetastoreOperatio
    * were attempting to set. This is used as a last resort when we are dealing with exceptions that
    * may indicate the commit has failed but are not proof that this is the case. Past locations must
    * also be searched on the chance that a second committer was able to successfully commit on top
-   * of our commit.
+   * of our commit. When the {@code newMetadataLocation} is not found, the method returns {@link
+   * CommitStatus#FAILURE}.
    *
    * @param newMetadataLocation the path of the new commit file
    * @param config metadata to use for configuration
    * @return Commit Status of Success, Failure or Unknown
    */
-  protected CommitStatus checkCommitStatus(String newMetadataLocation, TableMetadata config) {
-    return CommitStatus.valueOf(
-        checkCommitStatus(
-                tableName(),
-                newMetadataLocation,
-                config.properties(),
-                () -> checkCurrentMetadataLocation(newMetadataLocation))
-            .name());
+  protected CommitStatus checkCommitStatusStrict(String newMetadataLocation, TableMetadata config) {
+    return checkCommitStatusStrict(
+        tableName(),
+        newMetadataLocation,
+        config.properties(),
+        () -> checkCurrentMetadataLocation(newMetadataLocation));
   }
 
   /**
@@ -336,7 +344,8 @@ public abstract class BaseMetastoreTableOperations extends BaseMetastoreOperatio
             TableProperties.METADATA_COMPRESSION, TableProperties.METADATA_COMPRESSION_DEFAULT);
     String fileExtension = TableMetadataParser.getFileExtension(codecName);
     return metadataFileLocation(
-        meta, String.format("%05d-%s%s", newVersion, UUID.randomUUID(), fileExtension));
+        meta,
+        String.format(Locale.ROOT, "%05d-%s%s", newVersion, UUID.randomUUID(), fileExtension));
   }
 
   /**
@@ -355,46 +364,10 @@ public abstract class BaseMetastoreTableOperations extends BaseMetastoreOperatio
     }
 
     try {
-      return Integer.valueOf(metadataLocation.substring(versionStart, versionEnd));
+      return Integer.parseInt(metadataLocation.substring(versionStart, versionEnd));
     } catch (NumberFormatException e) {
       LOG.warn("Unable to parse version from metadata location: {}", metadataLocation, e);
       return -1;
-    }
-  }
-
-  /**
-   * Deletes the oldest metadata files if {@link
-   * TableProperties#METADATA_DELETE_AFTER_COMMIT_ENABLED} is true.
-   *
-   * @param base table metadata on which previous versions were based
-   * @param metadata new table metadata with updated previous versions
-   */
-  private void deleteRemovedMetadataFiles(TableMetadata base, TableMetadata metadata) {
-    if (base == null) {
-      return;
-    }
-
-    boolean deleteAfterCommit =
-        metadata.propertyAsBoolean(
-            TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED,
-            TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED_DEFAULT);
-
-    if (deleteAfterCommit) {
-      Set<TableMetadata.MetadataLogEntry> removedPreviousMetadataFiles =
-          Sets.newHashSet(base.previousFiles());
-      // TableMetadata#addPreviousFile builds up the metadata log and uses
-      // TableProperties.METADATA_PREVIOUS_VERSIONS_MAX to determine how many files should stay in
-      // the log, thus we don't include metadata.previousFiles() for deletion - everything else can
-      // be removed
-      removedPreviousMetadataFiles.removeAll(metadata.previousFiles());
-      Tasks.foreach(removedPreviousMetadataFiles)
-          .noRetry()
-          .suppressFailureWhenFinished()
-          .onFailure(
-              (previousMetadataFile, exc) ->
-                  LOG.warn(
-                      "Delete failed for previous metadata file: {}", previousMetadataFile, exc))
-          .run(previousMetadataFile -> io().deleteFile(previousMetadataFile.file()));
     }
   }
 }

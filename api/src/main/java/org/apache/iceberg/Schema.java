@@ -28,6 +28,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Joiner;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.BiMap;
@@ -55,6 +56,17 @@ public class Schema implements Serializable {
   private static final String ALL_COLUMNS = "*";
   private static final int DEFAULT_SCHEMA_ID = 0;
 
+  @VisibleForTesting static final int DEFAULT_VALUES_MIN_FORMAT_VERSION = 3;
+
+  @VisibleForTesting
+  static final Map<Type.TypeID, Integer> MIN_FORMAT_VERSIONS =
+      ImmutableMap.of(
+          Type.TypeID.TIMESTAMP_NANO, 3,
+          Type.TypeID.VARIANT, 3,
+          Type.TypeID.UNKNOWN, 3,
+          Type.TypeID.GEOMETRY, 3,
+          Type.TypeID.GEOGRAPHY, 3);
+
   private final StructType struct;
   private final int schemaId;
   private final int[] identifierFieldIds;
@@ -67,8 +79,8 @@ public class Schema implements Serializable {
   private transient Map<Integer, Accessor<StructLike>> idToAccessor = null;
   private transient Map<Integer, String> idToName = null;
   private transient Set<Integer> identifierFieldIdSet = null;
-  private transient Map<Integer, Integer> idsToReassigned;
-  private transient Map<Integer, Integer> idsToOriginal;
+  private final transient Map<Integer, Integer> idsToReassigned;
+  private final transient Map<Integer, Integer> idsToOriginal;
 
   public Schema(List<NestedField> columns, Map<String, Integer> aliases) {
     this(columns, aliases, ImmutableSet.of());
@@ -572,5 +584,49 @@ public class Schema implements Serializable {
               return newId;
             });
     return res.asStructType().fields();
+  }
+
+  /**
+   * Check the compatibility of the schema with a format version.
+   *
+   * <p>This validates that the schema does not contain types that were released in later format
+   * versions.
+   *
+   * @param schema a Schema
+   * @param formatVersion table format version
+   */
+  public static void checkCompatibility(Schema schema, int formatVersion) {
+    // accumulate errors as a treemap to keep them in a reasonable order
+    Map<Integer, String> problems = Maps.newTreeMap();
+
+    // check each field's type and defaults
+    for (NestedField field : schema.lazyIdToField().values()) {
+      Integer minFormatVersion = MIN_FORMAT_VERSIONS.get(field.type().typeId());
+      if (minFormatVersion != null && formatVersion < minFormatVersion) {
+        problems.put(
+            field.fieldId(),
+            String.format(
+                "Invalid type for %s: %s is not supported until v%s",
+                schema.findColumnName(field.fieldId()), field.type(), minFormatVersion));
+      }
+
+      if (field.initialDefault() != null && formatVersion < DEFAULT_VALUES_MIN_FORMAT_VERSION) {
+        problems.put(
+            field.fieldId(),
+            String.format(
+                "Invalid initial default for %s: non-null default (%s) is not supported until v%s",
+                schema.findColumnName(field.fieldId()),
+                field.initialDefault(),
+                DEFAULT_VALUES_MIN_FORMAT_VERSION));
+      }
+    }
+
+    // throw if there are any compatibility problems
+    if (!problems.isEmpty()) {
+      throw new IllegalStateException(
+          String.format(
+              "Invalid schema for v%s:\n- %s",
+              formatVersion, Joiner.on("\n- ").join(problems.values())));
+    }
   }
 }

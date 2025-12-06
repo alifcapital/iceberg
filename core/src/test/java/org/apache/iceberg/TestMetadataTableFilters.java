@@ -21,12 +21,13 @@ package org.apache.iceberg;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
-import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Types;
@@ -37,10 +38,10 @@ import org.junit.jupiter.api.extension.ExtendWith;
 @ExtendWith(ParameterizedTestExtension.class)
 public class TestMetadataTableFilters extends TestBase {
 
-  private static final Set<MetadataTableType> aggFileTables =
+  private static final Set<MetadataTableType> AGG_FILE_TABLES =
       Sets.newHashSet(
           MetadataTableType.ALL_DATA_FILES,
-          MetadataTableType.ALL_DATA_FILES,
+          MetadataTableType.ALL_DELETE_FILES,
           MetadataTableType.ALL_FILES,
           MetadataTableType.ALL_ENTRIES);
 
@@ -49,21 +50,26 @@ public class TestMetadataTableFilters extends TestBase {
 
   @Parameters(name = "formatVersion = {0}, table_type = {1}")
   protected static List<Object> parameters() {
-    return Arrays.asList(
-        new Object[] {1, MetadataTableType.DATA_FILES},
-        new Object[] {2, MetadataTableType.DATA_FILES},
-        new Object[] {2, MetadataTableType.DELETE_FILES},
-        new Object[] {1, MetadataTableType.FILES},
-        new Object[] {2, MetadataTableType.FILES},
-        new Object[] {1, MetadataTableType.ALL_DATA_FILES},
-        new Object[] {2, MetadataTableType.ALL_DATA_FILES},
-        new Object[] {2, MetadataTableType.ALL_DELETE_FILES},
-        new Object[] {1, MetadataTableType.ALL_FILES},
-        new Object[] {2, MetadataTableType.ALL_FILES},
-        new Object[] {1, MetadataTableType.ENTRIES},
-        new Object[] {2, MetadataTableType.ENTRIES},
-        new Object[] {1, MetadataTableType.ALL_ENTRIES},
-        new Object[] {2, MetadataTableType.ALL_ENTRIES});
+    return TestHelpers.ALL_VERSIONS.stream()
+        .flatMap(
+            v -> {
+              ImmutableList.Builder<Object[]> builder =
+                  ImmutableList.<Object[]>builder()
+                      .add(new Object[] {v, MetadataTableType.DATA_FILES})
+                      .add(new Object[] {v, MetadataTableType.FILES})
+                      .add(new Object[] {v, MetadataTableType.ALL_DATA_FILES})
+                      .add(new Object[] {v, MetadataTableType.ALL_FILES})
+                      .add(new Object[] {v, MetadataTableType.ENTRIES})
+                      .add(new Object[] {v, MetadataTableType.ALL_ENTRIES});
+              if (v >= 2) {
+                builder
+                    .add(new Object[] {v, MetadataTableType.DELETE_FILES})
+                    .add(new Object[] {v, MetadataTableType.ALL_DELETE_FILES});
+              }
+
+              return builder.build().stream();
+            })
+        .collect(Collectors.toList());
   }
 
   @BeforeEach
@@ -76,9 +82,9 @@ public class TestMetadataTableFilters extends TestBase {
     table.newFastAppend().appendFile(FILE_D).commit();
     table.newFastAppend().appendFile(FILE_B).commit();
 
-    if (formatVersion == 2) {
-      table.newRowDelta().addDeletes(FILE_A_DELETES).commit();
-      table.newRowDelta().addDeletes(FILE_B_DELETES).commit();
+    if (formatVersion >= 2) {
+      table.newRowDelta().addDeletes(fileADeletes()).commit();
+      table.newRowDelta().addDeletes(fileBDeletes()).commit();
       table.newRowDelta().addDeletes(FILE_C2_DELETES).commit();
       table.newRowDelta().addDeletes(FILE_D2_DELETES).commit();
     }
@@ -132,9 +138,9 @@ public class TestMetadataTableFilters extends TestBase {
         }
       case DATA_FILES:
       case DELETE_FILES:
-      case ALL_DELETE_FILES:
         return partitions;
       case ALL_DATA_FILES:
+      case ALL_DELETE_FILES:
         return partitions * 2; // ScanTask for Data Manifest in DELETED and ADDED states
       case ALL_FILES:
       case ALL_ENTRIES:
@@ -149,7 +155,7 @@ public class TestMetadataTableFilters extends TestBase {
   }
 
   private boolean isAggFileTable(MetadataTableType tableType) {
-    return aggFileTables.contains(tableType);
+    return AGG_FILE_TABLES.contains(tableType);
   }
 
   private String partitionColumn(String colName) {
@@ -169,7 +175,9 @@ public class TestMetadataTableFilters extends TestBase {
     }
   }
 
-  /** @return a basic expression that always evaluates to true, to test AND logic */
+  /**
+   * @return a basic expression that always evaluates to true, to test AND logic
+   */
   private Expression dummyExpression() {
     switch (type) {
       case FILES:
@@ -317,7 +325,7 @@ public class TestMetadataTableFilters extends TestBase {
             .withPartition(data10Key)
             .build();
     PartitionKey data11Key = new PartitionKey(newSpec, table.schema());
-    data10Key.set(1, 11);
+    data11Key.set(1, 11);
     DataFile data11 =
         DataFiles.builder(newSpec)
             .withPath("/path/to/data-11.parquet")
@@ -364,7 +372,7 @@ public class TestMetadataTableFilters extends TestBase {
 
   @TestTemplate
   public void testPartitionSpecEvolutionRemovalV2() {
-    assumeThat(formatVersion).isEqualTo(2);
+    assumeThat(formatVersion).isGreaterThanOrEqualTo(2);
 
     // Change spec and add two data and delete files each
     table.updateSpec().removeField(Expressions.bucket("data", 16)).addField("id").commit();
@@ -386,27 +394,13 @@ public class TestMetadataTableFilters extends TestBase {
             .withPartitionPath("id=11")
             .build();
 
-    DeleteFile delete10 =
-        FileMetadata.deleteFileBuilder(newSpec)
-            .ofPositionDeletes()
-            .withPath("/path/to/data-10-deletes.parquet")
-            .withFileSizeInBytes(10)
-            .withPartitionPath("id=10")
-            .withRecordCount(1)
-            .build();
-    DeleteFile delete11 =
-        FileMetadata.deleteFileBuilder(newSpec)
-            .ofPositionDeletes()
-            .withPath("/path/to/data-11-deletes.parquet")
-            .withFileSizeInBytes(10)
-            .withPartitionPath("id=11")
-            .withRecordCount(1)
-            .build();
+    DeleteFile delete10 = newDeletes(data10);
+    DeleteFile delete11 = newDeletes(data11);
 
     table.newFastAppend().appendFile(data10).commit();
     table.newFastAppend().appendFile(data11).commit();
 
-    if (formatVersion == 2) {
+    if (formatVersion >= 2) {
       table.newRowDelta().addDeletes(delete10).commit();
       table.newRowDelta().addDeletes(delete11).commit();
     }
@@ -465,8 +459,8 @@ public class TestMetadataTableFilters extends TestBase {
             .withPartition(data10Key)
             .build();
     PartitionKey data11Key = new PartitionKey(newSpec, table.schema());
-    data11Key.set(0, 1); // data=0
-    data10Key.set(1, 11); // id=11
+    data11Key.set(0, 1); // data=1
+    data11Key.set(1, 11); // id=11
     DataFile data11 =
         DataFiles.builder(newSpec)
             .withPath("/path/to/data-11.parquet")
@@ -512,8 +506,8 @@ public class TestMetadataTableFilters extends TestBase {
   }
 
   @TestTemplate
-  public void testPartitionSpecEvolutionAdditiveV2() {
-    assumeThat(formatVersion).isEqualTo(2);
+  public void testPartitionSpecEvolutionAdditiveV2AndAbove() {
+    assumeThat(formatVersion).isGreaterThanOrEqualTo(2);
 
     // Change spec and add two data and delete files each
     table.updateSpec().addField("id").commit();
@@ -535,27 +529,13 @@ public class TestMetadataTableFilters extends TestBase {
             .withPartitionPath("data_bucket=1/id=11")
             .build();
 
-    DeleteFile delete10 =
-        FileMetadata.deleteFileBuilder(newSpec)
-            .ofPositionDeletes()
-            .withPath("/path/to/data-10-deletes.parquet")
-            .withFileSizeInBytes(10)
-            .withPartitionPath("data_bucket=0/id=10")
-            .withRecordCount(1)
-            .build();
-    DeleteFile delete11 =
-        FileMetadata.deleteFileBuilder(newSpec)
-            .ofPositionDeletes()
-            .withPath("/path/to/data-11-deletes.parquet")
-            .withFileSizeInBytes(10)
-            .withPartitionPath("data_bucket=1/id=11")
-            .withRecordCount(1)
-            .build();
+    DeleteFile delete10 = newDeletes(data10);
+    DeleteFile delete11 = newDeletes(data11);
 
     table.newFastAppend().appendFile(data10).commit();
     table.newFastAppend().appendFile(data11).commit();
 
-    if (formatVersion == 2) {
+    if (formatVersion >= 2) {
       table.newRowDelta().addDeletes(delete10).commit();
       table.newRowDelta().addDeletes(delete11).commit();
     }

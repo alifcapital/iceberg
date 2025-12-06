@@ -24,9 +24,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -44,9 +43,8 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.orc.OrcMetrics;
 import org.apache.iceberg.parquet.ParquetUtil;
-import org.apache.iceberg.relocated.com.google.common.util.concurrent.MoreExecutors;
-import org.apache.iceberg.relocated.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.iceberg.util.Tasks;
+import org.apache.iceberg.util.ThreadPools;
 
 public class TableMigrationUtil {
   private static final PathFilter HIDDEN_PATH_FILTER =
@@ -100,7 +98,9 @@ public class TableMigrationUtil {
    * @param conf a Hadoop conf
    * @param metricsSpec a metrics conf
    * @param mapping a name mapping
-   * @param parallelism number of threads to use for file reading
+   * @param parallelism number of threads to use for file reading. If null, file reading will be
+   *     performed on the current thread. If non-null, the provided ExecutorService will be shutdown
+   *     within this method after file reading is complete.
    * @return a List of DataFile
    */
   public static List<DataFile> listPartition(
@@ -112,7 +112,48 @@ public class TableMigrationUtil {
       MetricsConfig metricsSpec,
       NameMapping mapping,
       int parallelism) {
-    ExecutorService service = null;
+    return listPartition(
+        partition,
+        partitionUri,
+        format,
+        spec,
+        conf,
+        metricsSpec,
+        mapping,
+        migrationService(parallelism));
+  }
+
+  /**
+   * Returns the data files in a partition by listing the partition location. Metrics are read from
+   * the files and the file reading is done in parallel by a specified number of threads.
+   *
+   * <p>For Parquet and ORC partitions, this will read metrics from the file footer. For Avro
+   * partitions, metrics other than row count are set to null.
+   *
+   * <p>Note: certain metrics, like NaN counts, that are only supported by Iceberg file writers but
+   * not file footers, will not be populated.
+   *
+   * @param partition map of column names to column values for the partition
+   * @param partitionUri partition location URI
+   * @param format partition format, avro, parquet or orc
+   * @param spec a partition spec
+   * @param conf a Hadoop conf
+   * @param metricsSpec a metrics conf
+   * @param mapping a name mapping
+   * @param service executor service to use for file reading. If null, file reading will be
+   *     performed on the current thread. If non-null, the provided ExecutorService will be shutdown
+   *     within this method after file reading is complete.
+   * @return a List of DataFile
+   */
+  public static List<DataFile> listPartition(
+      Map<String, String> partition,
+      String partitionUri,
+      String format,
+      PartitionSpec spec,
+      Configuration conf,
+      MetricsConfig metricsSpec,
+      NameMapping mapping,
+      ExecutorService service) {
     try {
       List<String> partitionValues =
           spec.fields().stream()
@@ -130,8 +171,7 @@ public class TableMigrationUtil {
       Tasks.Builder<Integer> task =
           Tasks.range(fileStatus.size()).stopOnFailure().throwFailureWhenFinished();
 
-      if (parallelism > 1) {
-        service = migrationService(parallelism);
+      if (service != null) {
         task.executeWith(service);
       }
 
@@ -215,11 +255,17 @@ public class TableMigrationUtil {
         .build();
   }
 
-  private static ExecutorService migrationService(int parallelism) {
-    return MoreExecutors.getExitingExecutorService(
-        (ThreadPoolExecutor)
-            Executors.newFixedThreadPool(
-                parallelism,
-                new ThreadFactoryBuilder().setNameFormat("table-migration-%d").build()));
+  /**
+   * Returns an {@link ExecutorService} for table migration.
+   *
+   * <p>If parallelism is 1, this method returns null, indicating that no executor service is
+   * needed. Otherwise, it returns a fixed-size thread pool with the given parallelism.
+   *
+   * <p><b>Important:</b> Callers are responsible for shutting down the returned executor service
+   * when it is no longer needed to prevent resource leaks.
+   */
+  @Nullable
+  public static ExecutorService migrationService(int parallelism) {
+    return parallelism == 1 ? null : ThreadPools.newFixedThreadPool("table-migration", parallelism);
   }
 }

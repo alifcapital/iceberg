@@ -25,6 +25,7 @@ import java.io.Serializable;
 import java.nio.ByteBuffer;
 import java.util.Map;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.Type;
 import org.apache.iceberg.util.ByteBuffers;
 
 /** Iceberg file format metrics. */
@@ -37,8 +38,14 @@ public class Metrics implements Serializable {
   private Map<Integer, Long> nanValueCounts = null;
   private Map<Integer, ByteBuffer> lowerBounds = null;
   private Map<Integer, ByteBuffer> upperBounds = null;
+  // this is not serialized with all the other fields
+  private Map<Integer, Type> originalTypes = null;
 
   public Metrics() {}
+
+  public Metrics(long rowCount) {
+    this.rowCount = rowCount;
+  }
 
   public Metrics(
       Long rowCount,
@@ -46,11 +53,7 @@ public class Metrics implements Serializable {
       Map<Integer, Long> valueCounts,
       Map<Integer, Long> nullValueCounts,
       Map<Integer, Long> nanValueCounts) {
-    this.rowCount = rowCount;
-    this.columnSizes = columnSizes;
-    this.valueCounts = valueCounts;
-    this.nullValueCounts = nullValueCounts;
-    this.nanValueCounts = nanValueCounts;
+    this(rowCount, columnSizes, valueCounts, nullValueCounts, nanValueCounts, null, null, null);
   }
 
   public Metrics(
@@ -61,6 +64,26 @@ public class Metrics implements Serializable {
       Map<Integer, Long> nanValueCounts,
       Map<Integer, ByteBuffer> lowerBounds,
       Map<Integer, ByteBuffer> upperBounds) {
+    this(
+        rowCount,
+        columnSizes,
+        valueCounts,
+        nullValueCounts,
+        nanValueCounts,
+        lowerBounds,
+        upperBounds,
+        null);
+  }
+
+  public Metrics(
+      Long rowCount,
+      Map<Integer, Long> columnSizes,
+      Map<Integer, Long> valueCounts,
+      Map<Integer, Long> nullValueCounts,
+      Map<Integer, Long> nanValueCounts,
+      Map<Integer, ByteBuffer> lowerBounds,
+      Map<Integer, ByteBuffer> upperBounds,
+      Map<Integer, Type> originalTypes) {
     this.rowCount = rowCount;
     this.columnSizes = columnSizes;
     this.valueCounts = valueCounts;
@@ -68,6 +91,7 @@ public class Metrics implements Serializable {
     this.nanValueCounts = nanValueCounts;
     this.lowerBounds = lowerBounds;
     this.upperBounds = upperBounds;
+    this.originalTypes = originalTypes;
   }
 
   /**
@@ -139,6 +163,15 @@ public class Metrics implements Serializable {
   }
 
   /**
+   * Get the non-null original types for the upper/lower bound for all fields in a file.
+   *
+   * @return A map of fieldId to the original type of the upper/lower bound.
+   */
+  Map<Integer, Type> originalTypes() {
+    return originalTypes;
+  }
+
+  /**
    * Implemented the method to enable serialization of ByteBuffers.
    *
    * @param out The stream where to write
@@ -179,6 +212,7 @@ public class Metrics implements Serializable {
    * @throws IOException On serialization error
    * @throws ClassNotFoundException If the class is not found
    */
+  @SuppressWarnings("DangerousJavaDeserialization")
   private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
     rowCount = (Long) in.readObject();
     columnSizes = (Map<Integer, Long>) in.readObject();
@@ -190,6 +224,7 @@ public class Metrics implements Serializable {
     upperBounds = readByteBufferMap(in);
   }
 
+  @SuppressWarnings("DangerousJavaDeserialization")
   private static Map<Integer, ByteBuffer> readByteBufferMap(ObjectInputStream in)
       throws IOException, ClassNotFoundException {
     int size = in.readInt();

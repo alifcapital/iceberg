@@ -50,16 +50,16 @@ public interface FileIO extends Serializable, Closeable {
     Preconditions.checkArgument(
         file.keyMetadata() == null,
         "Cannot decrypt data file: %s (use EncryptingFileIO)",
-        file.path());
-    return newInputFile(file.path().toString(), file.fileSizeInBytes());
+        file.location());
+    return newInputFile(file.location(), file.fileSizeInBytes());
   }
 
   default InputFile newInputFile(DeleteFile file) {
     Preconditions.checkArgument(
         file.keyMetadata() == null,
         "Cannot decrypt delete file: %s (use EncryptingFileIO)",
-        file.path());
-    return newInputFile(file.path().toString(), file.fileSizeInBytes());
+        file.location());
+    return newInputFile(file.location(), file.fileSizeInBytes());
   }
 
   default InputFile newInputFile(ManifestFile manifest) {
@@ -94,7 +94,7 @@ public interface FileIO extends Serializable, Closeable {
    */
   default Map<String, String> properties() {
     throw new UnsupportedOperationException(
-        String.format("%s does not expose configuration properties", this.getClass().toString()));
+        String.format("%s does not expose configuration properties", this.getClass()));
   }
 
   /**

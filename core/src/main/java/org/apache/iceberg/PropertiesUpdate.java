@@ -62,7 +62,7 @@ class PropertiesUpdate implements UpdateProperties {
   public UpdateProperties remove(String key) {
     Preconditions.checkNotNull(key, "Key cannot be null");
     Preconditions.checkArgument(
-        !updates.keySet().contains(key), "Cannot remove and update the same key: %s", key);
+        !updates.containsKey(key), "Cannot remove and update the same key: %s", key);
 
     removals.add(key);
 
@@ -98,12 +98,13 @@ class PropertiesUpdate implements UpdateProperties {
 
   @Override
   public void commit() {
+    // If existing table commit properties in base are corrupted, allow rectification
     Tasks.foreach(ops)
-        .retry(base.propertyAsInt(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
+        .retry(base.propertyTryAsInt(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
         .exponentialBackoff(
-            base.propertyAsInt(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT),
-            base.propertyAsInt(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT),
-            base.propertyAsInt(COMMIT_TOTAL_RETRY_TIME_MS, COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT),
+            base.propertyTryAsInt(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT),
+            base.propertyTryAsInt(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT),
+            base.propertyTryAsInt(COMMIT_TOTAL_RETRY_TIME_MS, COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT),
             2.0 /* exponential */)
         .onlyRetryOn(CommitFailedException.class)
         .run(

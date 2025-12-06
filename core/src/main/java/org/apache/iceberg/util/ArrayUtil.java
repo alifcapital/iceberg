@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.LongStream;
+import org.apache.iceberg.relocated.com.google.common.primitives.Ints;
 import org.apache.iceberg.relocated.com.google.common.primitives.Longs;
 
 public class ArrayUtil {
@@ -40,6 +41,14 @@ public class ArrayUtil {
   public static List<Integer> toIntList(int[] ints) {
     if (ints != null) {
       return IntStream.of(ints).boxed().collect(Collectors.toList());
+    } else {
+      return null;
+    }
+  }
+
+  public static List<Integer> toUnmodifiableIntList(int[] ints) {
+    if (ints != null) {
+      return Collections.unmodifiableList(Ints.asList(ints));
     } else {
       return null;
     }
@@ -96,7 +105,7 @@ public class ArrayUtil {
     }
     final boolean[] result = new boolean[array.length];
     for (int i = 0; i < array.length; i++) {
-      result[i] = array[i].booleanValue();
+      result[i] = array[i];
     }
     return result;
   }
@@ -120,7 +129,7 @@ public class ArrayUtil {
     }
     final byte[] result = new byte[array.length];
     for (int i = 0; i < array.length; i++) {
-      result[i] = array[i].byteValue();
+      result[i] = array[i];
     }
     return result;
   }
@@ -144,7 +153,7 @@ public class ArrayUtil {
     }
     final short[] result = new short[array.length];
     for (int i = 0; i < array.length; i++) {
-      result[i] = array[i].shortValue();
+      result[i] = array[i];
     }
     return result;
   }
@@ -168,7 +177,7 @@ public class ArrayUtil {
     }
     final int[] result = new int[array.length];
     for (int i = 0; i < array.length; i++) {
-      result[i] = array[i].intValue();
+      result[i] = array[i];
     }
     return result;
   }
@@ -192,7 +201,7 @@ public class ArrayUtil {
     }
     final long[] result = new long[array.length];
     for (int i = 0; i < array.length; i++) {
-      result[i] = array[i].longValue();
+      result[i] = array[i];
     }
     return result;
   }
@@ -216,7 +225,7 @@ public class ArrayUtil {
     }
     final float[] result = new float[array.length];
     for (int i = 0; i < array.length; i++) {
-      result[i] = array[i].floatValue();
+      result[i] = array[i];
     }
     return result;
   }
@@ -240,7 +249,7 @@ public class ArrayUtil {
     }
     final double[] result = new double[array.length];
     for (int i = 0; i < array.length; i++) {
-      result[i] = array[i].doubleValue();
+      result[i] = array[i];
     }
     return result;
   }

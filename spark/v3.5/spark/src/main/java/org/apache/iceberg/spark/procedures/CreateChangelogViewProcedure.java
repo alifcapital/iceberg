@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -37,6 +38,7 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.catalyst.expressions.OrderUtils;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter;
@@ -146,10 +148,21 @@ public class CreateChangelogViewProcedure extends BaseProcedure {
     Dataset<Row> df = loadRows(changelogTableIdent, options(input));
 
     boolean netChanges = input.asBoolean(NET_CHANGES, false);
+    String[] identifierColumns = identifierColumns(input, tableIdent);
+    Set<String> unorderableColumnNames =
+        Arrays.stream(df.schema().fields())
+            .filter(field -> !OrderUtils.isOrderable(field.dataType()))
+            .map(StructField::name)
+            .collect(Collectors.toSet());
+
+    Preconditions.checkArgument(
+        identifierColumns.length > 0 || unorderableColumnNames.isEmpty(),
+        "Identifier field is required as table contains unorderable columns: %s",
+        unorderableColumnNames);
 
     if (shouldComputeUpdateImages(input)) {
       Preconditions.checkArgument(!netChanges, "Not support net changes with update images");
-      df = computeUpdateImages(identifierColumns(input, tableIdent), df);
+      df = computeUpdateImages(identifierColumns, df);
     } else {
       df = removeCarryoverRows(df, netChanges);
     }
@@ -197,7 +210,12 @@ public class CreateChangelogViewProcedure extends BaseProcedure {
     }
 
     Column[] repartitionSpec =
-        Arrays.stream(df.columns()).filter(columnsToKeep).map(df::col).toArray(Column[]::new);
+        Arrays.stream(df.columns())
+            .filter(columnsToKeep)
+            .map(CreateChangelogViewProcedure::delimitedName)
+            .map(df::col)
+            .toArray(Column[]::new);
+
     return applyCarryoverRemoveIterator(df, repartitionSpec, netChanges);
   }
 
@@ -206,7 +224,9 @@ public class CreateChangelogViewProcedure extends BaseProcedure {
       return input.asStringArray(IDENTIFIER_COLUMNS_PARAM);
     } else {
       Table table = loadSparkTable(tableIdent).table();
-      return table.schema().identifierFieldNames().toArray(new String[0]);
+      return table.schema().identifierFieldNames().stream()
+          .map(CreateChangelogViewProcedure::delimitedName)
+          .toArray(String[]::new);
     }
   }
 
@@ -255,6 +275,24 @@ public class CreateChangelogViewProcedure extends BaseProcedure {
                         ? ChangelogIterator.removeNetCarryovers(rowIterator, schema)
                         : ChangelogIterator.removeCarryovers(rowIterator, schema),
             Encoders.row(schema));
+  }
+
+  /**
+   * Ensure that column can be referenced using this name. Issues may come from field names that
+   * contain non-standard characters. In Spark, this can be fixed by using <a
+   * href="https://spark.apache.org/docs/3.5.0/sql-ref-identifier.html#delimited-identifier">backtick
+   * quotes</a>.
+   *
+   * @param columnName Column name that potentially can contain non-standard characters.
+   * @return A name that can be safely used within Spark to reference a column by its name.
+   */
+  private static String delimitedName(String columnName) {
+    boolean delimited = columnName.startsWith("`") && columnName.endsWith("`");
+    if (delimited) {
+      return columnName;
+    } else {
+      return "`" + columnName.replaceAll("`", "``") + "`";
+    }
   }
 
   private static Column[] sortSpec(Dataset<Row> df, Column[] repartitionSpec, boolean netChanges) {

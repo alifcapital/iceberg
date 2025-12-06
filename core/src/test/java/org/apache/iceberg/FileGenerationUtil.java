@@ -19,27 +19,49 @@
 package org.apache.iceberg;
 
 import java.nio.ByteBuffer;
+import java.util.Comparator;
 import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import org.apache.iceberg.MetricsModes.Counts;
+import org.apache.iceberg.MetricsModes.MetricsMode;
+import org.apache.iceberg.MetricsModes.None;
+import org.apache.iceberg.MetricsModes.Truncate;
 import org.apache.iceberg.io.DeleteSchemaUtil;
 import org.apache.iceberg.io.LocationProvider;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.transforms.Transform;
+import org.apache.iceberg.transforms.Transforms;
+import org.apache.iceberg.types.Comparators;
 import org.apache.iceberg.types.Conversions;
+import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.Type.PrimitiveType;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.Pair;
+import org.apache.iceberg.util.RandomUtil;
 
 public class FileGenerationUtil {
 
   private FileGenerationUtil() {}
 
   public static DataFile generateDataFile(Table table, StructLike partition) {
+    return generateDataFile(table, partition, ImmutableMap.of(), ImmutableMap.of());
+  }
+
+  public static DataFile generateDataFile(
+      Table table,
+      StructLike partition,
+      Map<Integer, ByteBuffer> lowerBounds,
+      Map<Integer, ByteBuffer> upperBounds) {
     Schema schema = table.schema();
     PartitionSpec spec = table.spec();
     LocationProvider locations = table.locationProvider();
     String path = locations.newDataLocation(spec, partition, generateFileName());
     long fileSize = generateFileSize();
-    Metrics metrics = generateRandomMetrics(schema);
+    MetricsConfig metricsConfig = MetricsConfig.forTable(table);
+    Metrics metrics = generateRandomMetrics(schema, metricsConfig, lowerBounds, upperBounds);
     return DataFiles.builder(spec)
         .withPath(path)
         .withPartition(partition)
@@ -65,20 +87,70 @@ public class FileGenerationUtil {
         .build();
   }
 
-  public static DeleteFile generatePositionDeleteFile(Table table, DataFile dataFile) {
+  public static DeleteFile generateEqualityDeleteFile(Table table, StructLike partition) {
     PartitionSpec spec = table.spec();
+    LocationProvider locations = table.locationProvider();
+    String path = locations.newDataLocation(spec, partition, generateFileName());
+    long fileSize = generateFileSize();
+    return FileMetadata.deleteFileBuilder(spec)
+        .ofEqualityDeletes()
+        .withPartition(partition)
+        .withPath(path)
+        .withFileSizeInBytes(fileSize)
+        .withFormat(FileFormat.PARQUET)
+        .withRecordCount(generateRowCount())
+        .build();
+  }
+
+  public static DeleteFile generateDV(Table table, DataFile dataFile) {
+    PartitionSpec spec = table.specs().get(dataFile.specId());
+    long fileSize = generateFileSize();
+    long cardinality = generateRowCount();
+    long offset = generateContentOffset();
+    long length = generateContentLength();
+    return FileMetadata.deleteFileBuilder(spec)
+        .ofPositionDeletes()
+        .withPath("/path/to/delete-" + UUID.randomUUID() + ".puffin")
+        .withFileSizeInBytes(fileSize)
+        .withPartition(dataFile.partition())
+        .withRecordCount(cardinality)
+        .withReferencedDataFile(dataFile.location())
+        .withContentOffset(offset)
+        .withContentSizeInBytes(length)
+        .build();
+  }
+
+  public static DeleteFile generatePositionDeleteFile(Table table, DataFile dataFile) {
+    PartitionSpec spec = table.specs().get(dataFile.specId());
     StructLike partition = dataFile.partition();
     LocationProvider locations = table.locationProvider();
     String path = locations.newDataLocation(spec, partition, generateFileName());
     long fileSize = generateFileSize();
     Metrics metrics = generatePositionDeleteMetrics(dataFile);
-    return FileMetadata.deleteFileBuilder(table.spec())
+    return FileMetadata.deleteFileBuilder(spec)
         .ofPositionDeletes()
         .withPath(path)
         .withPartition(partition)
         .withFileSizeInBytes(fileSize)
         .withFormat(FileFormat.PARQUET)
         .withMetrics(metrics)
+        .build();
+  }
+
+  public static DeleteFile generatePositionDeleteFileWithRef(Table table, DataFile dataFile) {
+    PartitionSpec spec = table.specs().get(dataFile.specId());
+    StructLike partition = dataFile.partition();
+    LocationProvider locations = table.locationProvider();
+    String path = locations.newDataLocation(spec, partition, generateFileName());
+    long fileSize = generateFileSize();
+    return FileMetadata.deleteFileBuilder(spec)
+        .ofPositionDeletes()
+        .withPath(path)
+        .withPartition(partition)
+        .withFileSizeInBytes(fileSize)
+        .withFormat(FileFormat.PARQUET)
+        .withReferencedDataFile(dataFile.location())
+        .withRecordCount(3)
         .build();
   }
 
@@ -91,7 +163,11 @@ public class FileGenerationUtil {
     return String.format("%d-%d-%s-%d.parquet", partitionId, taskId, operationId, fileCount);
   }
 
-  public static Metrics generateRandomMetrics(Schema schema) {
+  public static Metrics generateRandomMetrics(
+      Schema schema,
+      MetricsConfig metricsConfig,
+      Map<Integer, ByteBuffer> knownLowerBounds,
+      Map<Integer, ByteBuffer> knownUpperBounds) {
     long rowCount = generateRowCount();
     Map<Integer, Long> columnSizes = Maps.newHashMap();
     Map<Integer, Long> valueCounts = Maps.newHashMap();
@@ -99,6 +175,7 @@ public class FileGenerationUtil {
     Map<Integer, Long> nanValueCounts = Maps.newHashMap();
     Map<Integer, ByteBuffer> lowerBounds = Maps.newHashMap();
     Map<Integer, ByteBuffer> upperBounds = Maps.newHashMap();
+    Map<Integer, Type> originalTypes = Maps.newHashMap();
 
     for (Types.NestedField column : schema.columns()) {
       int fieldId = column.fieldId();
@@ -106,12 +183,17 @@ public class FileGenerationUtil {
       valueCounts.put(fieldId, generateValueCount());
       nullValueCounts.put(fieldId, (long) random().nextInt(5));
       nanValueCounts.put(fieldId, (long) random().nextInt(5));
-      byte[] lower = new byte[16];
-      random().nextBytes(lower);
-      lowerBounds.put(fieldId, ByteBuffer.wrap(lower));
-      byte[] upper = new byte[16];
-      random().nextBytes(upper);
-      upperBounds.put(fieldId, ByteBuffer.wrap(upper));
+      originalTypes.put(fieldId, column.type());
+      if (knownLowerBounds.containsKey(fieldId) && knownUpperBounds.containsKey(fieldId)) {
+        lowerBounds.put(fieldId, knownLowerBounds.get(fieldId));
+        upperBounds.put(fieldId, knownUpperBounds.get(fieldId));
+      } else if (column.type().isPrimitiveType()) {
+        PrimitiveType type = column.type().asPrimitiveType();
+        MetricsMode metricsMode = metricsConfig.columnMode(column.name());
+        Pair<ByteBuffer, ByteBuffer> bounds = generateBounds(type, metricsMode);
+        lowerBounds.put(fieldId, bounds.first());
+        upperBounds.put(fieldId, bounds.second());
+      }
     }
 
     return new Metrics(
@@ -121,7 +203,8 @@ public class FileGenerationUtil {
         nullValueCounts,
         nanValueCounts,
         lowerBounds,
-        upperBounds);
+        upperBounds,
+        originalTypes);
   }
 
   private static Metrics generatePositionDeleteMetrics(DataFile dataFile) {
@@ -129,14 +212,16 @@ public class FileGenerationUtil {
     Map<Integer, Long> columnSizes = Maps.newHashMap();
     Map<Integer, ByteBuffer> lowerBounds = Maps.newHashMap();
     Map<Integer, ByteBuffer> upperBounds = Maps.newHashMap();
+    Map<Integer, Type> originalTypes = Maps.newHashMap();
 
     for (Types.NestedField column : DeleteSchemaUtil.pathPosSchema().columns()) {
       int fieldId = column.fieldId();
       columnSizes.put(fieldId, generateColumnSize());
       if (fieldId == MetadataColumns.DELETE_FILE_PATH.fieldId()) {
-        ByteBuffer bound = Conversions.toByteBuffer(Types.StringType.get(), dataFile.path());
+        ByteBuffer bound = Conversions.toByteBuffer(Types.StringType.get(), dataFile.location());
         lowerBounds.put(fieldId, bound);
         upperBounds.put(fieldId, bound);
+        originalTypes.put(fieldId, column.type());
       }
     }
 
@@ -147,7 +232,8 @@ public class FileGenerationUtil {
         null /* no NULL counts */,
         null /* no NaN counts */,
         lowerBounds,
-        upperBounds);
+        upperBounds,
+        originalTypes);
   }
 
   private static Metrics generatePositionDeleteMetrics() {
@@ -183,6 +269,45 @@ public class FileGenerationUtil {
 
   private static long generateFileSize() {
     return random().nextInt(50_000);
+  }
+
+  private static long generateContentOffset() {
+    return random().nextInt(1_000_000);
+  }
+
+  private static long generateContentLength() {
+    return random().nextInt(10_000);
+  }
+
+  private static Pair<ByteBuffer, ByteBuffer> generateBounds(PrimitiveType type, MetricsMode mode) {
+    Comparator<Object> cmp = Comparators.forType(type);
+    Object value1 = generateBound(type, mode);
+    Object value2 = generateBound(type, mode);
+    if (cmp.compare(value1, value2) > 0) {
+      ByteBuffer lowerBuffer = Conversions.toByteBuffer(type, value2);
+      ByteBuffer upperBuffer = Conversions.toByteBuffer(type, value1);
+      return Pair.of(lowerBuffer, upperBuffer);
+    } else {
+      ByteBuffer lowerBuffer = Conversions.toByteBuffer(type, value1);
+      ByteBuffer upperBuffer = Conversions.toByteBuffer(type, value2);
+      return Pair.of(lowerBuffer, upperBuffer);
+    }
+  }
+
+  private static Object generateBound(PrimitiveType type, MetricsMode mode) {
+    if (mode instanceof None || mode instanceof Counts) {
+      return null;
+    } else if (mode instanceof Truncate) {
+      Object value = RandomUtil.generatePrimitive(type, random());
+      Transform<Object, Object> truncate = Transforms.truncate(((Truncate) mode).length());
+      if (truncate.canTransform(type)) {
+        return truncate.bind(type).apply(value);
+      } else {
+        return value;
+      }
+    } else {
+      return RandomUtil.generatePrimitive(type, random());
+    }
   }
 
   private static Random random() {

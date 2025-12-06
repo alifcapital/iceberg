@@ -45,6 +45,18 @@ The Iceberg community prefers to receive contributions as [Github pull requests]
 * If a PR is related to an issue, adding `Closes #1234` in the PR description will automatically close the issue and helps keep the project clean
 * If a PR is posted for visibility and isn't necessarily ready for review or merging, be sure to convert the PR to a draft
 
+### Merging Pull Requests
+
+Most pull requests can be merged once a single [committer](https://www.apache.org/foundation/how-it-works/#committers) other than the author is satisfied with the code in the PR (exceptions that require additional input from the community are detailed below). [Committers are trusted](https://infra.apache.org/new-committers-guide.html#the-committers-way) to act in the best [interest of the project](https://community.apache.org/projectIndependence.html#apache-projects-are-managed-independently).
+
+Before merging all review comments should be addressed either by making changes or agreeing the request is out of scope for the PR. For additions to public APIs committers should wait at least 24 hours before merging to ensure there is no additional feedback from members of the community. 
+
+Requesting changes on a PR indicates a reviewer believes the PR has merit but still needs issues addressed before merging. If a reviewer believes the change should not be merged at all and there is nothing the author could do to address the reviewers concerns, the reviewer should explicitly state this on the PR. In the rare event that a PR author and reviewers cannot come to a consensus on a PR, the disagreement should be raised to the developer mailing list for further discussion. In this context, a reviewer is anyone leaving comments on the PR including contributors, committers and PMC members.
+
+There are several exceptions to a single committer being able to merge a PR:
+
+* Behavioral and functional changes to a specification must go through the [Iceberg improvement proposal](#apache-iceberg-improvement-proposals) before any code can be merged.
+* Changes to files under the `format` directory and `open-api/rest-catalog*` are considered specification changes. Unless already covered under an Iceberg improvement proposal, specification changes require their own vote (e.g. bug fixes or specification clarifications). The vote follows the ASF [code modification](https://www.apache.org/foundation/voting.html#votes-on-code-modification) model and no lazy consensus modifier. Grammar, spelling and minor formatting fixes are exempted from this rule. Draft specifications (new independent specifications that are going through the Iceberg improvement process) do not require a vote but authors should provide notice on the developer mailing list about substantive changes (the final draft will be subject to a vote).
 
 ## Apache Iceberg Improvement Proposals
 
@@ -84,7 +96,7 @@ settle disagreements or to force a decision.
 
 ## Building the Project Locally
 
-Iceberg is built using Gradle with Java 8, 11, or 17.
+Iceberg is built using Gradle with Java 11, 17, or 21.
 
 * To invoke a build and run tests: `./gradlew build`
 * To skip tests: `./gradlew build -x test -x integrationTest`
@@ -107,7 +119,6 @@ This project Iceberg also has modules for adding Iceberg support to processing e
 * `iceberg-spark` is an implementation of Spark's Datasource V2 API for Iceberg with submodules for each spark versions (use runtime jars for a shaded version)
 * `iceberg-flink` contains classes for integrating with Apache Flink (use iceberg-flink-runtime for a shaded version)
 * `iceberg-mr` contains an InputFormat and other classes for integrating with Apache Hive
-* `iceberg-pig` is an implementation of Pig's LoadFunc API for Iceberg
 
 ## Setting up IDE and Code Style
 
@@ -196,6 +207,8 @@ public interface ManageSnapshots extends PendingUpdate<Snapshot> {
   // existing code...
 
   // adding this method introduces an API-breaking change
+  // since existing classes implementing ManageSnapshots
+  // will no longer compile.
   ManageSnapshots createBranch(String name);
 }
 ```
@@ -207,8 +220,8 @@ public class SnapshotManager implements ManageSnapshots {
   // existing code...
 
   @Override
-  public ManageSnapshots createBranch(String name, long snapshotId) {
-    updateSnapshotReferencesOperation().createBranch(name, snapshotId);
+  public ManageSnapshots createBranch(String name) {
+    updateSnapshotReferencesOperation().createBranch(name);
     return this;
   }
 }
@@ -374,12 +387,83 @@ When passing boolean arguments to existing or external methods, use inline comme
   dropTable(identifier, purge);
 ```
 
+#### Accessing instance variables
+
+Use `this` when assigning values to instance variables, making it clear when the object's state is being changed. Omit `this` when reading instance variables to keep lines shorter. 
+
+```java
+  private String value;
+
+  // BAD: unnecessary `this` during reads
+  public String value() {
+    return this.value;
+  }
+
+  // GOOD: no `this` when reading instance variables
+  public String value() {
+     return value;
+  }
+
+  // BAD: missing `this` in assignments
+  public void value(String newValue) {
+     value = newValue;
+  }
+
+  // GOOD: use `this` in assignments
+  public void value(String newValue) {
+     this.value = newValue;
+  }
+```
+
 #### Config naming
 
 1. Use `-` to link words in one concept
     * For example, preferred convection `access-key-id` rather than `access.key.id`
 2. Use `.` to create a hierarchy of config groups
     * For example, `s3` in `s3.access-key-id`, `s3.secret-access-key`
+
+#### Block Spacing
+
+To improve readability and maintain consistency, always place a newline after control blocks (if, for, while, switch, etc.). 
+This helps separate logical sections of the code, making it easier to read and debug.
+
+```java
+  // BAD: No newline separator after `if` block
+  public static WriteBuilder write(OutputFile file) {
+     if (file instanceof EncryptedOutputFile) {
+        return write((EncryptedOutputFile) file);
+     }
+     return new WriteBuilder(file);
+  }
+
+  // GOOD: newline separator after `if` block
+  public static WriteBuilder write(OutputFile file) {
+     if (file instanceof EncryptedOutputFile) {
+        return write((EncryptedOutputFile) file);
+     }
+     
+     return new WriteBuilder(file);
+  }
+
+  // BAD: No newline separator after `for` block
+  public static Schema convert(Schema schema) {
+     ImmutableList.Builder<Field> fields = ImmutableList.builder();
+     for (NestedField f : schema.columns()) {
+        fields.add(convert(f));
+     }
+     return new Schema(fields.build());
+  }
+
+  // GOOD: newline separator after `for` block
+  public static Schema convert(Schema schema) {
+     ImmutableList.Builder<Field> fields = ImmutableList.builder();
+     for (NestedField f : schema.columns()) {
+        fields.add(convert(f));
+     }
+
+     return new Schema(fields.build());
+  }
+```
 
 ## Testing
 
@@ -413,6 +497,18 @@ assertThat(metadataFileLocations).isNotNull().hasSize(4);
 
 // or
 assertThat(metadataFileLocations).isNotNull().hasSameSizeAs(expected).hasSize(4);
+```
+```java
+// if the specific element doesn't match the value, it won't show the content and its index of array 
+assertThat(array).hasSize(2);
+assertThat(array[0]).isEqualTo("value0");
+assertThat(array[1]).isEqualTo("value1");
+
+// better: all checks can be combined and the content of the array will be shown if any check fails
+assertThat(array).hasSize(2).containsExactly("value0", "value1");
+
+// better: if a specific element is checked, the content and its index will be also shown
+assertThat(array).contains("value1", atIndex(1));
 ```
 ```java
 // if any key doesn't exist, it won't show the content of the map
@@ -468,11 +564,11 @@ Awaitility.await("Tables were not deleted")
 Please refer to the [usage guide](https://github.com/awaitility/awaitility/wiki/Usage) of [Awaitility](https://github.com/awaitility/awaitility) for more usage examples.
 
 
-### JUnit4 / JUnit5
+### JUnit 5 / AssertJ
 
-Iceberg currently uses a mix of JUnit4 (`org.junit` imports) and JUnit5 (`org.junit.jupiter.api` imports) tests. To allow an easier migration to JUnit5 in the future, new test classes
-that are being added to the codebase should be written purely in JUnit5 where possible.
 
+Iceberg has now fully migrated to JUnit 5 (org.junit.jupiter.api imports) for all tests. Any new test classes should be written using JUnit 5, 
+and assertions should follow the AssertJ style to ensure consistency and readability.
 
 ## Running Benchmarks
 Some PRs/changesets might require running benchmarks to determine whether they are affecting the baseline performance. Currently there is 

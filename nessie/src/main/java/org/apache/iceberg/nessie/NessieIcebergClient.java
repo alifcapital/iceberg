@@ -192,7 +192,7 @@ public class NessieIcebergClient implements AutoCloseable {
 
   private TableIdentifier toIdentifier(EntriesResponse.Entry entry) {
     List<String> elements = entry.getName().getElements();
-    return TableIdentifier.of(elements.toArray(new String[elements.size()]));
+    return TableIdentifier.of(elements.toArray(new String[0]));
   }
 
   public IcebergTable table(TableIdentifier tableIdentifier) {
@@ -270,10 +270,22 @@ public class NessieIcebergClient implements AutoCloseable {
       } else {
         org.projectnessie.model.Namespace root =
             org.projectnessie.model.Namespace.of(namespace.levels());
+        Content existing =
+            api.getContent()
+                .reference(getReference())
+                .key(root.toContentKey())
+                .get()
+                .get(root.toContentKey());
+        if (existing == null) {
+          throw new NoSuchNamespaceException("Namespace does not exist: %s", namespace);
+        }
+
         filter +=
             String.format(
+                Locale.ROOT,
                 "size(entry.keyElements) == %d && entry.encodedKey.startsWith('%s.')",
-                root.getElementCount() + 1, root.name());
+                root.getElementCount() + 1,
+                root.name());
       }
       List<ContentKey> entries =
           withReference(api.getEntries()).filter(filter).stream()

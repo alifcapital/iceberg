@@ -32,9 +32,9 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
-import org.apache.iceberg.spark.data.SparkAvroReader;
 import org.apache.iceberg.spark.data.SparkOrcReader;
 import org.apache.iceberg.spark.data.SparkParquetReaders;
+import org.apache.iceberg.spark.data.SparkPlannedAvroReader;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.spark.sql.catalyst.InternalRow;
 
@@ -44,8 +44,10 @@ abstract class BaseRowReader<T extends ScanTask> extends BaseReader<InternalRow,
       ScanTaskGroup<T> taskGroup,
       Schema tableSchema,
       Schema expectedSchema,
-      boolean caseSensitive) {
-    super(table, taskGroup, tableSchema, expectedSchema, caseSensitive);
+      boolean caseSensitive,
+      boolean cacheDeleteFilesOnExecutors) {
+    super(
+        table, taskGroup, tableSchema, expectedSchema, caseSensitive, cacheDeleteFilesOnExecutors);
   }
 
   protected CloseableIterable<InternalRow> newIterable(
@@ -77,7 +79,7 @@ abstract class BaseRowReader<T extends ScanTask> extends BaseReader<InternalRow,
         .reuseContainers()
         .project(projection)
         .split(start, length)
-        .createReaderFunc(readSchema -> new SparkAvroReader(projection, readSchema, idToConstant))
+        .createResolvingReader(schema -> SparkPlannedAvroReader.create(schema, idToConstant))
         .withNameMapping(nameMapping())
         .build();
   }

@@ -21,9 +21,11 @@ package org.apache.iceberg.types;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.function.IntFunction;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.util.UnicodeUtil;
 
 public class Comparators {
@@ -41,6 +43,8 @@ public class Comparators {
           .put(Types.TimeType.get(), Comparator.naturalOrder())
           .put(Types.TimestampType.withZone(), Comparator.naturalOrder())
           .put(Types.TimestampType.withoutZone(), Comparator.naturalOrder())
+          .put(Types.TimestampNanoType.withZone(), Comparator.naturalOrder())
+          .put(Types.TimestampNanoType.withoutZone(), Comparator.naturalOrder())
           .put(Types.StringType.get(), Comparators.charSequences())
           .put(Types.UUIDType.get(), Comparator.naturalOrder())
           .put(Types.BinaryType.get(), Comparators.unsignedBytes())
@@ -52,6 +56,10 @@ public class Comparators {
 
   public static <T> Comparator<List<T>> forType(Types.ListType list) {
     return new ListComparator<>(list);
+  }
+
+  public static <K, V> Comparator<Map<K, V>> forType(Types.MapType mapType) {
+    return new MapComparator<>(mapType);
   }
 
   @SuppressWarnings("unchecked")
@@ -76,6 +84,8 @@ public class Comparators {
       return (Comparator<T>) forType(type.asStructType());
     } else if (type.isListType()) {
       return (Comparator<T>) forType(type.asListType());
+    } else if (type.isMapType()) {
+      return (Comparator<T>) forType(type.asMapType());
     }
 
     throw new UnsupportedOperationException("Cannot determine comparator for type: " + type);
@@ -147,6 +157,51 @@ public class Comparators {
     }
   }
 
+  private static class MapComparator<K, V> implements Comparator<Map<K, V>> {
+    private final Comparator<K> keyComparator;
+    private final Comparator<V> valueComparator;
+    private final Comparator<List<K>> keyListComparator;
+
+    private MapComparator(Types.MapType mapType) {
+      this.keyComparator = internal(mapType.keyType());
+      this.valueComparator =
+          mapType.isValueOptional()
+              ? Comparators.<V>nullsFirst().thenComparing(internal(mapType.valueType()))
+              : internal(mapType.valueType());
+      this.keyListComparator =
+          internal(Types.ListType.ofRequired(mapType.keyId(), mapType.keyType()));
+    }
+
+    @Override
+    public int compare(Map<K, V> o1, Map<K, V> o2) {
+      if (o1 == o2) {
+        return 0;
+      }
+
+      List<K> keys1 = Lists.newArrayList(o1.keySet());
+      List<K> keys2 = Lists.newArrayList(o2.keySet());
+      keys1.sort(keyComparator);
+      keys2.sort(keyComparator);
+
+      int cmp = keyListComparator.compare(keys1, keys2);
+      if (cmp != 0) {
+        return cmp;
+      }
+
+      for (K key : keys1) {
+        V value1 = o1.get(key);
+        V value2 = o2.get(key);
+
+        cmp = valueComparator.compare(value1, value2);
+        if (cmp != 0) {
+          return cmp;
+        }
+      }
+
+      return 0;
+    }
+  }
+
   public static Comparator<ByteBuffer> unsignedBytes() {
     return UnsignedByteBufComparator.INSTANCE;
   }
@@ -171,6 +226,10 @@ public class Comparators {
 
   public static Comparator<CharSequence> charSequences() {
     return CharSeqComparator.INSTANCE;
+  }
+
+  public static Comparator<CharSequence> filePath() {
+    return FilePathComparator.INSTANCE;
   }
 
   private static class NullsFirst<T> implements Comparator<T> {
@@ -317,9 +376,9 @@ public class Comparators {
      * represented using two Java characters (using UTF-16 surrogate pairs). Character by character
      * comparison may yield incorrect results while comparing a 4 byte UTF-8 character to a java
      * char. Character by character comparison works as expected if both characters are <= 3 byte
-     * UTF-8 character or both characters are 4 byte UTF-8 characters.
-     * isCharInUTF16HighSurrogateRange method detects a 4-byte character and considers that
-     * character to be lexicographically greater than any 3 byte or lower UTF-8 character.
+     * UTF-8 character or both characters are 4 byte UTF-8 characters. isCharHighSurrogate method
+     * detects a high surrogate (4-byte character) and considers that character to be
+     * lexicographically greater than any 3 byte or lower UTF-8 character.
      */
     @Override
     public int compare(CharSequence s1, CharSequence s2) {
@@ -349,6 +408,43 @@ public class Comparators {
 
       // if there are no differences, then the shorter seq is first
       return Integer.compare(s1.length(), s2.length());
+    }
+  }
+
+  private static class FilePathComparator implements Comparator<CharSequence> {
+    private static final FilePathComparator INSTANCE = new FilePathComparator();
+
+    private FilePathComparator() {}
+
+    @Override
+    public int compare(CharSequence s1, CharSequence s2) {
+      if (s1 == s2) {
+        return 0;
+      }
+      int count = s1.length();
+
+      int cmp = Integer.compare(count, s2.length());
+      if (cmp != 0) {
+        return cmp;
+      }
+
+      if (s1 instanceof String && s2 instanceof String) {
+        cmp = Integer.compare(s1.hashCode(), s2.hashCode());
+        if (cmp != 0) {
+          return cmp;
+        }
+      }
+      // File paths inside a delete file normally have more identical chars at the beginning. For
+      // example, a typical
+      // path is like "s3:/bucket/db/table/data/partition/00000-0-[uuid]-00001.parquet".
+      // The uuid is where the difference starts. So it's faster to find the first diff backward.
+      for (int i = count - 1; i >= 0; i--) {
+        cmp = Character.compare(s1.charAt(i), s2.charAt(i));
+        if (cmp != 0) {
+          return cmp;
+        }
+      }
+      return 0;
     }
   }
 }

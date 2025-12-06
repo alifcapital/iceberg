@@ -34,15 +34,20 @@ import static org.apache.iceberg.TableProperties.SNAPSHOT_ID_INHERITANCE_ENABLED
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import java.io.IOException;
+import java.math.RoundingMode;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.encryption.EncryptingFileIO;
 import org.apache.iceberg.events.CreateSnapshotEvent;
@@ -59,20 +64,32 @@ import org.apache.iceberg.metrics.ImmutableCommitReport;
 import org.apache.iceberg.metrics.LoggingMetricsReporter;
 import org.apache.iceberg.metrics.MetricsReporter;
 import org.apache.iceberg.metrics.Timer.Timed;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.relocated.com.google.common.math.IntMath;
 import org.apache.iceberg.util.Exceptions;
+import org.apache.iceberg.util.Pair;
+import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * Keeps common functionality to create a new snapshot.
+ *
+ * <p>The number of attempted commits is controlled by {@link TableProperties#COMMIT_NUM_RETRIES}
+ * and {@link TableProperties#COMMIT_NUM_RETRIES_DEFAULT} properties.
+ */
 @SuppressWarnings("UnnecessaryAnonymousClass")
 abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   private static final Logger LOG = LoggerFactory.getLogger(SnapshotProducer.class);
+  static final int MIN_FILE_GROUP_SIZE = 10_000;
   static final Set<ManifestFile> EMPTY_SET = Sets.newHashSet();
 
   /** Default callback used to delete files. */
@@ -101,7 +118,7 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   private boolean stageOnly = false;
   private Consumer<String> deleteFunc = defaultDelete;
 
-  private ExecutorService workerPool = ThreadPools.getWorkerPool();
+  private ExecutorService workerPool;
   private String targetBranch = SnapshotRef.MAIN_BRANCH;
   private CommitMetrics commitMetrics;
 
@@ -142,6 +159,10 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
     return self();
   }
 
+  protected TableOperations ops() {
+    return ops;
+  }
+
   protected CommitMetrics commitMetrics() {
     if (commitMetrics == null) {
       this.commitMetrics = CommitMetrics.of(new DefaultMetricsContext());
@@ -175,7 +196,11 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   }
 
   protected ExecutorService workerPool() {
-    return this.workerPool;
+    if (workerPool == null) {
+      this.workerPool = ThreadPools.getWorkerPool();
+    }
+
+    return workerPool;
   }
 
   @Override
@@ -237,14 +262,16 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
 
     OutputFile manifestList = manifestListPath();
 
-    try (ManifestListWriter writer =
+    ManifestListWriter writer =
         ManifestLists.write(
             ops.current().formatVersion(),
             manifestList,
             snapshotId(),
             parentSnapshotId,
-            sequenceNumber)) {
+            sequenceNumber,
+            base.nextRowId());
 
+    try (writer) {
       // keep track of the manifest lists created
       manifestLists.add(manifestList.location());
 
@@ -253,12 +280,36 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
       Tasks.range(manifestFiles.length)
           .stopOnFailure()
           .throwFailureWhenFinished()
-          .executeWith(workerPool)
+          .executeWith(workerPool())
           .run(index -> manifestFiles[index] = manifestsWithMetadata.get(manifests.get(index)));
 
       writer.addAll(Arrays.asList(manifestFiles));
     } catch (IOException e) {
       throw new RuntimeIOException(e, "Failed to write manifest list file");
+    }
+
+    Long nextRowId = null;
+    Long assignedRows = null;
+    if (base.formatVersion() >= 3) {
+      nextRowId = base.nextRowId();
+      assignedRows = writer.nextRowId() - base.nextRowId();
+    }
+
+    Map<String, String> summary = summary();
+    String operation = operation();
+
+    if (summary != null && DataOperations.REPLACE.equals(operation)) {
+      long addedRecords =
+          PropertyUtil.propertyAsLong(summary, SnapshotSummary.ADDED_RECORDS_PROP, 0L);
+      long replacedRecords =
+          PropertyUtil.propertyAsLong(summary, SnapshotSummary.DELETED_RECORDS_PROP, 0L);
+
+      // added may be less than replaced when records are already deleted by delete files
+      Preconditions.checkArgument(
+          addedRecords <= replacedRecords,
+          "Invalid REPLACE operation: %s added records > %s replaced records",
+          addedRecords,
+          replacedRecords);
     }
 
     return new BaseSnapshot(
@@ -269,7 +320,10 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
         operation(),
         summary(base),
         base.currentSchemaId(),
-        manifestList.location());
+        manifestList.location(),
+        nextRowId,
+        assignedRows,
+        null);
   }
 
   protected abstract Map<String, String> summary();
@@ -368,84 +422,83 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   @Override
   @SuppressWarnings("checkstyle:CyclomaticComplexity")
   public void commit() {
-    // this is always set to the latest commit attempt's snapshot id.
-    AtomicLong newSnapshotId = new AtomicLong(-1L);
-    Timed totalDuration = commitMetrics().totalDuration().start();
-    try {
-      Tasks.foreach(ops)
-          .retry(base.propertyAsInt(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
-          .exponentialBackoff(
-              base.propertyAsInt(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT),
-              base.propertyAsInt(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT),
-              base.propertyAsInt(COMMIT_TOTAL_RETRY_TIME_MS, COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT),
-              2.0 /* exponential */)
-          .onlyRetryOn(CommitFailedException.class)
-          .countAttempts(commitMetrics().attempts())
-          .run(
-              taskOps -> {
-                Snapshot newSnapshot = apply();
-                newSnapshotId.set(newSnapshot.snapshotId());
-                TableMetadata.Builder update = TableMetadata.buildFrom(base);
-                if (base.snapshot(newSnapshot.snapshotId()) != null) {
-                  // this is a rollback operation
-                  update.setBranchSnapshot(newSnapshot.snapshotId(), targetBranch);
-                } else if (stageOnly) {
-                  update.addSnapshot(newSnapshot);
-                } else {
-                  update.setBranchSnapshot(newSnapshot, targetBranch);
-                }
+    // this is always set to the latest commit attempt's snapshot
+    AtomicReference<Snapshot> stagedSnapshot = new AtomicReference<>();
+    try (Timed ignore = commitMetrics().totalDuration().start()) {
+      try {
+        Tasks.foreach(ops)
+            .retry(base.propertyAsInt(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))
+            .exponentialBackoff(
+                base.propertyAsInt(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT),
+                base.propertyAsInt(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT),
+                base.propertyAsInt(COMMIT_TOTAL_RETRY_TIME_MS, COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT),
+                2.0 /* exponential */)
+            .onlyRetryOn(CommitFailedException.class)
+            .countAttempts(commitMetrics().attempts())
+            .run(
+                taskOps -> {
+                  Snapshot newSnapshot = apply();
+                  stagedSnapshot.set(newSnapshot);
+                  TableMetadata.Builder update = TableMetadata.buildFrom(base);
+                  if (base.snapshot(newSnapshot.snapshotId()) != null) {
+                    // this is a rollback operation
+                    update.setBranchSnapshot(newSnapshot.snapshotId(), targetBranch);
+                  } else if (stageOnly) {
+                    update.addSnapshot(newSnapshot);
+                  } else {
+                    update.setBranchSnapshot(newSnapshot, targetBranch);
+                  }
 
-                TableMetadata updated = update.build();
-                if (updated.changes().isEmpty()) {
-                  // do not commit if the metadata has not changed. for example, this may happen
-                  // when setting the current
-                  // snapshot to an ID that is already current. note that this check uses identity.
-                  return;
-                }
+                  TableMetadata updated = update.build();
+                  if (updated.changes().isEmpty()) {
+                    // do not commit if the metadata has not changed. for example, this may happen
+                    // when setting the current
+                    // snapshot to an ID that is already current. note that this check uses
+                    // identity.
+                    return;
+                  }
 
-                // if the table UUID is missing, add it here. the UUID will be re-created each time
-                // this operation retries
-                // to ensure that if a concurrent operation assigns the UUID, this operation will
-                // not fail.
-                taskOps.commit(base, updated.withUUID());
-              });
+                  // if the table UUID is missing, add it here. the UUID will be re-created each
+                  // time
+                  // this operation retries
+                  // to ensure that if a concurrent operation assigns the UUID, this operation will
+                  // not fail.
+                  taskOps.commit(base, updated.withUUID());
+                });
 
-    } catch (CommitStateUnknownException commitStateUnknownException) {
-      throw commitStateUnknownException;
-    } catch (RuntimeException e) {
-      if (!strictCleanup || e instanceof CleanableFailure) {
-        Exceptions.suppressAndThrow(e, this::cleanAll);
+      } catch (CommitStateUnknownException commitStateUnknownException) {
+        throw commitStateUnknownException;
+      } catch (RuntimeException e) {
+        if (!strictCleanup || e instanceof CleanableFailure) {
+          Exceptions.suppressAndThrow(e, this::cleanAll);
+        }
+
+        throw e;
       }
 
-      throw e;
-    }
+      // at this point, the commit must have succeeded so the stagedSnapshot is committed
+      Snapshot committedSnapshot = stagedSnapshot.get();
+      try {
+        LOG.info(
+            "Committed snapshot {} ({})",
+            committedSnapshot.snapshotId(),
+            getClass().getSimpleName());
 
-    try {
-      LOG.info("Committed snapshot {} ({})", newSnapshotId.get(), getClass().getSimpleName());
-
-      // at this point, the commit must have succeeded. after a refresh, the snapshot is loaded by
-      // id in case another commit was added between this commit and the refresh.
-      Snapshot saved = ops.refresh().snapshot(newSnapshotId.get());
-      if (saved != null) {
-        cleanUncommitted(Sets.newHashSet(saved.allManifests(ops.io())));
+        if (cleanupAfterCommit()) {
+          cleanUncommitted(Sets.newHashSet(committedSnapshot.allManifests(ops.io())));
+        }
         // also clean up unused manifest lists created by multiple attempts
         for (String manifestList : manifestLists) {
-          if (!saved.manifestListLocation().equals(manifestList)) {
+          if (!committedSnapshot.manifestListLocation().equals(manifestList)) {
             deleteFile(manifestList);
           }
         }
-      } else {
-        // saved may not be present if the latest metadata couldn't be loaded due to eventual
-        // consistency problems in refresh. in that case, don't clean up.
-        LOG.warn("Failed to load committed snapshot, skipping manifest clean-up");
+      } catch (Throwable e) {
+        LOG.warn(
+            "Failed to load committed table metadata or during cleanup, skipping further cleanup",
+            e);
       }
-
-    } catch (Throwable e) {
-      LOG.warn(
-          "Failed to load committed table metadata or during cleanup, skipping further cleanup", e);
     }
-
-    totalDuration.stop();
 
     try {
       notifyListeners();
@@ -498,19 +551,11 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
             ops.metadataFileLocation(
                 FileFormat.AVRO.addExtension(
                     String.format(
-                        "snap-%d-%d-%s", snapshotId(), attempt.incrementAndGet(), commitUUID))));
-  }
-
-  /**
-   * @deprecated will be removed in 1.7.0; Use {@link SnapshotProducer#newManifestOutputFile}
-   *     instead
-   */
-  @Deprecated
-  protected OutputFile newManifestOutput() {
-    return ops.io()
-        .newOutputFile(
-            ops.metadataFileLocation(
-                FileFormat.AVRO.addExtension(commitUUID + "-m" + manifestCount.getAndIncrement())));
+                        Locale.ROOT,
+                        "snap-%d-%d-%s",
+                        snapshotId(),
+                        attempt.incrementAndGet(),
+                        commitUUID))));
   }
 
   protected EncryptedOutputFile newManifestOutputFile() {
@@ -561,6 +606,116 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
 
   protected boolean canInheritSnapshotId() {
     return canInheritSnapshotId;
+  }
+
+  protected boolean cleanupAfterCommit() {
+    return true;
+  }
+
+  protected List<ManifestFile> writeDataManifests(Collection<DataFile> files, PartitionSpec spec) {
+    return writeDataManifests(files, null /* inherit data seq */, spec);
+  }
+
+  protected List<ManifestFile> writeDataManifests(
+      Collection<DataFile> files, Long dataSeq, PartitionSpec spec) {
+    return writeManifests(files, group -> writeDataFileGroup(group, dataSeq, spec));
+  }
+
+  private List<ManifestFile> writeDataFileGroup(
+      Collection<DataFile> files, Long dataSeq, PartitionSpec spec) {
+    RollingManifestWriter<DataFile> writer = newRollingManifestWriter(spec);
+
+    try (RollingManifestWriter<DataFile> closableWriter = writer) {
+      if (dataSeq != null) {
+        files.forEach(file -> closableWriter.add(file, dataSeq));
+      } else {
+        files.forEach(closableWriter::add);
+      }
+    } catch (IOException e) {
+      throw new RuntimeIOException(e, "Failed to write data manifests");
+    }
+
+    return writer.toManifestFiles();
+  }
+
+  protected List<ManifestFile> writeDeleteManifests(
+      Collection<DeleteFile> files, PartitionSpec spec) {
+    return writeManifests(files, group -> writeDeleteFileGroup(group, spec));
+  }
+
+  private List<ManifestFile> writeDeleteFileGroup(
+      Collection<DeleteFile> files, PartitionSpec spec) {
+    RollingManifestWriter<DeleteFile> writer = newRollingDeleteManifestWriter(spec);
+
+    try (RollingManifestWriter<DeleteFile> closableWriter = writer) {
+      for (DeleteFile file : files) {
+        Preconditions.checkArgument(
+            file instanceof Delegates.PendingDeleteFile,
+            "Invalid delete file: must be PendingDeleteFile");
+        if (file.dataSequenceNumber() != null) {
+          closableWriter.add(file, file.dataSequenceNumber());
+        } else {
+          closableWriter.add(file);
+        }
+      }
+    } catch (IOException e) {
+      throw new RuntimeIOException(e, "Failed to write delete manifests");
+    }
+
+    return writer.toManifestFiles();
+  }
+
+  private static <F> List<ManifestFile> writeManifests(
+      Collection<F> files, Function<List<F>, List<ManifestFile>> writeFunc) {
+    int parallelism = manifestWriterCount(ThreadPools.WORKER_THREAD_POOL_SIZE, files.size());
+    List<List<F>> groups = divide(files, parallelism);
+
+    // Create a new list pairing each group with its index
+    List<Pair<Integer, List<F>>> groupsWithIndex = Lists.newArrayList();
+    for (int i = 0; i < groups.size(); i++) {
+      groupsWithIndex.add(Pair.of(i, groups.get(i)));
+    }
+
+    AtomicReferenceArray<List<ManifestFile>> results = new AtomicReferenceArray<>(groups.size());
+
+    Tasks.foreach(groupsWithIndex)
+        .stopOnFailure()
+        .throwFailureWhenFinished()
+        .executeWith(ThreadPools.getWorkerPool())
+        .run(
+            indexedGroup -> {
+              int index = indexedGroup.first();
+              List<F> group = indexedGroup.second();
+              List<ManifestFile> groupResults = writeFunc.apply(group);
+              results.set(index, groupResults);
+            });
+
+    // Collect results in order
+    ImmutableList.Builder<ManifestFile> builder = ImmutableList.builder();
+    for (int i = 0; i < results.length(); i++) {
+      builder.addAll(results.get(i));
+    }
+    return builder.build();
+  }
+
+  private static <T> List<List<T>> divide(Collection<T> collection, int groupCount) {
+    List<T> list = Lists.newArrayList(collection);
+    int groupSize = IntMath.divide(list.size(), groupCount, RoundingMode.CEILING);
+    return Lists.partition(list, groupSize);
+  }
+
+  /**
+   * Calculates how many manifest writers can be used to concurrently to handle the given number of
+   * files without creating too small manifests.
+   *
+   * @param workerPoolSize the size of the available worker pool
+   * @param fileCount the total number of files to be processed
+   * @return the number of manifest writers that can be used concurrently
+   */
+  @VisibleForTesting
+  static int manifestWriterCount(int workerPoolSize, int fileCount) {
+    int limit = IntMath.divide(fileCount, MIN_FILE_GROUP_SIZE, RoundingMode.HALF_UP);
+    return Math.max(1, Math.min(workerPoolSize, limit));
   }
 
   private static ManifestFile addMetadata(TableOperations ops, ManifestFile manifest) {
@@ -618,13 +773,14 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
           manifest.sequenceNumber(),
           manifest.minSequenceNumber(),
           snapshotId,
+          stats.summaries(),
+          null,
           addedFiles,
           addedRows,
           existingFiles,
           existingRows,
           deletedFiles,
           deletedRows,
-          stats.summaries(),
           null);
 
     } catch (IOException e) {

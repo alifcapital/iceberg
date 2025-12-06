@@ -48,7 +48,7 @@ import org.projectnessie.model.Branch;
 public class TestMultipleClients extends BaseTestIceberg {
 
   private static final String BRANCH = "multiple-clients-test";
-  private static final Schema schema =
+  private static final Schema SCHEMA =
       new Schema(Types.StructType.of(required(1, "id", Types.LongType.get())).fields());
 
   public TestMultipleClients() {
@@ -76,9 +76,15 @@ public class TestMultipleClients extends BaseTestIceberg {
     assertThat(catalog.listNamespaces()).isEmpty();
     assertThat(anotherCatalog.listNamespaces()).isEmpty();
 
-    // listing a non-existent namespace should return empty
-    assertThat(catalog.listNamespaces(Namespace.of("db1"))).isEmpty();
-    assertThat(anotherCatalog.listNamespaces(Namespace.of("db1"))).isEmpty();
+    // listing a non-existent namespace should throw an NoSuchNamespaceExists exception
+    Namespace namespaceDb1 = Namespace.of("db1");
+    assertThatThrownBy(() -> catalog.listNamespaces(namespaceDb1))
+        .isInstanceOf(NoSuchNamespaceException.class)
+        .hasMessage("Namespace does not exist: %s", namespaceDb1);
+
+    assertThatThrownBy(() -> anotherCatalog.listNamespaces(namespaceDb1))
+        .isInstanceOf(NoSuchNamespaceException.class)
+        .hasMessage("Namespace does not exist: %s", namespaceDb1);
 
     catalog.createNamespace(Namespace.of("db1"), Collections.emptyMap());
 
@@ -153,12 +159,12 @@ public class TestMultipleClients extends BaseTestIceberg {
 
   @Test
   public void testListTables() {
-    createTable(TableIdentifier.parse("foo.tbl1"), schema);
+    createTable(TableIdentifier.parse("foo.tbl1"), SCHEMA);
     assertThat(catalog.listTables(Namespace.of("foo")))
         .containsExactlyInAnyOrder(TableIdentifier.parse("foo.tbl1"));
 
     // another client creates a table with the same nessie server
-    anotherCatalog.createTable(TableIdentifier.parse("foo.tbl2"), schema);
+    anotherCatalog.createTable(TableIdentifier.parse("foo.tbl2"), SCHEMA);
     assertThat(anotherCatalog.listTables(Namespace.of("foo")))
         .containsExactlyInAnyOrder(
             TableIdentifier.parse("foo.tbl1"), TableIdentifier.parse("foo.tbl2"));
@@ -171,7 +177,7 @@ public class TestMultipleClients extends BaseTestIceberg {
   @Test
   public void testCommits() {
     TableIdentifier identifier = TableIdentifier.parse("foo.tbl1");
-    createTable(identifier, schema);
+    createTable(identifier, SCHEMA);
     Table tableFromCatalog = catalog.loadTable(identifier);
     tableFromCatalog.updateSchema().addColumn("x1", Types.LongType.get()).commit();
 
@@ -188,7 +194,7 @@ public class TestMultipleClients extends BaseTestIceberg {
   @Test
   public void testConcurrentCommitsWithRefresh() {
     TableIdentifier identifier = TableIdentifier.parse("foo.tbl1");
-    createTable(identifier, schema);
+    createTable(identifier, SCHEMA);
 
     String hashBefore = catalog.currentHash();
 

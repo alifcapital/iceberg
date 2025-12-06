@@ -21,8 +21,10 @@ package org.apache.iceberg.io;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.CatalogUtil;
@@ -32,6 +34,7 @@ import org.apache.iceberg.hadoop.SerializableConfiguration;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Joiner;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterators;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -46,7 +49,8 @@ import org.slf4j.LoggerFactory;
  * Delegate FileIO implementations must implement the {@link DelegateFileIO} mixin interface,
  * otherwise initialization will fail.
  */
-public class ResolvingFileIO implements HadoopConfigurable, DelegateFileIO {
+public class ResolvingFileIO
+    implements HadoopConfigurable, DelegateFileIO, SupportsStorageCredentials {
   private static final Logger LOG = LoggerFactory.getLogger(ResolvingFileIO.class);
   private static final int BATCH_SIZE = 100_000;
   private static final String FALLBACK_IMPL = "org.apache.iceberg.hadoop.HadoopFileIO";
@@ -60,13 +64,17 @@ public class ResolvingFileIO implements HadoopConfigurable, DelegateFileIO {
           "s3n", S3_FILE_IO_IMPL,
           "gs", GCS_FILE_IO_IMPL,
           "abfs", ADLS_FILE_IO_IMPL,
-          "abfss", ADLS_FILE_IO_IMPL);
+          "abfss", ADLS_FILE_IO_IMPL,
+          "wasb", ADLS_FILE_IO_IMPL,
+          "wasbs", ADLS_FILE_IO_IMPL);
 
   private final Map<String, DelegateFileIO> ioInstances = Maps.newConcurrentMap();
   private final AtomicBoolean isClosed = new AtomicBoolean(false);
   private final transient StackTraceElement[] createStack;
   private SerializableMap<String, String> properties;
   private SerializableSupplier<Configuration> hadoopConf;
+  // use modifiable collection for Kryo serde
+  private List<StorageCredential> storageCredentials = Lists.newArrayList();
 
   /**
    * No-arg constructor to load the FileIO dynamically.
@@ -141,7 +149,7 @@ public class ResolvingFileIO implements HadoopConfigurable, DelegateFileIO {
   @Override
   public void serializeConfWith(
       Function<Configuration, SerializableSupplier<Configuration>> confSerializer) {
-    this.hadoopConf = confSerializer.apply(hadoopConf.get());
+    this.hadoopConf = confSerializer.apply(getConf());
   }
 
   @Override
@@ -151,7 +159,7 @@ public class ResolvingFileIO implements HadoopConfigurable, DelegateFileIO {
 
   @Override
   public Configuration getConf() {
-    return hadoopConf.get();
+    return Optional.ofNullable(hadoopConf).map(Supplier::get).orElse(null);
   }
 
   @VisibleForTesting
@@ -163,9 +171,14 @@ public class ResolvingFileIO implements HadoopConfigurable, DelegateFileIO {
         synchronized (io) {
           if (((HadoopConfigurable) io).getConf() == null) {
             // re-apply the config in case it's null after Kryo serialization
-            ((HadoopConfigurable) io).setConf(hadoopConf.get());
+            ((HadoopConfigurable) io).setConf(getConf());
           }
         }
+      }
+
+      if (io instanceof SupportsStorageCredentials
+          && !((SupportsStorageCredentials) io).credentials().equals(storageCredentials)) {
+        ((SupportsStorageCredentials) io).setCredentials(storageCredentials);
       }
 
       return io;
@@ -174,7 +187,7 @@ public class ResolvingFileIO implements HadoopConfigurable, DelegateFileIO {
     return ioInstances.computeIfAbsent(
         impl,
         key -> {
-          Configuration conf = hadoopConf.get();
+          Configuration conf = getConf();
           FileIO fileIO;
 
           try {
@@ -182,7 +195,7 @@ public class ResolvingFileIO implements HadoopConfigurable, DelegateFileIO {
             // ResolvingFileIO is keeping track of the creation stacktrace, so no need to do the
             // same in S3FileIO.
             props.put("init-creation-stacktrace", "false");
-            fileIO = CatalogUtil.loadFileIO(key, props, conf);
+            fileIO = CatalogUtil.loadFileIO(key, props, conf, storageCredentials);
           } catch (IllegalArgumentException e) {
             if (key.equals(FALLBACK_IMPL)) {
               // no implementation to fall back to, throw the exception
@@ -195,7 +208,8 @@ public class ResolvingFileIO implements HadoopConfigurable, DelegateFileIO {
                   FALLBACK_IMPL,
                   e);
               try {
-                fileIO = CatalogUtil.loadFileIO(FALLBACK_IMPL, properties, conf);
+                fileIO =
+                    CatalogUtil.loadFileIO(FALLBACK_IMPL, properties, conf, storageCredentials);
               } catch (IllegalArgumentException suppressed) {
                 LOG.warn(
                     "Failed to load FileIO implementation: {} (fallback)",
@@ -240,7 +254,7 @@ public class ResolvingFileIO implements HadoopConfigurable, DelegateFileIO {
     return null;
   }
 
-  @SuppressWarnings("checkstyle:NoFinalizer")
+  @SuppressWarnings({"checkstyle:NoFinalizer", "Finalize"})
   @Override
   protected void finalize() throws Throwable {
     super.finalize();
@@ -263,5 +277,17 @@ public class ResolvingFileIO implements HadoopConfigurable, DelegateFileIO {
   @Override
   public void deletePrefix(String prefix) {
     io(prefix).deletePrefix(prefix);
+  }
+
+  @Override
+  public void setCredentials(List<StorageCredential> credentials) {
+    Preconditions.checkArgument(credentials != null, "Invalid storage credentials: null");
+    // copy credentials into a modifiable collection for Kryo serde
+    this.storageCredentials = Lists.newArrayList(credentials);
+  }
+
+  @Override
+  public List<StorageCredential> credentials() {
+    return ImmutableList.copyOf(storageCredentials);
   }
 }

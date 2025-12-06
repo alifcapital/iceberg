@@ -181,11 +181,36 @@ public class TypeUtil {
     return indexer.byId();
   }
 
+  /**
+   * Creates a mapping from lower-case field names to their corresponding field IDs.
+   *
+   * <p>This method iterates over the fields of the provided struct and maps each field's name
+   * (converted to lower-case) to its ID. If two fields have the same lower-case name, an
+   * `IllegalArgumentException` is thrown.
+   *
+   * @param struct the struct type whose fields are to be indexed
+   * @return a map where the keys are lower-case field names and the values are field IDs
+   * @throws IllegalArgumentException if two fields have the same lower-case name
+   */
   public static Map<String, Integer> indexByLowerCaseName(Types.StructType struct) {
     Map<String, Integer> indexByLowerCaseName = Maps.newHashMap();
+
+    IndexByName indexer = new IndexByName();
+    visit(struct, indexer);
+    Map<Integer, String> byId = indexer.byId();
+
     indexByName(struct)
         .forEach(
-            (name, integer) -> indexByLowerCaseName.put(name.toLowerCase(Locale.ROOT), integer));
+            (name, fieldId) -> {
+              String key = name.toLowerCase(Locale.ROOT);
+              Integer existingId = indexByLowerCaseName.put(key, fieldId);
+              Preconditions.checkArgument(
+                  existingId == null || existingId.equals(fieldId),
+                  "Cannot build lower case index: %s and %s collide",
+                  byId.get(existingId),
+                  byId.get(fieldId));
+              indexByLowerCaseName.put(key, fieldId);
+            });
     return indexByLowerCaseName;
   }
 
@@ -370,6 +395,10 @@ public class TypeUtil {
     return visit(schema, new FindTypeVisitor(predicate));
   }
 
+  public static Type find(Type type, Predicate<Type> predicate) {
+    return visit(type, new FindTypeVisitor(predicate));
+  }
+
   public static boolean isPromotionAllowed(Type from, Type.PrimitiveType to) {
     // Warning! Before changing this function, make sure that the type change doesn't introduce
     // compatibility problems in partitioning.
@@ -496,6 +525,7 @@ public class TypeUtil {
       case DOUBLE:
       case TIME:
       case TIMESTAMP:
+      case TIMESTAMP_NANO:
         // longs and doubles occupy 8 bytes
         // times and timestamps are internally represented as longs
         return 8;
@@ -508,7 +538,17 @@ public class TypeUtil {
       case FIXED:
         return ((Types.FixedType) type).length();
       case BINARY:
+      case VARIANT:
         return 80;
+      case GEOMETRY:
+      case GEOGRAPHY:
+        // 80 bytes is an approximate size for a polygon or linestring with 4 to 5 coordinates.
+        // This is a reasonable estimate for the size of a geometry or geography object without
+        // additional details.
+        return 80;
+      case UNKNOWN:
+        // Consider Unknown as null
+        return 0;
       case DECIMAL:
         // 12 (header) + (12 + 12 + 4) (BigInteger) + 4 (scale) = 44 bytes
         return 44;
@@ -586,6 +626,18 @@ public class TypeUtil {
       return null;
     }
 
+    /**
+     * @deprecated will be removed in 2.0.0; use {@link #variant(Types.VariantType)} instead.
+     */
+    @Deprecated
+    public T variant() {
+      return variant(Types.VariantType.get());
+    }
+
+    public T variant(Types.VariantType variant) {
+      throw new UnsupportedOperationException("Unsupported type: variant");
+    }
+
     public T primitive(Type.PrimitiveType primitive) {
       return null;
     }
@@ -649,6 +701,9 @@ public class TypeUtil {
 
         return visitor.map(map, keyResult, valueResult);
 
+      case VARIANT:
+        return visitor.variant(type.asVariantType());
+
       default:
         return visitor.primitive(type.asPrimitiveType());
     }
@@ -673,6 +728,10 @@ public class TypeUtil {
 
     public T map(Types.MapType map, Supplier<T> keyResult, Supplier<T> valueResult) {
       return null;
+    }
+
+    public T variant(Types.VariantType variant) {
+      throw new UnsupportedOperationException("Unsupported type: variant");
     }
 
     public T primitive(Type.PrimitiveType primitive) {
@@ -750,6 +809,9 @@ public class TypeUtil {
             map,
             new VisitFuture<>(map.keyType(), visitor),
             new VisitFuture<>(map.valueType(), visitor));
+
+      case VARIANT:
+        return visitor.variant(type.asVariantType());
 
       default:
         return visitor.primitive(type.asPrimitiveType());

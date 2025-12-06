@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.util.Map;
 import org.apache.iceberg.CachingCatalog;
 import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Parameters;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -32,10 +33,12 @@ import org.apache.iceberg.spark.TestBaseWithCatalog;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
 
+@ExtendWith(ParameterizedTestExtension.class)
 public class TestSparkCatalogCacheExpiration extends TestBaseWithCatalog {
 
-  private static final Map<String, String> sessionCatalogConfig =
+  private static final Map<String, String> SESSION_CATALOG_CONFIG =
       ImmutableMap.of(
           "type",
           "hadoop",
@@ -49,7 +52,7 @@ public class TestSparkCatalogCacheExpiration extends TestBaseWithCatalog {
   @Parameters(name = "catalogName = {0}, implementation = {1}, config = {2}")
   public static Object[][] parameters() {
     return new Object[][] {
-      {"spark_catalog", SparkSessionCatalog.class.getName(), sessionCatalogConfig},
+      {"spark_catalog", SparkSessionCatalog.class.getName(), SESSION_CATALOG_CONFIG},
     };
   }
 

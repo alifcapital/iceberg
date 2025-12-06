@@ -78,9 +78,11 @@ public class LakeFormationAwsClientFactory extends AssumeRoleAwsClientFactory {
   public S3Client s3() {
     if (isTableRegisteredWithLakeFormation()) {
       return S3Client.builder()
+          .applyMutation(awsClientProperties()::applyLegacyMd5Plugin)
           .applyMutation(httpClientProperties()::applyHttpClientConfigurations)
           .applyMutation(s3FileIOProperties()::applyEndpointConfigurations)
           .applyMutation(s3FileIOProperties()::applyServiceConfigurations)
+          .applyMutation(s3FileIOProperties()::applyRetryConfigurations)
           .credentialsProvider(
               new LakeFormationCredentialsProvider(lakeFormation(), buildTableArn()))
           .region(Region.of(region()))
@@ -95,6 +97,7 @@ public class LakeFormationAwsClientFactory extends AssumeRoleAwsClientFactory {
     if (isTableRegisteredWithLakeFormation()) {
       return KmsClient.builder()
           .applyMutation(httpClientProperties()::applyHttpClientConfigurations)
+          .applyMutation(awsClientProperties()::applyRetryConfigurations)
           .credentialsProvider(
               new LakeFormationCredentialsProvider(lakeFormation(), buildTableArn()))
           .region(Region.of(region()))
@@ -139,8 +142,8 @@ public class LakeFormationAwsClientFactory extends AssumeRoleAwsClientFactory {
   }
 
   static class LakeFormationCredentialsProvider implements AwsCredentialsProvider {
-    private LakeFormationClient client;
-    private String tableArn;
+    private final LakeFormationClient client;
+    private final String tableArn;
 
     LakeFormationCredentialsProvider(LakeFormationClient lakeFormationClient, String tableArn) {
       this.client = lakeFormationClient;

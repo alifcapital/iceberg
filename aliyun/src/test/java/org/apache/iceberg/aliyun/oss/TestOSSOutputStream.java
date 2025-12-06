@@ -50,7 +50,7 @@ public class TestOSSOutputStream extends AliyunOSSTestBase {
   private final OSS ossMock = mock(OSS.class, delegatesTo(ossClient));
 
   private final Path tmpDir = Files.createTempDirectory("oss-file-io-test-");
-  private static final Random random = ThreadLocalRandom.current();
+  private static final Random RANDOM = ThreadLocalRandom.current();
 
   private final AliyunProperties props =
       new AliyunProperties(
@@ -70,7 +70,7 @@ public class TestOSSOutputStream extends AliyunOSSTestBase {
       reset(ossMock);
 
       // Write large file.
-      writeAndVerify(ossMock, uri, randomData(32 * 1024 * 1024), arrayWrite);
+      writeAndVerify(ossMock, uri, randomData(32 * 1024), arrayWrite);
       verify(ossMock, times(1)).putObject(any());
       reset(ossMock);
     }
@@ -127,7 +127,7 @@ public class TestOSSOutputStream extends AliyunOSSTestBase {
 
   private byte[] randomData(int size) {
     byte[] data = new byte[size];
-    random.nextBytes(data);
+    RANDOM.nextBytes(data);
     return data;
   }
 

@@ -63,6 +63,7 @@ abstract class BaseCommitService<T> implements Closeable {
   private final int rewritesPerCommit;
   private final AtomicBoolean running = new AtomicBoolean(false);
   private final long timeoutInMS;
+  private int succeededCommits = 0;
 
   /**
    * Constructs a {@link BaseCommitService}
@@ -230,6 +231,7 @@ abstract class BaseCommitService<T> implements Closeable {
       try {
         commitOrClean(batch);
         committedRewrites.addAll(batch);
+        succeededCommits++;
       }
       catch (ValidationException e) {
         LOG.error("Concurrent delete", e);
@@ -242,6 +244,10 @@ abstract class BaseCommitService<T> implements Closeable {
         inProgressCommits.remove(inProgressCommitToken);
       }
     }
+  }
+
+  public int succeededCommits() {
+    return succeededCommits;
   }
 
   @VisibleForTesting

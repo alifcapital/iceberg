@@ -105,6 +105,10 @@ public class UpdateRequirements {
         update((MetadataUpdate.SetDefaultPartitionSpec) update);
       } else if (update instanceof MetadataUpdate.SetDefaultSortOrder) {
         update((MetadataUpdate.SetDefaultSortOrder) update);
+      } else if (update instanceof MetadataUpdate.RemovePartitionSpecs) {
+        update((MetadataUpdate.RemovePartitionSpecs) update);
+      } else if (update instanceof MetadataUpdate.RemoveSchemas) {
+        update((MetadataUpdate.RemoveSchemas) update);
       }
 
       return this;
@@ -124,7 +128,7 @@ public class UpdateRequirements {
       }
     }
 
-    private void update(MetadataUpdate.AddSchema update) {
+    private void update(MetadataUpdate.AddSchema unused) {
       if (!addedSchema) {
         if (base != null) {
           require(new UpdateRequirement.AssertLastAssignedFieldId(base.lastColumnId()));
@@ -133,17 +137,11 @@ public class UpdateRequirements {
       }
     }
 
-    private void update(MetadataUpdate.SetCurrentSchema update) {
-      if (!setSchemaId) {
-        if (base != null && !isReplace) {
-          // require that the current schema has not changed
-          require(new UpdateRequirement.AssertCurrentSchemaID(base.currentSchemaId()));
-        }
-        this.setSchemaId = true;
-      }
+    private void update(MetadataUpdate.SetCurrentSchema unused) {
+      requireCurrentSchemaNotChanged();
     }
 
-    private void update(MetadataUpdate.AddPartitionSpec update) {
+    private void update(MetadataUpdate.AddPartitionSpec unused) {
       if (!addedSpec) {
         if (base != null) {
           require(
@@ -153,23 +151,61 @@ public class UpdateRequirements {
       }
     }
 
-    private void update(MetadataUpdate.SetDefaultPartitionSpec update) {
-      if (!setSpecId) {
-        if (base != null && !isReplace) {
-          // require that the default spec has not changed
-          require(new UpdateRequirement.AssertDefaultSpecID(base.defaultSpecId()));
-        }
-        this.setSpecId = true;
-      }
+    private void update(MetadataUpdate.SetDefaultPartitionSpec unused) {
+      requireDefaultPartitionSpecNotChanged();
     }
 
-    private void update(MetadataUpdate.SetDefaultSortOrder update) {
+    private void update(MetadataUpdate.SetDefaultSortOrder unused) {
       if (!setOrderId) {
         if (base != null && !isReplace) {
           // require that the default write order has not changed
           require(new UpdateRequirement.AssertDefaultSortOrderID(base.defaultSortOrderId()));
         }
         this.setOrderId = true;
+      }
+    }
+
+    private void update(MetadataUpdate.RemovePartitionSpecs unused) {
+      requireDefaultPartitionSpecNotChanged();
+
+      // require that no branches have changed, so that old specs won't be written.
+      requireNoBranchesChanged();
+    }
+
+    private void update(MetadataUpdate.RemoveSchemas unused) {
+      requireCurrentSchemaNotChanged();
+
+      // require that no branches have changed, so that old schemas won't be written.
+      requireNoBranchesChanged();
+    }
+
+    private void requireDefaultPartitionSpecNotChanged() {
+      if (!setSpecId) {
+        if (base != null && !isReplace) {
+          require(new UpdateRequirement.AssertDefaultSpecID(base.defaultSpecId()));
+        }
+        this.setSpecId = true;
+      }
+    }
+
+    private void requireCurrentSchemaNotChanged() {
+      if (!setSchemaId) {
+        if (base != null && !isReplace) {
+          require(new UpdateRequirement.AssertCurrentSchemaID(base.currentSchemaId()));
+        }
+        this.setSchemaId = true;
+      }
+    }
+
+    private void requireNoBranchesChanged() {
+      if (base != null && !isReplace) {
+        base.refs()
+            .forEach(
+                (name, ref) -> {
+                  if (ref.isBranch() && !name.equals(SnapshotRef.MAIN_BRANCH)) {
+                    require(new UpdateRequirement.AssertRefSnapshotID(name, ref.snapshotId()));
+                  }
+                });
       }
     }
 

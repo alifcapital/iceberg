@@ -17,7 +17,7 @@
 
 INHERIT: ./nav.yml
 
-site_name: Apache Iceberg
+site_name: "Apache Iceberg™"
 
 theme:
   custom_dir: overrides
@@ -35,6 +35,7 @@ theme:
     - navigation.tabs
     - navigation.tabs.sticky
     - navigation.path
+    - navigation.sections
     - navigation.top
     - navigation.tracking
     - toc.follow
@@ -78,10 +79,10 @@ markdown_extensions:
       permalink: 🔗
 
 extra:
-  icebergVersion: '1.5.2'
-  nessieVersion: '0.77.1'
-  flinkVersion: '1.19.0'
-  flinkVersionMajor: '1.19'
+  icebergVersion: '1.9.2'
+  nessieVersion: '0.104.5'
+  flinkVersion: '1.20.0'
+  flinkVersionMajor: '1.20'
   social:
     - icon: fontawesome/regular/comments
       link: 'https://iceberg.apache.org/community/'

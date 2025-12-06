@@ -24,6 +24,7 @@ import static org.assertj.core.api.Assumptions.assumeThat;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Table;
@@ -140,7 +141,6 @@ public class TestMigrateTableProcedure extends ExtensionsTestBase {
   @TestTemplate
   public void testMigrateWithInvalidMetricsConfig() throws IOException {
     assumeThat(catalogName).isEqualToIgnoringCase("spark_catalog");
-
     String location = Files.createTempDirectory(temp, "junit").toFile().toString();
     sql(
         "CREATE TABLE %s (id bigint NOT NULL, data string) USING parquet LOCATION '%s'",
@@ -158,7 +158,6 @@ public class TestMigrateTableProcedure extends ExtensionsTestBase {
   @TestTemplate
   public void testMigrateWithConflictingProps() throws IOException {
     assumeThat(catalogName).isEqualToIgnoringCase("spark_catalog");
-
     String location = Files.createTempDirectory(temp, "junit").toFile().toString();
     sql(
         "CREATE TABLE %s (id bigint NOT NULL, data string) USING parquet LOCATION '%s'",
@@ -230,5 +229,61 @@ public class TestMigrateTableProcedure extends ExtensionsTestBase {
         tableName, location);
     Object result = scalarSql("CALL %s.system.migrate('%s')", catalogName, tableName);
     assertThat(result).isEqualTo(0L);
+  }
+
+  @TestTemplate
+  public void testMigrateWithParallelism() throws IOException {
+    assumeThat(catalogName).isEqualToIgnoringCase("spark_catalog");
+    String location = Files.createTempDirectory(temp, "junit").toFile().toString();
+    sql(
+        "CREATE TABLE %s (id bigint NOT NULL, data string) USING parquet LOCATION '%s'",
+        tableName, location);
+    sql("INSERT INTO TABLE %s VALUES (1, 'a')", tableName);
+    sql("INSERT INTO TABLE %s VALUES (2, 'b')", tableName);
+
+    List<Object[]> result =
+        sql("CALL %s.system.migrate(table => '%s', parallelism => %d)", catalogName, tableName, 2);
+    assertEquals("Procedure output must match", ImmutableList.of(row(2L)), result);
+
+    assertEquals(
+        "Should have expected rows",
+        ImmutableList.of(row(1L, "a"), row(2L, "b")),
+        sql("SELECT * FROM %s ORDER BY id", tableName));
+  }
+
+  @TestTemplate
+  public void testMigrateWithInvalidParallelism() throws IOException {
+    assumeThat(catalogName).isEqualToIgnoringCase("spark_catalog");
+    String location = Files.createTempDirectory(temp, "junit").toFile().toString();
+    sql(
+        "CREATE TABLE %s (id bigint NOT NULL, data string) USING parquet LOCATION '%s'",
+        tableName, location);
+    sql("INSERT INTO TABLE %s VALUES (1, 'a')", tableName);
+    sql("INSERT INTO TABLE %s VALUES (2, 'b')", tableName);
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.migrate(table => '%s', parallelism => %d)",
+                    catalogName, tableName, -1))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("Parallelism should be larger than 0");
+  }
+
+  @TestTemplate
+  public void testMigratePartitionedWithParallelism() throws IOException {
+    assumeThat(catalogName).isEqualToIgnoringCase("spark_catalog");
+    String location = Files.createTempDirectory(temp, "junit").toFile().toString();
+    sql(
+        "CREATE TABLE %s (id bigint NOT NULL, data string) USING parquet PARTITIONED BY (id) LOCATION '%s'",
+        tableName, location);
+    sql("INSERT INTO TABLE %s (id, data) VALUES (1, 'a'), (2, 'b')", tableName);
+    List<Object[]> result =
+        sql("CALL %s.system.migrate(table => '%s', parallelism => %d)", catalogName, tableName, 2);
+    assertEquals("Procedure output must match", ImmutableList.of(row(2L)), result);
+    assertEquals(
+        "Should have expected rows",
+        ImmutableList.of(row("a", 1L), row("b", 2L)),
+        sql("SELECT * FROM %s ORDER BY id", tableName));
   }
 }
