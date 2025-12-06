@@ -964,8 +964,8 @@ public class ConvertEqualityDeleteFilesSparkAction
             .suffix("pos-deletes")
             .build();
 
-    GenericAppenderFactory appenderFactory = new GenericAppenderFactory(table.schema(), spec);
-    appenderFactory.setAll(table.properties());
+    GenericAppenderFactory appenderFactory =
+        new GenericAppenderFactory(table, table.schema(), spec, table.properties(), null, null, null);
 
     FileWriter<PositionDelete<Record>, DeleteWriteResult> posDeleteWriter =
         new SortingPositionOnlyDeleteWriter<>(
@@ -1076,8 +1076,8 @@ public class ConvertEqualityDeleteFilesSparkAction
             .suffix("pos-deletes")
             .build();
 
-    GenericAppenderFactory appenderFactory = new GenericAppenderFactory(table.schema(), spec);
-    appenderFactory.setAll(table.properties());
+    GenericAppenderFactory appenderFactory =
+        new GenericAppenderFactory(table, table.schema(), spec, table.properties(), null, null, null);
 
     FileWriter<PositionDelete<Record>, DeleteWriteResult> posDeleteWriter =
         new SortingPositionOnlyDeleteWriter<>(
