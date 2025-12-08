@@ -125,6 +125,8 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
     this.listingParallelism = spark.sessionState().conf().parallelPartitionDiscoveryParallelism();
     this.table = table;
     this.location = table.location();
+    // Auto-detect: use FileIO prefix listing if supported (e.g. S3), otherwise use Hadoop
+    this.usePrefixListing = table.io() instanceof SupportsPrefixOperations;
 
     ValidationException.check(
         PropertyUtil.propertyAsBoolean(table.properties(), GC_ENABLED, GC_ENABLED_DEFAULT),
