@@ -138,7 +138,7 @@ public class RemoveOrphanFilesProcedure extends BaseProcedure {
     PrefixMismatchMode prefixMismatchMode =
         args.isNullAt(8) ? null : PrefixMismatchMode.fromString(args.getString(8));
 
-    boolean prefixListing = args.isNullAt(9) ? false : args.getBoolean(9);
+    Boolean prefixListing = args.isNullAt(9) ? null : args.getBoolean(9);
 
     return withIcebergTable(
         tableIdent,
@@ -186,7 +186,9 @@ public class RemoveOrphanFilesProcedure extends BaseProcedure {
             action.prefixMismatchMode(prefixMismatchMode);
           }
 
-          action.usePrefixListing(prefixListing);
+          if (prefixListing != null) {
+            action.usePrefixListing(prefixListing);
+          }
 
           DeleteOrphanFiles.Result result = action.execute();
 
