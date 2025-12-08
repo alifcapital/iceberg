@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.actions;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.Comparator;
@@ -57,6 +58,7 @@ import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.Files;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DeleteWriteResult;
 import org.apache.iceberg.io.FileWriter;
@@ -136,6 +138,27 @@ public class ConvertEqualityDeleteFilesSparkAction
 
   public static final long PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT = 512L * 1024 * 1024;
 
+  /**
+   * Local mount path for s3fs/goofys/mountpoint-s3 FUSE cache.
+   * When set, data files will be read from this local path instead of S3.
+   * Example: "/mnt/s3-cache/my-bucket"
+   *
+   * <p>This is useful when running convert_equality_deletes frequently on the same data files.
+   * The FUSE mount provides transparent caching with partial read support (range requests),
+   * which works well with Parquet bloom filters.
+   */
+  public static final String CACHE_MOUNT_PATH = "cache.mount-path";
+
+  /**
+   * S3 prefix to replace with the local mount path.
+   * Example: "s3://my-bucket" or "s3a://my-bucket"
+   *
+   * <p>When reading a file like "s3://my-bucket/data/file.parquet",
+   * if cache.mount-path="/mnt/s3-cache/my-bucket" and cache.s3-prefix="s3://my-bucket",
+   * the file will be read from "/mnt/s3-cache/my-bucket/data/file.parquet" if it exists.
+   */
+  public static final String CACHE_S3_PREFIX = "cache.s3-prefix";
+
   private static final Result EMPTY_RESULT =
       ImmutableConvertEqualityDeleteFiles.Result.builder()
           .convertedEqualityDeleteFilesCount(0)
@@ -150,6 +173,8 @@ public class ConvertEqualityDeleteFilesSparkAction
   private Expression filter = Expressions.alwaysTrue();
   private boolean partialProgressEnabled = PARTIAL_PROGRESS_ENABLED_DEFAULT;
   private long minCommitSizeBytes = PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT;
+  private String cacheMountPath = null;
+  private String cacheS3Prefix = null;
 
   ConvertEqualityDeleteFilesSparkAction(SparkSession spark, Table table) {
     super(spark.cloneSession());
@@ -178,6 +203,28 @@ public class ConvertEqualityDeleteFilesSparkAction
             options(),
             PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES,
             PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT);
+
+    // Cache options for s3fs/FUSE mount
+    this.cacheMountPath = options().get(CACHE_MOUNT_PATH);
+    this.cacheS3Prefix = options().get(CACHE_S3_PREFIX);
+
+    if (cacheMountPath != null && cacheS3Prefix != null) {
+      LOG.info(
+          "{} table={} cache_enabled mount_path={} s3_prefix={}",
+          LOG_PREFIX,
+          table.name(),
+          cacheMountPath,
+          cacheS3Prefix);
+    } else if (cacheMountPath != null || cacheS3Prefix != null) {
+      LOG.warn(
+          "{} table={} cache partially configured - both {} and {} must be set to enable caching",
+          LOG_PREFIX,
+          table.name(),
+          CACHE_MOUNT_PATH,
+          CACHE_S3_PREFIX);
+      this.cacheMountPath = null;
+      this.cacheS3Prefix = null;
+    }
   }
 
   @Override
@@ -806,13 +853,19 @@ public class ConvertEqualityDeleteFilesSparkAction
     String eqColumnName = firstCol.name();
     if (isSingleLongColumn) {
       posDeletesRDD = filesRDD.flatMap(
-          new ReadAndFilterLongFunction(tableBroadcast, projectionSchema, broadcastLongKeys, eqColumnName, filesSkipped));
+          new ReadAndFilterLongFunction(
+              tableBroadcast, projectionSchema, broadcastLongKeys, eqColumnName, filesSkipped,
+              cacheMountPath, cacheS3Prefix));
     } else if (isSingleStringColumn) {
       posDeletesRDD = filesRDD.flatMap(
-          new ReadAndFilterStringFunction(tableBroadcast, projectionSchema, broadcastStringKeys, eqColumnName, filesSkipped));
+          new ReadAndFilterStringFunction(
+              tableBroadcast, projectionSchema, broadcastStringKeys, eqColumnName, filesSkipped,
+              cacheMountPath, cacheS3Prefix));
     } else {
       posDeletesRDD = filesRDD.flatMap(
-          new ReadAndFilterFunction(tableBroadcast, projectionSchema, broadcastKeys));
+          new ReadAndFilterFunction(
+              tableBroadcast, projectionSchema, broadcastKeys,
+              cacheMountPath, cacheS3Prefix));
     }
 
     // Collect results
@@ -888,23 +941,31 @@ public class ConvertEqualityDeleteFilesSparkAction
   private static class ReadAndFilterLongFunction
       implements FlatMapFunction<DataFileInfo, PositionDeleteRecord> {
 
+    private static final Logger LOG = LoggerFactory.getLogger(ReadAndFilterLongFunction.class);
+
     private final Broadcast<Table> tableBroadcast;
     private final Schema projectionSchema;
     private final Broadcast<Set<Long>> broadcastLongKeys;
     private final String eqColumnName;
     private final org.apache.spark.util.LongAccumulator filesSkipped;
+    private final String cacheMountPath;
+    private final String cacheS3Prefix;
 
     ReadAndFilterLongFunction(
         Broadcast<Table> tableBroadcast,
         Schema projectionSchema,
         Broadcast<Set<Long>> broadcastLongKeys,
         String eqColumnName,
-        org.apache.spark.util.LongAccumulator filesSkipped) {
+        org.apache.spark.util.LongAccumulator filesSkipped,
+        String cacheMountPath,
+        String cacheS3Prefix) {
       this.tableBroadcast = tableBroadcast;
       this.projectionSchema = projectionSchema;
       this.broadcastLongKeys = broadcastLongKeys;
       this.eqColumnName = eqColumnName;
       this.filesSkipped = filesSkipped;
+      this.cacheMountPath = cacheMountPath;
+      this.cacheS3Prefix = cacheS3Prefix;
     }
 
     @Override
@@ -913,7 +974,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       Set<Long> deleteKeys = broadcastLongKeys.value();
 
       List<PositionDeleteRecord> matches = Lists.newArrayList();
-      InputFile inputFile = table.io().newInputFile(fileInfo.path());
+      InputFile inputFile = getInputFile(fileInfo.path(), table);
 
       // Only use bloom filter if delete keys <= 10000 (avoid overhead with large IN expressions)
       Expression bloomFilter = deleteKeys.size() <= 10000
@@ -947,6 +1008,20 @@ public class ConvertEqualityDeleteFilesSparkAction
       return matches.iterator();
     }
 
+    /**
+     * Get InputFile, using local FUSE mount path if configured.
+     * When s3fs/goofys is mounted, the file is always accessible via local path -
+     * FUSE transparently proxies reads to S3 with caching.
+     */
+    private InputFile getInputFile(String s3Path, Table table) {
+      if (cacheMountPath != null && cacheS3Prefix != null && s3Path.startsWith(cacheS3Prefix)) {
+        String localPath = s3Path.replace(cacheS3Prefix, cacheMountPath);
+        LOG.debug("Using FUSE mount: {} -> {}", s3Path, localPath);
+        return Files.localInput(new File(localPath));
+      }
+      return table.io().newInputFile(s3Path);
+    }
+
     private CloseableIterable<Record> openDataFile(
         InputFile inputFile, Schema schema, FileFormat format, Expression filter) {
       switch (format) {
@@ -977,23 +1052,31 @@ public class ConvertEqualityDeleteFilesSparkAction
   private static class ReadAndFilterStringFunction
       implements FlatMapFunction<DataFileInfo, PositionDeleteRecord> {
 
+    private static final Logger LOG = LoggerFactory.getLogger(ReadAndFilterStringFunction.class);
+
     private final Broadcast<Table> tableBroadcast;
     private final Schema projectionSchema;
     private final Broadcast<Set<String>> broadcastStringKeys;
     private final String eqColumnName;
     private final org.apache.spark.util.LongAccumulator filesSkipped;
+    private final String cacheMountPath;
+    private final String cacheS3Prefix;
 
     ReadAndFilterStringFunction(
         Broadcast<Table> tableBroadcast,
         Schema projectionSchema,
         Broadcast<Set<String>> broadcastStringKeys,
         String eqColumnName,
-        org.apache.spark.util.LongAccumulator filesSkipped) {
+        org.apache.spark.util.LongAccumulator filesSkipped,
+        String cacheMountPath,
+        String cacheS3Prefix) {
       this.tableBroadcast = tableBroadcast;
       this.projectionSchema = projectionSchema;
       this.broadcastStringKeys = broadcastStringKeys;
       this.eqColumnName = eqColumnName;
       this.filesSkipped = filesSkipped;
+      this.cacheMountPath = cacheMountPath;
+      this.cacheS3Prefix = cacheS3Prefix;
     }
 
     @Override
@@ -1002,7 +1085,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       Set<String> deleteKeys = broadcastStringKeys.value();
 
       List<PositionDeleteRecord> matches = Lists.newArrayList();
-      InputFile inputFile = table.io().newInputFile(fileInfo.path());
+      InputFile inputFile = getInputFile(fileInfo.path(), table);
 
       // Only use bloom filter if delete keys <= 10000 (avoid overhead with large IN expressions)
       Expression bloomFilter = deleteKeys.size() <= 10000
@@ -1036,6 +1119,20 @@ public class ConvertEqualityDeleteFilesSparkAction
       return matches.iterator();
     }
 
+    /**
+     * Get InputFile, using local FUSE mount path if configured.
+     * When s3fs/goofys is mounted, the file is always accessible via local path -
+     * FUSE transparently proxies reads to S3 with caching.
+     */
+    private InputFile getInputFile(String s3Path, Table table) {
+      if (cacheMountPath != null && cacheS3Prefix != null && s3Path.startsWith(cacheS3Prefix)) {
+        String localPath = s3Path.replace(cacheS3Prefix, cacheMountPath);
+        LOG.debug("Using FUSE mount: {} -> {}", s3Path, localPath);
+        return Files.localInput(new File(localPath));
+      }
+      return table.io().newInputFile(s3Path);
+    }
+
     private CloseableIterable<Record> openDataFile(
         InputFile inputFile, Schema schema, FileFormat format, Expression filter) {
       switch (format) {
@@ -1066,17 +1163,25 @@ public class ConvertEqualityDeleteFilesSparkAction
   private static class ReadAndFilterFunction
       implements FlatMapFunction<DataFileInfo, PositionDeleteRecord> {
 
+    private static final Logger LOG = LoggerFactory.getLogger(ReadAndFilterFunction.class);
+
     private final Broadcast<Table> tableBroadcast;
     private final Schema projectionSchema;
     private final Broadcast<Set<List<Object>>> broadcastKeys;
+    private final String cacheMountPath;
+    private final String cacheS3Prefix;
 
     ReadAndFilterFunction(
         Broadcast<Table> tableBroadcast,
         Schema projectionSchema,
-        Broadcast<Set<List<Object>>> broadcastKeys) {
+        Broadcast<Set<List<Object>>> broadcastKeys,
+        String cacheMountPath,
+        String cacheS3Prefix) {
       this.tableBroadcast = tableBroadcast;
       this.projectionSchema = projectionSchema;
       this.broadcastKeys = broadcastKeys;
+      this.cacheMountPath = cacheMountPath;
+      this.cacheS3Prefix = cacheS3Prefix;
     }
 
     @Override
@@ -1085,7 +1190,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       Set<List<Object>> deleteKeys = broadcastKeys.value();
 
       List<PositionDeleteRecord> matches = Lists.newArrayList();
-      InputFile inputFile = table.io().newInputFile(fileInfo.path());
+      InputFile inputFile = getInputFile(fileInfo.path(), table);
 
       // Position column is the last column in projection schema
       int posColumnIndex = projectionSchema.columns().size() - 1;
@@ -1109,6 +1214,20 @@ public class ConvertEqualityDeleteFilesSparkAction
       }
 
       return matches.iterator();
+    }
+
+    /**
+     * Get InputFile, using local FUSE mount path if configured.
+     * When s3fs/goofys is mounted, the file is always accessible via local path -
+     * FUSE transparently proxies reads to S3 with caching.
+     */
+    private InputFile getInputFile(String s3Path, Table table) {
+      if (cacheMountPath != null && cacheS3Prefix != null && s3Path.startsWith(cacheS3Prefix)) {
+        String localPath = s3Path.replace(cacheS3Prefix, cacheMountPath);
+        LOG.debug("Using FUSE mount: {} -> {}", s3Path, localPath);
+        return Files.localInput(new File(localPath));
+      }
+      return table.io().newInputFile(s3Path);
     }
 
     private CloseableIterable<Record> openDataFile(
