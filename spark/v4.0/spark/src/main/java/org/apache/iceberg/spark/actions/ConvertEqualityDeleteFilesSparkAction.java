@@ -18,10 +18,9 @@
  */
 package org.apache.iceberg.spark.actions;
 
-import static org.apache.spark.sql.functions.col;
-
 import java.io.IOException;
 import java.io.Serializable;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -72,6 +71,7 @@ import org.apache.iceberg.spark.SparkSchemaUtil;
 import org.apache.iceberg.spark.source.SerializableTableWithSize;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.StructLikeSet;
 import org.apache.iceberg.util.Tasks;
 import org.apache.spark.api.java.JavaRDD;
@@ -116,6 +116,25 @@ public class ConvertEqualityDeleteFilesSparkAction
 
   private static final String LOG_PREFIX = "[ConvertEqDeletes]";
 
+  /**
+   * If enabled, the action will commit results incrementally as groups complete, allowing partial
+   * progress even if the overall action fails. When disabled, all changes are committed atomically
+   * at the end.
+   */
+  public static final String PARTIAL_PROGRESS_ENABLED = "partial-progress.enabled";
+
+  public static final boolean PARTIAL_PROGRESS_ENABLED_DEFAULT = false;
+
+  /**
+   * Minimum size of data files (in bytes) to read before attempting a partial commit.
+   * This prevents excessive commits for small groups while allowing large groups to commit
+   * immediately. Default is 512MB.
+   */
+  public static final String PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES =
+      "partial-progress.min-commit-size-bytes";
+
+  public static final long PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT = 512L * 1024 * 1024;
+
   private static final Result EMPTY_RESULT =
       ImmutableConvertEqualityDeleteFiles.Result.builder()
           .convertedEqualityDeleteFilesCount(0)
@@ -126,6 +145,8 @@ public class ConvertEqualityDeleteFilesSparkAction
 
   private final Table table;
   private Expression filter = Expressions.alwaysTrue();
+  private boolean partialProgressEnabled = PARTIAL_PROGRESS_ENABLED_DEFAULT;
+  private long minCommitSizeBytes = PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT;
 
   ConvertEqualityDeleteFilesSparkAction(SparkSession spark, Table table) {
     super(((org.apache.spark.sql.classic.SparkSession) spark).cloneSession());
@@ -145,8 +166,21 @@ public class ConvertEqualityDeleteFilesSparkAction
     return this;
   }
 
+  private void initOptions() {
+    this.partialProgressEnabled =
+        PropertyUtil.propertyAsBoolean(
+            options(), PARTIAL_PROGRESS_ENABLED, PARTIAL_PROGRESS_ENABLED_DEFAULT);
+    this.minCommitSizeBytes =
+        PropertyUtil.propertyAsLong(
+            options(),
+            PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES,
+            PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT);
+  }
+
   @Override
   public Result execute() {
+    initOptions();
+
     long startTime = System.currentTimeMillis();
 
     if (table.currentSnapshot() == null) {
@@ -156,11 +190,13 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     long startingSnapshotId = table.currentSnapshot().snapshotId();
     LOG.info(
-        "{} table={} snapshot={} filter={} starting conversion",
+        "{} table={} snapshot={} filter={} partial_progress={} min_commit_size_bytes={} starting conversion",
         LOG_PREFIX,
         table.name(),
         startingSnapshotId,
-        filter);
+        filter,
+        partialProgressEnabled,
+        minCommitSizeBytes);
 
     // Step 1: Find all tasks that have equality delete files
     long scanStartTime = System.currentTimeMillis();
@@ -189,6 +225,18 @@ public class ConvertEqualityDeleteFilesSparkAction
         tasksWithEqDeletes.size(),
         totalEqDeleteFiles,
         totalDataFiles);
+
+    if (partialProgressEnabled) {
+      return doExecuteWithPartialProgress(tasksWithEqDeletes, startingSnapshotId, startTime);
+    } else {
+      return doExecute(tasksWithEqDeletes, startingSnapshotId, startTime);
+    }
+  }
+
+  private Result doExecute(
+      Map<DeleteFileGroup, List<FileScanTask>> tasksWithEqDeletes,
+      long startingSnapshotId,
+      long startTime) {
 
     Set<DeleteFile> convertedEqDeleteFiles = Sets.newHashSet();
     Set<DeleteFile> addedPosDeleteFiles = Sets.newHashSet();
@@ -269,6 +317,277 @@ public class ConvertEqualityDeleteFilesSparkAction
     return ImmutableConvertEqualityDeleteFiles.Result.builder()
         .convertedEqualityDeleteFilesCount(convertedEqDeleteFiles.size())
         .addedPositionDeleteFilesCount(addedPosDeleteFiles.size())
+        .rewrittenDeleteRecordsCount(totalRewrittenRecords)
+        .addedDeleteRecordsCount(totalAddedRecords)
+        .build();
+  }
+
+  private Result doExecuteWithPartialProgress(
+      Map<DeleteFileGroup, List<FileScanTask>> tasksWithEqDeletes,
+      long startingSnapshotId,
+      long startTime) {
+
+    // Build dependency tracking: eq_delete_path -> set of groups containing it
+    Map<String, Set<DeleteFileGroup>> eqDeleteToGroups = Maps.newHashMap();
+    for (DeleteFileGroup group : tasksWithEqDeletes.keySet()) {
+      for (DeleteFile eqDelete : group.deleteFiles()) {
+        String path = eqDelete.path().toString();
+        eqDeleteToGroups.computeIfAbsent(path, k -> Sets.newHashSet()).add(group);
+      }
+    }
+
+    // Sort groups by MIN sequence number of their eq deletes (ascending).
+    // Eq deletes with lower sequence numbers apply to fewer data files (only D where D.seq < E.seq),
+    // so they appear in fewer groups and can be fully processed and committed sooner.
+    List<Map.Entry<DeleteFileGroup, List<FileScanTask>>> sortedGroups =
+        tasksWithEqDeletes.entrySet().stream()
+            .sorted(
+                Comparator.comparingLong(
+                    entry ->
+                        entry.getKey().deleteFiles().stream()
+                            .mapToLong(DeleteFile::dataSequenceNumber)
+                            .min()
+                            .orElse(Long.MAX_VALUE)))
+            .collect(Collectors.toList());
+
+    LOG.info(
+        "{} table={} groups_sorted_for_partial_progress total_groups={}",
+        LOG_PREFIX,
+        table.name(),
+        sortedGroups.size());
+
+    // Track processed groups and results per group
+    Set<DeleteFileGroup> processedGroups = Sets.newHashSet();
+    Map<DeleteFileGroup, ConversionResult> groupResults = Maps.newHashMap();
+
+    // Track committed eq deletes and pos deletes
+    Set<String> committedEqDeletePaths = Sets.newHashSet();
+    Set<DeleteFile> uncommittedPosDeletes = Sets.newHashSet();
+    Map<DeleteFile, Set<DeleteFile>> eqDeleteToPosDeletes = Maps.newHashMap();
+
+    // Counters for result
+    int totalConvertedEqDeleteFiles = 0;
+    int totalAddedPosDeleteFiles = 0;
+    long totalRewrittenRecords = 0;
+    long totalAddedRecords = 0;
+    int commitCount = 0;
+
+    // Track bytes read since last commit for commit threshold
+    long bytesReadSinceLastCommit = 0;
+
+    int groupIndex = 0;
+    for (Map.Entry<DeleteFileGroup, List<FileScanTask>> entry : sortedGroups) {
+      groupIndex++;
+      DeleteFileGroup eqDeleteGroup = entry.getKey();
+      List<FileScanTask> dataFileTasks = entry.getValue();
+
+      LOG.info(
+          "{} table={} group={}/{} eq_delete_files={} data_files={} processing (partial progress)",
+          LOG_PREFIX,
+          table.name(),
+          groupIndex,
+          sortedGroups.size(),
+          eqDeleteGroup.deleteFiles().size(),
+          dataFileTasks.size());
+
+      ConversionResult conversionResult =
+          convertEqualityDeletes(eqDeleteGroup, dataFileTasks, startingSnapshotId, groupIndex);
+
+      processedGroups.add(eqDeleteGroup);
+      groupResults.put(eqDeleteGroup, conversionResult);
+      uncommittedPosDeletes.addAll(conversionResult.posDeleteFiles);
+
+      // Track which pos deletes belong to which eq deletes
+      for (DeleteFile eqDelete : eqDeleteGroup.deleteFiles()) {
+        eqDeleteToPosDeletes
+            .computeIfAbsent(eqDelete, k -> Sets.newHashSet())
+            .addAll(conversionResult.posDeleteFiles);
+      }
+
+      totalRewrittenRecords += conversionResult.eqDeleteRecordsCount;
+      totalAddedRecords += conversionResult.posDeleteRecordsCount;
+
+      // Track bytes read from data files in this group
+      long groupDataFilesSize =
+          dataFileTasks.stream().mapToLong(task -> task.file().fileSizeInBytes()).sum();
+      bytesReadSinceLastCommit += groupDataFilesSize;
+
+      // Check which eq deletes are now fully processed (all their groups are done)
+      Set<DeleteFile> readyToCommitEqDeletes = Sets.newHashSet();
+      Set<DeleteFile> readyToCommitPosDeletes = Sets.newHashSet();
+
+      for (DeleteFile eqDelete : eqDeleteGroup.deleteFiles()) {
+        String eqPath = eqDelete.path().toString();
+        if (committedEqDeletePaths.contains(eqPath)) {
+          continue; // Already committed
+        }
+
+        Set<DeleteFileGroup> groupsForThisEqDelete = eqDeleteToGroups.get(eqPath);
+        boolean allGroupsProcessed = processedGroups.containsAll(groupsForThisEqDelete);
+
+        if (allGroupsProcessed) {
+          readyToCommitEqDeletes.add(eqDelete);
+          // Add all pos deletes from all groups that contain this eq delete
+          for (DeleteFileGroup g : groupsForThisEqDelete) {
+            ConversionResult result = groupResults.get(g);
+            if (result != null) {
+              readyToCommitPosDeletes.addAll(result.posDeleteFiles);
+            }
+          }
+        }
+      }
+
+      // Filter out already committed pos deletes
+      readyToCommitPosDeletes.retainAll(uncommittedPosDeletes);
+
+      // Try to commit if we have ready eq deletes and accumulated enough data
+      boolean shouldCommit =
+          !readyToCommitEqDeletes.isEmpty() && bytesReadSinceLastCommit >= minCommitSizeBytes;
+
+      if (shouldCommit) {
+        LOG.info(
+            "{} table={} partial_commit={} eq_delete_files={} pos_delete_files={} "
+                + "bytes_since_last_commit={} attempting commit",
+            LOG_PREFIX,
+            table.name(),
+            commitCount + 1,
+            readyToCommitEqDeletes.size(),
+            readyToCommitPosDeletes.size(),
+            bytesReadSinceLastCommit);
+
+        try {
+          long commitStartTime = System.currentTimeMillis();
+          commitChanges(readyToCommitEqDeletes, readyToCommitPosDeletes, startingSnapshotId);
+          long commitDuration = System.currentTimeMillis() - commitStartTime;
+
+          commitCount++;
+          totalConvertedEqDeleteFiles += readyToCommitEqDeletes.size();
+          totalAddedPosDeleteFiles += readyToCommitPosDeletes.size();
+
+          // Mark as committed
+          for (DeleteFile eqDelete : readyToCommitEqDeletes) {
+            committedEqDeletePaths.add(eqDelete.path().toString());
+          }
+          uncommittedPosDeletes.removeAll(readyToCommitPosDeletes);
+
+          // Reset bytes counter after successful commit
+          bytesReadSinceLastCommit = 0;
+
+          LOG.info(
+              "{} table={} partial_commit={} commit_duration_ms={} success",
+              LOG_PREFIX,
+              table.name(),
+              commitCount,
+              commitDuration);
+
+        } catch (ValidationException | CommitFailedException e) {
+          LOG.error(
+              "{} table={} partial_commit failed due to concurrent modification, stopping",
+              LOG_PREFIX,
+              table.name(),
+              e);
+
+          // Clean up uncommitted pos delete files
+          cleanUpFiles(uncommittedPosDeletes);
+
+          // Return partial results
+          long totalDuration = System.currentTimeMillis() - startTime;
+          LOG.info(
+              "{} table={} total_duration_ms={} partial_progress_stopped "
+                  + "converted_eq_delete_files={} added_pos_delete_files={} commits={}",
+              LOG_PREFIX,
+              table.name(),
+              totalDuration,
+              totalConvertedEqDeleteFiles,
+              totalAddedPosDeleteFiles,
+              commitCount);
+
+          return ImmutableConvertEqualityDeleteFiles.Result.builder()
+              .convertedEqualityDeleteFilesCount(totalConvertedEqDeleteFiles)
+              .addedPositionDeleteFilesCount(totalAddedPosDeleteFiles)
+              .rewrittenDeleteRecordsCount(totalRewrittenRecords)
+              .addedDeleteRecordsCount(totalAddedRecords)
+              .build();
+        }
+      }
+    }
+
+    // Final commit for any remaining uncommitted eq deletes
+    Set<DeleteFile> remainingEqDeletes = Sets.newHashSet();
+    for (DeleteFileGroup group : processedGroups) {
+      for (DeleteFile eqDelete : group.deleteFiles()) {
+        if (!committedEqDeletePaths.contains(eqDelete.path().toString())) {
+          remainingEqDeletes.add(eqDelete);
+        }
+      }
+    }
+
+    if (!remainingEqDeletes.isEmpty() && !uncommittedPosDeletes.isEmpty()) {
+      LOG.info(
+          "{} table={} final_commit eq_delete_files={} pos_delete_files={} attempting",
+          LOG_PREFIX,
+          table.name(),
+          remainingEqDeletes.size(),
+          uncommittedPosDeletes.size());
+
+      try {
+        long commitStartTime = System.currentTimeMillis();
+        commitChanges(remainingEqDeletes, uncommittedPosDeletes, startingSnapshotId);
+        long commitDuration = System.currentTimeMillis() - commitStartTime;
+
+        commitCount++;
+        totalConvertedEqDeleteFiles += remainingEqDeletes.size();
+        totalAddedPosDeleteFiles += uncommittedPosDeletes.size();
+
+        LOG.info(
+            "{} table={} final_commit commit_duration_ms={} success",
+            LOG_PREFIX,
+            table.name(),
+            commitDuration);
+
+      } catch (ValidationException | CommitFailedException e) {
+        LOG.error(
+            "{} table={} final_commit failed due to concurrent modification",
+            LOG_PREFIX,
+            table.name(),
+            e);
+
+        cleanUpFiles(uncommittedPosDeletes);
+
+        long totalDuration = System.currentTimeMillis() - startTime;
+        LOG.info(
+            "{} table={} total_duration_ms={} partial_progress_stopped_at_final_commit "
+                + "converted_eq_delete_files={} added_pos_delete_files={} commits={}",
+            LOG_PREFIX,
+            table.name(),
+            totalDuration,
+            totalConvertedEqDeleteFiles,
+            totalAddedPosDeleteFiles,
+            commitCount);
+
+        return ImmutableConvertEqualityDeleteFiles.Result.builder()
+            .convertedEqualityDeleteFilesCount(totalConvertedEqDeleteFiles)
+            .addedPositionDeleteFilesCount(totalAddedPosDeleteFiles)
+            .rewrittenDeleteRecordsCount(totalRewrittenRecords)
+            .addedDeleteRecordsCount(totalAddedRecords)
+            .build();
+      }
+    }
+
+    long totalDuration = System.currentTimeMillis() - startTime;
+    LOG.info(
+        "{} table={} total_duration_ms={} partial_progress_completed "
+            + "converted_eq_delete_files={} added_pos_delete_files={} commits={}",
+        LOG_PREFIX,
+        table.name(),
+        totalDuration,
+        totalConvertedEqDeleteFiles,
+        totalAddedPosDeleteFiles,
+        commitCount);
+
+    return ImmutableConvertEqualityDeleteFiles.Result.builder()
+        .convertedEqualityDeleteFilesCount(totalConvertedEqDeleteFiles)
+        .addedPositionDeleteFilesCount(totalAddedPosDeleteFiles)
         .rewrittenDeleteRecordsCount(totalRewrittenRecords)
         .addedDeleteRecordsCount(totalAddedRecords)
         .build();
