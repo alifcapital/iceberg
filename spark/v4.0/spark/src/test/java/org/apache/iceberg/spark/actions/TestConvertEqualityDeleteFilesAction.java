@@ -295,6 +295,84 @@ public class TestConvertEqualityDeleteFilesAction extends TestBase {
     assertThat(idsAfter).doesNotContain(10, 20, 30, 40);
   }
 
+  @TestTemplate
+  public void testRowGroupSkippingWithCorrectPositions() {
+    // This test verifies that when row groups are skipped by bloom filter,
+    // the position deletes still have correct absolute positions in the file.
+    // This is critical for the _pos fix - without it, skipped row groups would
+    // cause incorrect position calculations.
+
+    Table table =
+        TABLES.create(
+            SCHEMA,
+            PartitionSpec.unpartitioned(),
+            ImmutableMap.of(
+                TableProperties.FORMAT_VERSION, String.valueOf(formatVersion),
+                TableProperties.DEFAULT_FILE_FORMAT, "parquet",
+                // Small row group size to create multiple row groups per file
+                "write.parquet.row-group-size-bytes", "1024",
+                // Enable bloom filter on id column
+                "write.parquet.bloom-filter-enabled.column.id", "true"),
+            tableLocation);
+
+    // Insert enough data to create multiple row groups (with small row-group-size)
+    // IDs 1-1000 should create multiple row groups
+    spark
+        .range(1, 1001)
+        .selectExpr("cast(id as int) as id", "'value' as data")
+        .write()
+        .format("iceberg")
+        .mode("append")
+        .save(tableLocation);
+
+    table.refresh();
+
+    // Verify we have data files
+    List<DataFile> dataFiles = TestHelpers.dataFiles(table);
+    assertThat(dataFiles).isNotEmpty();
+
+    // Write equality delete for specific IDs that should be in different row groups
+    // Delete IDs: 100, 500, 900 - spread across the file to hit different row groups
+    writeEqualityDelete(table, Lists.newArrayList(100, 500, 900));
+
+    table.refresh();
+
+    // Read data BEFORE conversion
+    List<Row> dataBefore = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataBefore).hasSize(997); // 1000 - 3 deleted
+
+    // Verify deleted IDs are not present
+    List<Integer> idsBefore =
+        dataBefore.stream().map(r -> r.getInt(0)).sorted().collect(Collectors.toList());
+    assertThat(idsBefore).doesNotContain(100, 500, 900);
+
+    // Convert equality deletes to position deletes
+    // This will use bloom filter to skip row groups that don't contain the delete keys
+    ConvertEqualityDeleteFiles.Result result =
+        SparkActions.get().convertEqualityDeletes(table).execute();
+
+    assertThat(result.convertedEqualityDeleteFilesCount()).isEqualTo(1);
+    assertThat(result.addedPositionDeleteFilesCount()).isGreaterThan(0);
+
+    table.refresh();
+
+    // CRITICAL: Read data AFTER conversion - positions must be correct
+    // If row group skipping caused incorrect positions, wrong rows would be deleted
+    List<Row> dataAfter = spark.read().format("iceberg").load(tableLocation).collectAsList();
+
+    // Data count must match
+    assertThat(dataAfter).hasSize(dataBefore.size());
+
+    // Verify the SAME IDs are deleted (not wrong rows due to position errors)
+    List<Integer> idsAfter =
+        dataAfter.stream().map(r -> r.getInt(0)).sorted().collect(Collectors.toList());
+    assertThat(idsAfter).doesNotContain(100, 500, 900);
+
+    // Verify all other IDs are still present
+    assertThat(idsAfter).containsAll(
+        idsBefore.stream().filter(id -> id != 100 && id != 500 && id != 900).collect(Collectors.toList()));
+  }
+
   private void writeEqualityDelete(Table table, List<Integer> idsToDelete) {
     table.refresh();
     List<Integer> equalityFieldIds = Lists.newArrayList(table.schema().findField("id").fieldId());

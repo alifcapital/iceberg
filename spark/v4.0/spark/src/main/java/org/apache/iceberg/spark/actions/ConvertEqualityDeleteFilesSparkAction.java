@@ -778,7 +778,12 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     Table serializableTable = SerializableTableWithSize.copyOf(table);
     Broadcast<Table> tableBroadcast = jsc.broadcast(serializableTable);
-    Schema projectionSchema = deleteSchema;
+
+    // Add _pos column to projection schema for correct row position tracking
+    // This is essential when row groups are skipped by bloom filter
+    List<Types.NestedField> projectionFields = Lists.newArrayList(deleteSchema.columns());
+    projectionFields.add(MetadataColumns.ROW_POSITION);
+    Schema projectionSchema = new Schema(projectionFields);
 
     // Accumulator for bloom filter skipped files
     org.apache.spark.util.LongAccumulator filesSkipped = jsc.sc().longAccumulator("filesSkipped");
@@ -903,6 +908,9 @@ public class ConvertEqualityDeleteFilesSparkAction
           ? Expressions.in(eqColumnName, deleteKeys)
           : Expressions.alwaysTrue();
 
+      // Position column is the last column in projection schema
+      int posColumnIndex = projectionSchema.columns().size() - 1;
+
       long rowsRead = 0;
       try (CloseableIterable<Record> reader =
           openDataFile(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
@@ -911,7 +919,9 @@ public class ConvertEqualityDeleteFilesSparkAction
           Object val = record.get(0);
           long key = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
           if (deleteKeys.contains(key)) {
-            matches.add(new PositionDeleteRecord(fileInfo.path(), rowsRead));
+            // Use _pos from record for correct position when row groups are skipped
+            Long pos = (Long) record.get(posColumnIndex);
+            matches.add(new PositionDeleteRecord(fileInfo.path(), pos));
           }
           rowsRead++;
         }
@@ -987,6 +997,9 @@ public class ConvertEqualityDeleteFilesSparkAction
           ? Expressions.in(eqColumnName, deleteKeys)
           : Expressions.alwaysTrue();
 
+      // Position column is the last column in projection schema
+      int posColumnIndex = projectionSchema.columns().size() - 1;
+
       long rowsRead = 0;
       try (CloseableIterable<Record> reader =
           openDataFile(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
@@ -995,7 +1008,9 @@ public class ConvertEqualityDeleteFilesSparkAction
           Object val = record.get(0);
           String key = val != null ? val.toString() : null;
           if (deleteKeys.contains(key)) {
-            matches.add(new PositionDeleteRecord(fileInfo.path(), rowsRead));
+            // Use _pos from record for correct position when row groups are skipped
+            Long pos = (Long) record.get(posColumnIndex);
+            matches.add(new PositionDeleteRecord(fileInfo.path(), pos));
           }
           rowsRead++;
         }
@@ -1060,19 +1075,24 @@ public class ConvertEqualityDeleteFilesSparkAction
       List<PositionDeleteRecord> matches = Lists.newArrayList();
       InputFile inputFile = table.io().newInputFile(fileInfo.path());
 
-      long pos = 0;
+      // Position column is the last column in projection schema
+      int posColumnIndex = projectionSchema.columns().size() - 1;
+      // Number of key columns (excluding _pos)
+      int keyColumnCount = posColumnIndex;
+
       try (CloseableIterable<Record> reader =
           openDataFile(inputFile, projectionSchema, fileInfo.format())) {
         for (Record record : reader) {
-          List<Object> recordKey =
-              Lists.newArrayListWithCapacity(projectionSchema.columns().size());
-          for (int i = 0; i < projectionSchema.columns().size(); i++) {
+          List<Object> recordKey = Lists.newArrayListWithCapacity(keyColumnCount);
+          // Only include key columns, not _pos
+          for (int i = 0; i < keyColumnCount; i++) {
             recordKey.add(record.get(i));
           }
           if (deleteKeys.contains(recordKey)) {
+            // Use _pos from record for correct position when row groups are skipped
+            Long pos = (Long) record.get(posColumnIndex);
             matches.add(new PositionDeleteRecord(fileInfo.path(), pos));
           }
-          pos++;
         }
       }
 
