@@ -18,8 +18,10 @@
  */
 package org.apache.iceberg.spark.procedures;
 
+import java.util.Map;
 import org.apache.iceberg.actions.ConvertEqualityDeleteFiles;
 import org.apache.iceberg.actions.ConvertEqualityDeleteFiles.Result;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
@@ -47,8 +49,11 @@ public class ConvertEqualityDeleteFilesProcedure extends BaseProcedure {
 
   private static final ProcedureParameter TABLE_PARAM =
       ProcedureParameter.required("table", DataTypes.StringType);
+  private static final ProcedureParameter OPTIONS_PARAM =
+      ProcedureParameter.optional("options", STRING_MAP);
 
-  private static final ProcedureParameter[] PARAMETERS = new ProcedureParameter[] {TABLE_PARAM};
+  private static final ProcedureParameter[] PARAMETERS =
+      new ProcedureParameter[] {TABLE_PARAM, OPTIONS_PARAM};
 
   private static final StructType OUTPUT_TYPE =
       new StructType(
@@ -90,11 +95,12 @@ public class ConvertEqualityDeleteFilesProcedure extends BaseProcedure {
   public InternalRow[] call(InternalRow args) {
     ProcedureInput input = new ProcedureInput(spark(), tableCatalog(), PARAMETERS, args);
     Identifier tableIdent = input.ident(TABLE_PARAM);
+    Map<String, String> options = input.asStringMap(OPTIONS_PARAM, ImmutableMap.of());
 
     return modifyIcebergTable(
         tableIdent,
         table -> {
-          ConvertEqualityDeleteFiles action = actions().convertEqualityDeletes(table);
+          ConvertEqualityDeleteFiles action = actions().convertEqualityDeletes(table).options(options);
           Result result = action.execute();
           return new InternalRow[] {toOutputRow(result)};
         });
