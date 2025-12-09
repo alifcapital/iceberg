@@ -25,6 +25,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import org.apache.iceberg.CombinedScanTask;
 import org.apache.iceberg.DeleteFile;
@@ -144,6 +145,8 @@ public class ConvertEqualityDeleteFilesSparkAction
           .build();
 
   private final Table table;
+  // Unique ID for this action instance to prevent file name collisions between parallel jobs
+  private final String operationUUID = UUID.randomUUID().toString().substring(0, 8);
   private Expression filter = Expressions.alwaysTrue();
   private boolean partialProgressEnabled = PARTIAL_PROGRESS_ENABLED_DEFAULT;
   private long minCommitSizeBytes = PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT;
@@ -289,12 +292,16 @@ public class ConvertEqualityDeleteFilesSparkAction
             table.name(),
             commitDuration);
       } catch (ValidationException | CommitFailedException e) {
+        // NOTE: We intentionally do NOT clean up the created position delete files here.
+        // If we delete them, we might remove files that a concurrent job has already committed.
+        // Orphan files will be cleaned up later by remove_orphan_files procedure.
         LOG.warn(
-            "{} table={} pos_delete_files_to_cleanup={} commit failed, cleaning up",
+            "{} table={} pos_delete_files_count={} commit failed due to concurrent modification. "
+                + "Files are NOT cleaned up to avoid deleting files committed by parallel jobs. "
+                + "Run remove_orphan_files to clean up.",
             LOG_PREFIX,
             table.name(),
             addedPosDeleteFiles.size());
-        cleanUpFiles(addedPosDeleteFiles);
         throw new RuntimeException(
             "Cannot commit because of a concurrent modification. "
                 + "The equality delete files may have been modified by another operation.",
@@ -481,14 +488,16 @@ public class ConvertEqualityDeleteFilesSparkAction
               commitDuration);
 
         } catch (ValidationException | CommitFailedException e) {
+          // NOTE: We intentionally do NOT clean up the created position delete files here.
+          // If we delete them, we might remove files that a concurrent job has already committed.
+          // Orphan files will be cleaned up later by remove_orphan_files procedure.
           LOG.error(
-              "{} table={} partial_commit failed due to concurrent modification, stopping",
+              "{} table={} partial_commit failed due to concurrent modification, stopping. "
+                  + "Uncommitted files ({}) are NOT cleaned up to avoid deleting files committed by parallel jobs.",
               LOG_PREFIX,
               table.name(),
+              uncommittedPosDeletes.size(),
               e);
-
-          // Clean up uncommitted pos delete files
-          cleanUpFiles(uncommittedPosDeletes);
 
           // Return partial results
           long totalDuration = System.currentTimeMillis() - startTime;
@@ -546,13 +555,16 @@ public class ConvertEqualityDeleteFilesSparkAction
             commitDuration);
 
       } catch (ValidationException | CommitFailedException e) {
+        // NOTE: We intentionally do NOT clean up the created position delete files here.
+        // If we delete them, we might remove files that a concurrent job has already committed.
+        // Orphan files will be cleaned up later by remove_orphan_files procedure.
         LOG.error(
-            "{} table={} final_commit failed due to concurrent modification",
+            "{} table={} final_commit failed due to concurrent modification. "
+                + "Uncommitted files ({}) are NOT cleaned up to avoid deleting files committed by parallel jobs.",
             LOG_PREFIX,
             table.name(),
+            uncommittedPosDeletes.size(),
             e);
-
-        cleanUpFiles(uncommittedPosDeletes);
 
         long totalDuration = System.currentTimeMillis() - startTime;
         LOG.info(
@@ -1299,7 +1311,7 @@ public class ConvertEqualityDeleteFilesSparkAction
     OutputFileFactory outputFileFactory =
         OutputFileFactory.builderFor(table, 0, groupIndex)
             .format(deleteFileFormat)
-            .operationId(String.valueOf(snapshotId) + "-g" + groupIndex)
+            .operationId(String.valueOf(snapshotId) + "-" + operationUUID + "-g" + groupIndex)
             .suffix("pos-deletes")
             .build();
 
@@ -1411,7 +1423,7 @@ public class ConvertEqualityDeleteFilesSparkAction
     OutputFileFactory outputFileFactory =
         OutputFileFactory.builderFor(table, 0, groupIndex)
             .format(deleteFileFormat)
-            .operationId(String.valueOf(snapshotId) + "-g" + groupIndex)
+            .operationId(String.valueOf(snapshotId) + "-" + operationUUID + "-g" + groupIndex)
             .suffix("pos-deletes")
             .build();
 
