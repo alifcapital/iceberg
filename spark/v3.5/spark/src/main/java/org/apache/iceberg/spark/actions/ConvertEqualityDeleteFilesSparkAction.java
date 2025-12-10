@@ -133,6 +133,16 @@ public class ConvertEqualityDeleteFilesSparkAction
   public static final long PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT = 512L * 1024 * 1024;
 
   /**
+   * Maximum number of groups to process before attempting a partial commit.
+   * Commits will happen when either this limit OR min-commit-size-bytes is reached.
+   * Default is 64.
+   */
+  public static final String PARTIAL_PROGRESS_MAX_COMMIT_GROUP_NUM =
+      "partial-progress.max-commit-group-num";
+
+  public static final int PARTIAL_PROGRESS_MAX_COMMIT_GROUP_NUM_DEFAULT = 64;
+
+  /**
    * Number of async jobs to run in parallel (pipeline depth).
    * Higher values may improve throughput but increase memory usage.
    * Default is 8.
@@ -176,6 +186,7 @@ public class ConvertEqualityDeleteFilesSparkAction
   private Expression filter = Expressions.alwaysTrue();
   private boolean partialProgressEnabled = PARTIAL_PROGRESS_ENABLED_DEFAULT;
   private long minCommitSizeBytes = PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT;
+  private int maxCommitGroupNum = PARTIAL_PROGRESS_MAX_COMMIT_GROUP_NUM_DEFAULT;
   private int asyncPipelineDepth = ASYNC_PIPELINE_DEPTH_DEFAULT;
   private String cacheMountPath = null;
   private String cacheS3Prefix = null;
@@ -207,6 +218,11 @@ public class ConvertEqualityDeleteFilesSparkAction
             options(),
             PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES,
             PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT);
+    this.maxCommitGroupNum =
+        PropertyUtil.propertyAsInt(
+            options(),
+            PARTIAL_PROGRESS_MAX_COMMIT_GROUP_NUM,
+            PARTIAL_PROGRESS_MAX_COMMIT_GROUP_NUM_DEFAULT);
     this.asyncPipelineDepth =
         PropertyUtil.propertyAsInt(
             options(), ASYNC_PIPELINE_DEPTH, ASYNC_PIPELINE_DEPTH_DEFAULT);
@@ -568,8 +584,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     long totalAddedRecords = 0;
     int commitCount = 0;
 
-    // Track bytes read since last commit for commit threshold
+    // Track bytes read and groups processed since last commit for commit threshold
     long bytesReadSinceLastCommit = 0;
+    int groupsSinceLastCommit = 0;
 
     // Async pipeline: queue of pending jobs (FIFO order)
     java.util.LinkedList<PendingConversionJob> pendingJobs = new java.util.LinkedList<>();
@@ -683,8 +700,9 @@ public class ConvertEqualityDeleteFilesSparkAction
       totalRewrittenRecords += conversionResult.eqDeleteRecordsCount;
       totalAddedRecords += conversionResult.posDeleteRecordsCount;
 
-      // Track bytes read from data files in this group
+      // Track bytes read and groups processed since last commit
       bytesReadSinceLastCommit += job.dataFilesSize();
+      groupsSinceLastCommit++;
 
       // Check which eq deletes are now fully processed (all their groups are done)
       Set<DeleteFile> readyToCommitEqDeletes = Sets.newHashSet();
@@ -714,20 +732,23 @@ public class ConvertEqualityDeleteFilesSparkAction
       // Filter out already committed pos deletes
       readyToCommitPosDeletes.retainAll(uncommittedPosDeletes);
 
-      // Try to commit if we have ready eq deletes and accumulated enough data
+      // Try to commit if we have ready eq deletes and accumulated enough data or groups
       boolean shouldCommit =
-          !readyToCommitEqDeletes.isEmpty() && bytesReadSinceLastCommit >= minCommitSizeBytes;
+          !readyToCommitEqDeletes.isEmpty()
+              && (bytesReadSinceLastCommit >= minCommitSizeBytes
+                  || groupsSinceLastCommit >= maxCommitGroupNum);
 
       if (shouldCommit) {
         LOG.info(
             "{} table={} partial_commit={} eq_delete_files={} pos_delete_files={} "
-                + "bytes_since_last_commit={} attempting commit",
+                + "bytes_since_last_commit={} groups_since_last_commit={} attempting commit",
             LOG_PREFIX,
             table.name(),
             commitCount + 1,
             readyToCommitEqDeletes.size(),
             readyToCommitPosDeletes.size(),
-            bytesReadSinceLastCommit);
+            bytesReadSinceLastCommit,
+            groupsSinceLastCommit);
 
         try {
           long commitStartTime = System.currentTimeMillis();
@@ -744,8 +765,9 @@ public class ConvertEqualityDeleteFilesSparkAction
           }
           uncommittedPosDeletes.removeAll(readyToCommitPosDeletes);
 
-          // Reset bytes counter after successful commit
+          // Reset counters after successful commit
           bytesReadSinceLastCommit = 0;
+          groupsSinceLastCommit = 0;
 
           LOG.info(
               "{} table={} partial_commit={} commit_duration_ms={} success",
