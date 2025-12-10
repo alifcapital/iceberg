@@ -133,6 +133,15 @@ public class ConvertEqualityDeleteFilesSparkAction
   public static final long PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT = 512L * 1024 * 1024;
 
   /**
+   * Number of async jobs to run in parallel (pipeline depth).
+   * Higher values may improve throughput but increase memory usage.
+   * Default is 8.
+   */
+  public static final String ASYNC_PIPELINE_DEPTH = "async-pipeline-depth";
+
+  public static final int ASYNC_PIPELINE_DEPTH_DEFAULT = 8;
+
+  /**
    * Local mount path for s3fs/goofys/mountpoint-s3 FUSE cache.
    * When set, data files will be read from this local path instead of S3.
    * Example: "/mnt/s3-cache/my-bucket"
@@ -167,6 +176,7 @@ public class ConvertEqualityDeleteFilesSparkAction
   private Expression filter = Expressions.alwaysTrue();
   private boolean partialProgressEnabled = PARTIAL_PROGRESS_ENABLED_DEFAULT;
   private long minCommitSizeBytes = PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT;
+  private int asyncPipelineDepth = ASYNC_PIPELINE_DEPTH_DEFAULT;
   private String cacheMountPath = null;
   private String cacheS3Prefix = null;
 
@@ -197,6 +207,9 @@ public class ConvertEqualityDeleteFilesSparkAction
             options(),
             PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES,
             PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT);
+    this.asyncPipelineDepth =
+        PropertyUtil.propertyAsInt(
+            options(), ASYNC_PIPELINE_DEPTH, ASYNC_PIPELINE_DEPTH_DEFAULT);
 
     // Cache options for s3fs/FUSE mount
     this.cacheMountPath = options().get(CACHE_MOUNT_PATH);
@@ -292,7 +305,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         LOG_PREFIX,
         table.name(),
         tasksWithEqDeletes.size(),
-        ASYNC_PIPELINE_DEPTH);
+        asyncPipelineDepth);
 
     // Async pipeline: queue of pending jobs (FIFO order)
     java.util.LinkedList<PendingConversionJob> pendingJobs = new java.util.LinkedList<>();
@@ -303,8 +316,8 @@ public class ConvertEqualityDeleteFilesSparkAction
     int submitIndex = 0;
 
     while (groupIterator.hasNext() || !pendingJobs.isEmpty()) {
-      // Fill pipeline up to ASYNC_PIPELINE_DEPTH
-      while (pendingJobs.size() < ASYNC_PIPELINE_DEPTH && groupIterator.hasNext()) {
+      // Fill pipeline up to asyncPipelineDepth
+      while (pendingJobs.size() < asyncPipelineDepth && groupIterator.hasNext()) {
         Map.Entry<DeleteFileGroup, List<FileScanTask>> entry = groupIterator.next();
         submitIndex++;
         DeleteFileGroup eqDeleteGroup = entry.getKey();
@@ -348,6 +361,8 @@ public class ConvertEqualityDeleteFilesSparkAction
         throw new RuntimeException("Failed to get conversion result for group " + groupIndex, e);
       }
 
+      long totalMs = System.currentTimeMillis() - job.submitTimeMs;
+
       // Convert to DeleteFiles
       PartitionSpec spec = eqDeleteGroup.spec();
       Set<DeleteFile> posDeleteFiles = convertToDeleteFiles(deleteFileInfos, spec);
@@ -355,14 +370,35 @@ public class ConvertEqualityDeleteFilesSparkAction
       long posDeleteRecordsCount = job.posDeleteRecordsWritten.value();
 
       LOG.info(
-          "{} table={} group={}/{} completed eq_records={} pos_files={} pos_records={}",
+          "{} table={} group={} total_ms={} eq_read_ms={} data_read_ms={} pos_write_ms={} "
+              + "data_files={} data_bytes_total={} data_bytes_read={} files_skipped={} "
+              + "eq_delete_records={} pos_delete_files={} pos_delete_records={}",
           LOG_PREFIX,
           table.name(),
           groupIndex,
-          tasksWithEqDeletes.size(),
+          totalMs,
+          job.eqDeleteReadTimeMs.value(),
+          job.dataFileReadTimeMs.value(),
+          job.posDeleteWriteTimeMs.value(),
+          job.dataFileCount,
+          job.totalDataFileSize,
+          job.dataFileBytesRead.value(),
+          job.filesSkipped.value(),
           eqDeleteRecordsCount,
           deleteFileInfos.size(),
           posDeleteRecordsCount);
+
+      // Log each created pos delete file
+      for (DeleteFileInfo info : deleteFileInfos) {
+        LOG.info(
+            "{} table={} group={} pos_delete_file={} size_bytes={} records={}",
+            LOG_PREFIX,
+            table.name(),
+            groupIndex,
+            info.path(),
+            info.fileSizeInBytes(),
+            info.recordCount());
+      }
 
       convertedEqDeleteFiles.addAll(eqDeleteGroup.deleteFiles());
       addedPosDeleteFiles.addAll(posDeleteFiles);
@@ -434,31 +470,52 @@ public class ConvertEqualityDeleteFilesSparkAction
     final int groupIndex;
     final DeleteFileGroup eqDeleteGroup;
     final List<FileScanTask> dataFileTasks;
+    final int dataFileCount;
+    final long totalDataFileSize;
     final JavaFutureAction<List<DeleteFileInfo>> future;
+    final long submitTimeMs;
     final org.apache.spark.util.LongAccumulator eqDeleteRecordsRead;
+    final org.apache.spark.util.LongAccumulator eqDeleteReadTimeMs;
+    final org.apache.spark.util.LongAccumulator dataFileReadTimeMs;
+    final org.apache.spark.util.LongAccumulator posDeleteWriteTimeMs;
     final org.apache.spark.util.LongAccumulator posDeleteRecordsWritten;
+    final org.apache.spark.util.LongAccumulator filesSkipped;
+    final org.apache.spark.util.LongAccumulator dataFileBytesRead;
 
     PendingConversionJob(
         int groupIndex,
         DeleteFileGroup eqDeleteGroup,
         List<FileScanTask> dataFileTasks,
+        int dataFileCount,
+        long totalDataFileSize,
         JavaFutureAction<List<DeleteFileInfo>> future,
         org.apache.spark.util.LongAccumulator eqDeleteRecordsRead,
-        org.apache.spark.util.LongAccumulator posDeleteRecordsWritten) {
+        org.apache.spark.util.LongAccumulator eqDeleteReadTimeMs,
+        org.apache.spark.util.LongAccumulator dataFileReadTimeMs,
+        org.apache.spark.util.LongAccumulator posDeleteWriteTimeMs,
+        org.apache.spark.util.LongAccumulator posDeleteRecordsWritten,
+        org.apache.spark.util.LongAccumulator filesSkipped,
+        org.apache.spark.util.LongAccumulator dataFileBytesRead) {
       this.groupIndex = groupIndex;
       this.eqDeleteGroup = eqDeleteGroup;
       this.dataFileTasks = dataFileTasks;
+      this.dataFileCount = dataFileCount;
+      this.totalDataFileSize = totalDataFileSize;
       this.future = future;
+      this.submitTimeMs = System.currentTimeMillis();
       this.eqDeleteRecordsRead = eqDeleteRecordsRead;
+      this.eqDeleteReadTimeMs = eqDeleteReadTimeMs;
+      this.dataFileReadTimeMs = dataFileReadTimeMs;
+      this.posDeleteWriteTimeMs = posDeleteWriteTimeMs;
       this.posDeleteRecordsWritten = posDeleteRecordsWritten;
+      this.filesSkipped = filesSkipped;
+      this.dataFileBytesRead = dataFileBytesRead;
     }
 
     long dataFilesSize() {
       return dataFileTasks.stream().mapToLong(task -> task.file().fileSizeInBytes()).sum();
     }
   }
-
-  private static final int ASYNC_PIPELINE_DEPTH = 8;
 
   private Result doExecuteWithPartialProgress(
       Map<DeleteFileGroup, List<FileScanTask>> tasksWithEqDeletes,
@@ -493,7 +550,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         LOG_PREFIX,
         table.name(),
         sortedGroups.size(),
-        ASYNC_PIPELINE_DEPTH);
+        asyncPipelineDepth);
 
     // Track processed groups and results per group
     Set<DeleteFileGroup> processedGroups = Sets.newHashSet();
@@ -524,8 +581,8 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     // Helper to submit next job
     while (groupIterator.hasNext() || !pendingJobs.isEmpty()) {
-      // Fill pipeline up to ASYNC_PIPELINE_DEPTH
-      while (pendingJobs.size() < ASYNC_PIPELINE_DEPTH && groupIterator.hasNext()) {
+      // Fill pipeline up to asyncPipelineDepth
+      while (pendingJobs.size() < asyncPipelineDepth && groupIterator.hasNext()) {
         Map.Entry<DeleteFileGroup, List<FileScanTask>> entry = groupIterator.next();
         submitIndex++;
         DeleteFileGroup eqDeleteGroup = entry.getKey();
@@ -570,6 +627,8 @@ public class ConvertEqualityDeleteFilesSparkAction
         throw new RuntimeException("Failed to get conversion result for group " + groupIndex, e);
       }
 
+      long totalMs = System.currentTimeMillis() - job.submitTimeMs;
+
       // Convert to ConversionResult
       PartitionSpec spec = eqDeleteGroup.spec();
       Set<DeleteFile> posDeleteFiles = convertToDeleteFiles(deleteFileInfos, spec);
@@ -580,14 +639,35 @@ public class ConvertEqualityDeleteFilesSparkAction
           new ConversionResult(posDeleteFiles, eqDeleteRecordsCount, posDeleteRecordsCount);
 
       LOG.info(
-          "{} table={} group={}/{} completed eq_records={} pos_files={} pos_records={}",
+          "{} table={} group={} total_ms={} eq_read_ms={} data_read_ms={} pos_write_ms={} "
+              + "data_files={} data_bytes_total={} data_bytes_read={} files_skipped={} "
+              + "eq_delete_records={} pos_delete_files={} pos_delete_records={}",
           LOG_PREFIX,
           table.name(),
           groupIndex,
-          sortedGroups.size(),
+          totalMs,
+          job.eqDeleteReadTimeMs.value(),
+          job.dataFileReadTimeMs.value(),
+          job.posDeleteWriteTimeMs.value(),
+          job.dataFileCount,
+          job.totalDataFileSize,
+          job.dataFileBytesRead.value(),
+          job.filesSkipped.value(),
           eqDeleteRecordsCount,
           deleteFileInfos.size(),
           posDeleteRecordsCount);
+
+      // Log each created pos delete file
+      for (DeleteFileInfo info : deleteFileInfos) {
+        LOG.info(
+            "{} table={} group={} pos_delete_file={} size_bytes={} records={}",
+            LOG_PREFIX,
+            table.name(),
+            groupIndex,
+            info.path(),
+            info.fileSizeInBytes(),
+            info.recordCount());
+      }
 
       processedGroups.add(eqDeleteGroup);
       groupResults.put(eqDeleteGroup, conversionResult);
@@ -885,15 +965,17 @@ public class ConvertEqualityDeleteFilesSparkAction
             .distinct()
             .collect(Collectors.toList());
 
+    long totalDataFileSize = dataFileInfos.stream().mapToLong(DataFileInfo::fileSizeInBytes).sum();
+
     if (dataFileInfos.isEmpty()) {
       // Return a completed future with empty result
-      org.apache.spark.util.LongAccumulator emptyAcc1 = new org.apache.spark.util.LongAccumulator();
-      org.apache.spark.util.LongAccumulator emptyAcc2 = new org.apache.spark.util.LongAccumulator();
-      spark().sparkContext().register(emptyAcc1, "ConvertEqDeletes.eqDeleteRecordsRead.g" + groupIndex);
-      spark().sparkContext().register(emptyAcc2, "ConvertEqDeletes.posDeleteRecordsWritten.g" + groupIndex);
+      org.apache.spark.util.LongAccumulator zeroAcc = new org.apache.spark.util.LongAccumulator();
+      spark().sparkContext().register(zeroAcc, "ConvertEqDeletes.empty.g" + groupIndex);
       JavaFutureAction<List<DeleteFileInfo>> emptyFuture =
           jsc.parallelize(java.util.Collections.<DeleteFileInfo>emptyList(), 1).collectAsync();
-      return new PendingConversionJob(groupIndex, eqDeleteGroup, dataFileTasks, emptyFuture, emptyAcc1, emptyAcc2);
+      return new PendingConversionJob(
+          groupIndex, eqDeleteGroup, dataFileTasks, 0, 0L, emptyFuture,
+          zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc);
     }
 
     Table serializableTable = SerializableTableWithSize.copyOf(table);
@@ -956,7 +1038,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     JavaFutureAction<List<DeleteFileInfo>> future = deleteFileInfosRDD.collectAsync();
 
     return new PendingConversionJob(
-        groupIndex, eqDeleteGroup, dataFileTasks, future, eqDeleteRecordsRead, posDeleteRecordsWritten);
+        groupIndex, eqDeleteGroup, dataFileTasks, dataFileInfos.size(), totalDataFileSize, future,
+        eqDeleteRecordsRead, eqDeleteReadTimeMs, dataFileReadTimeMs, posDeleteWriteTimeMs,
+        posDeleteRecordsWritten, filesSkipped, dataFileBytesRead);
   }
 
   /** Convert serializable DeleteFileInfo from executors to DeleteFile for commit. */
