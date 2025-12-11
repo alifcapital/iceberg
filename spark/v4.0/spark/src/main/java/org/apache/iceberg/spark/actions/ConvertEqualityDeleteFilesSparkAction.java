@@ -1296,7 +1296,7 @@ public class ConvertEqualityDeleteFilesSparkAction
             .build();
 
     GenericAppenderFactory appenderFactory =
-        new GenericAppenderFactory(table, table.schema(), spec, table.properties(), null, null, null);
+        new GenericAppenderFactory(table, table.schema(), spec, null, null, null, null);
 
     FileWriter<PositionDelete<Record>, DeleteWriteResult> posDeleteWriter =
         new SortingPositionOnlyDeleteWriter<>(
