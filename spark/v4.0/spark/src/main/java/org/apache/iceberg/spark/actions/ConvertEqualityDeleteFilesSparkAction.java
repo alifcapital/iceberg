@@ -74,6 +74,7 @@ import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.Tasks;
+import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
@@ -192,7 +193,7 @@ public class ConvertEqualityDeleteFilesSparkAction
   private String cacheS3Prefix = null;
 
   ConvertEqualityDeleteFilesSparkAction(SparkSession spark, Table table) {
-    super(spark.cloneSession());
+    super(((org.apache.spark.sql.classic.SparkSession) spark).cloneSession());
     // Disable AQE to ensure predictable join behavior for the hash join
     spark().conf().set(SQLConf.ADAPTIVE_EXECUTION_ENABLED().key(), false);
     this.table = table;
@@ -1027,10 +1028,35 @@ public class ConvertEqualityDeleteFilesSparkAction
     spark().sparkContext().register(filesSkipped, "ConvertEqDeletes.filesSkipped.g" + groupIndex);
     spark().sparkContext().register(dataFileBytesRead, "ConvertEqDeletes.dataFileBytesRead.g" + groupIndex);
 
-    // Distribute data files
+    // Distribute data files evenly by size (greedy bin packing)
     int numPartitions = Math.max(1, Math.min(dataFileInfos.size(),
         spark().sparkContext().defaultParallelism()));
-    JavaRDD<DataFileInfo> filesRDD = jsc.parallelize(dataFileInfos, numPartitions);
+
+    // Sort files by size descending for better bin packing
+    List<DataFileInfo> sortedFiles = dataFileInfos.stream()
+        .sorted((a, b) -> Long.compare(b.fileSizeInBytes(), a.fileSizeInBytes()))
+        .collect(Collectors.toList());
+
+    // Greedy assignment: add each file to the partition with smallest total size
+    long[] partitionSizes = new long[numPartitions];
+    List<scala.Tuple2<Integer, DataFileInfo>> filesWithPartitions = new java.util.ArrayList<>();
+
+    for (DataFileInfo file : sortedFiles) {
+      // Find partition with minimum total size
+      int minPartition = 0;
+      for (int i = 1; i < numPartitions; i++) {
+        if (partitionSizes[i] < partitionSizes[minPartition]) {
+          minPartition = i;
+        }
+      }
+      filesWithPartitions.add(new scala.Tuple2<>(minPartition, file));
+      partitionSizes[minPartition] += file.fileSizeInBytes();
+    }
+
+    // Create PairRDD and partition by assigned partition ID
+    JavaPairRDD<Integer, DataFileInfo> pairRDD = jsc.parallelizePairs(filesWithPartitions)
+        .partitionBy(new org.apache.spark.HashPartitioner(numPartitions));
+    JavaRDD<DataFileInfo> filesRDD = pairRDD.values();
 
     // Generate unique operation ID
     String operationId = snapshotId + "-" + operationUUID + "-g" + groupIndex;
