@@ -1262,7 +1262,8 @@ public class ConvertEqualityDeleteFilesSparkAction
       DataFileInfo fileInfo,
       List<PositionDelete<Record>> posDeletes,
       int groupIndex,
-      String operationId) throws IOException {
+      String operationId,
+      int fileIndex) throws IOException {
 
     PartitionSpec spec = table.specs().get(fileInfo.specId());
     StructLike partition = fileInfo.partitionValues() != null
@@ -1276,11 +1277,12 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     int taskId = org.apache.spark.TaskContext.getPartitionId();
 
+    // Include fileIndex in suffix to ensure unique filenames when processing multiple data files
     OutputFileFactory outputFileFactory =
         OutputFileFactory.builderFor(table, taskId, groupIndex)
             .format(deleteFileFormat)
             .operationId(operationId)
-            .suffix("pos-deletes")
+            .suffix("f" + fileIndex + "-pos-deletes")
             .build();
 
     GenericAppenderFactory appenderFactory =
@@ -1467,9 +1469,11 @@ public class ConvertEqualityDeleteFilesSparkAction
       List<DeleteFileInfo> results = Lists.newArrayList();
       String eqColumnName = firstCol.name();
       int posColumnIndex = projectionSchema.columns().size() - 1;
+      int fileIndex = 0;
 
       while (dataFiles.hasNext()) {
         DataFileInfo fileInfo = dataFiles.next();
+        fileIndex++;
         dataFilesReceived.add(1);
         List<PositionDelete<Record>> matches = Lists.newArrayList();
 
@@ -1529,7 +1533,7 @@ public class ConvertEqualityDeleteFilesSparkAction
           if (!matches.isEmpty()) {
             long writeStart = System.currentTimeMillis();
             List<DeleteFileInfo> written = writePosDeleteFileOnExecutor(
-                table, fileInfo, matches, groupIndex, operationId);
+                table, fileInfo, matches, groupIndex, operationId, fileIndex);
             posDeleteWriteTimeMs.add(System.currentTimeMillis() - writeStart);
             results.addAll(written);
             posDeleteRecordsWritten.add(matches.size());
