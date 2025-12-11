@@ -1028,6 +1028,16 @@ public class ConvertEqualityDeleteFilesSparkAction
     spark().sparkContext().register(filesSkipped, "ConvertEqDeletes.filesSkipped.g" + groupIndex);
     spark().sparkContext().register(dataFileBytesRead, "ConvertEqDeletes.dataFileBytesRead.g" + groupIndex);
 
+    // Initialize accumulators with 0 so they appear in Spark UI even if not updated
+    eqDeleteRecordsRead.add(0);
+    eqDeleteReadTimeMs.add(0);
+    dataFileReadTimeMs.add(0);
+    posDeleteWriteTimeMs.add(0);
+    dataFilesReceived.add(0);
+    posDeleteRecordsWritten.add(0);
+    filesSkipped.add(0);
+    dataFileBytesRead.add(0);
+
     // Distribute data files evenly by size (greedy bin packing)
     int numPartitions = Math.max(1, Math.min(dataFileInfos.size(),
         spark().sparkContext().defaultParallelism()));
