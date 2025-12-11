@@ -1015,12 +1015,14 @@ public class ConvertEqualityDeleteFilesSparkAction
     org.apache.spark.util.LongAccumulator dataFileReadTimeMs = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator posDeleteWriteTimeMs = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator posDeleteRecordsWritten = new org.apache.spark.util.LongAccumulator();
+    org.apache.spark.util.LongAccumulator dataFilesReceived = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator filesSkipped = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator dataFileBytesRead = new org.apache.spark.util.LongAccumulator();
     spark().sparkContext().register(eqDeleteRecordsRead, "ConvertEqDeletes.eqDeleteRecordsRead.g" + groupIndex);
     spark().sparkContext().register(eqDeleteReadTimeMs, "ConvertEqDeletes.eqDeleteReadTimeMs.g" + groupIndex);
     spark().sparkContext().register(dataFileReadTimeMs, "ConvertEqDeletes.dataFileReadTimeMs.g" + groupIndex);
     spark().sparkContext().register(posDeleteWriteTimeMs, "ConvertEqDeletes.posDeleteWriteTimeMs.g" + groupIndex);
+    spark().sparkContext().register(dataFilesReceived, "ConvertEqDeletes.dataFilesReceived.g" + groupIndex);
     spark().sparkContext().register(posDeleteRecordsWritten, "ConvertEqDeletes.posDeleteRecordsWritten.g" + groupIndex);
     spark().sparkContext().register(filesSkipped, "ConvertEqDeletes.filesSkipped.g" + groupIndex);
     spark().sparkContext().register(dataFileBytesRead, "ConvertEqDeletes.dataFileBytesRead.g" + groupIndex);
@@ -1045,6 +1047,7 @@ public class ConvertEqualityDeleteFilesSparkAction
             dataFileReadTimeMs,
             posDeleteWriteTimeMs,
             posDeleteRecordsWritten,
+            dataFilesReceived,
             filesSkipped,
             dataFileBytesRead,
             cacheMountPath,
@@ -1341,6 +1344,7 @@ public class ConvertEqualityDeleteFilesSparkAction
     private final org.apache.spark.util.LongAccumulator dataFileReadTimeMs;
     private final org.apache.spark.util.LongAccumulator posDeleteWriteTimeMs;
     private final org.apache.spark.util.LongAccumulator posDeleteRecordsWritten;
+    private final org.apache.spark.util.LongAccumulator dataFilesReceived;
     private final org.apache.spark.util.LongAccumulator filesSkipped;
     private final org.apache.spark.util.LongAccumulator dataFileBytesRead;
     private final String cacheMountPath;
@@ -1358,6 +1362,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         org.apache.spark.util.LongAccumulator dataFileReadTimeMs,
         org.apache.spark.util.LongAccumulator posDeleteWriteTimeMs,
         org.apache.spark.util.LongAccumulator posDeleteRecordsWritten,
+        org.apache.spark.util.LongAccumulator dataFilesReceived,
         org.apache.spark.util.LongAccumulator filesSkipped,
         org.apache.spark.util.LongAccumulator dataFileBytesRead,
         String cacheMountPath,
@@ -1373,6 +1378,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       this.dataFileReadTimeMs = dataFileReadTimeMs;
       this.posDeleteWriteTimeMs = posDeleteWriteTimeMs;
       this.posDeleteRecordsWritten = posDeleteRecordsWritten;
+      this.dataFilesReceived = dataFilesReceived;
       this.filesSkipped = filesSkipped;
       this.dataFileBytesRead = dataFileBytesRead;
       this.cacheMountPath = cacheMountPath;
@@ -1438,6 +1444,7 @@ public class ConvertEqualityDeleteFilesSparkAction
 
       while (dataFiles.hasNext()) {
         DataFileInfo fileInfo = dataFiles.next();
+        dataFilesReceived.add(1);
         List<PositionDelete<Record>> matches = Lists.newArrayList();
 
         InputFile inputFile = getInputFileWithCache(fileInfo.path(), table, cacheMountPath, cacheS3Prefix);
