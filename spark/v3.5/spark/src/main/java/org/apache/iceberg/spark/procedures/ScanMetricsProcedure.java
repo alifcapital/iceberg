@@ -26,9 +26,11 @@ public class ScanMetricsProcedure extends BaseProcedure {
             ProcedureParameter.required("table", DataTypes.StringType);
     private static final ProcedureParameter SNAPSHOT_ID_PARAM =
             ProcedureParameter.optional("snapshot_id", DataTypes.LongType);
+    private static final ProcedureParameter SMALL_FILE_SIZE_BYTES_PARAM =
+            ProcedureParameter.optional("small_file_size_bytes", DataTypes.LongType);
 
     private static final ProcedureParameter[] PARAMETERS =
-            new ProcedureParameter[]{TABLE_PARAM, SNAPSHOT_ID_PARAM};
+            new ProcedureParameter[]{TABLE_PARAM, SNAPSHOT_ID_PARAM, SMALL_FILE_SIZE_BYTES_PARAM};
 
     private static final StructType OUTPUT_TYPE = new StructType(
             new StructField[]{
@@ -44,7 +46,8 @@ public class ScanMetricsProcedure extends BaseProcedure {
                     new StructField("eq_delete_records", DataTypes.LongType, false, Metadata.empty()),
                     new StructField("unique_pos_delete_files", DataTypes.IntegerType, false, Metadata.empty()),
                     new StructField("pos_delete_files_referenced", DataTypes.LongType, false, Metadata.empty()),
-                    new StructField("pos_delete_records", DataTypes.LongType, false, Metadata.empty())
+                    new StructField("pos_delete_records", DataTypes.LongType, false, Metadata.empty()),
+                    new StructField("small_data_files", DataTypes.LongType, false, Metadata.empty())
             });
 
     public static Builder<ScanMetricsProcedure> builder() {
@@ -80,6 +83,7 @@ public class ScanMetricsProcedure extends BaseProcedure {
         ProcedureInput input = new ProcedureInput(spark(), tableCatalog(), PARAMETERS, args);
         Identifier ident = input.ident(TABLE_PARAM);
         Long snapshotId = input.asLong(SNAPSHOT_ID_PARAM, null);
+        Long smallFileSizeBytes = input.asLong(SMALL_FILE_SIZE_BYTES_PARAM, null);
 
         return withIcebergTable(ident, icebergTable -> {
             TableScan scan = icebergTable.newScan();
@@ -101,11 +105,15 @@ public class ScanMetricsProcedure extends BaseProcedure {
             AtomicLong eqDeleteFilesReferenced = new AtomicLong(0);
             AtomicLong posDeleteFilesReferenced = new AtomicLong(0);
             AtomicLong totalDataFiles = new AtomicLong(0);
+            AtomicLong smallDataFiles = new AtomicLong(0);
 
             for (FileScanTask task : tasks) {
                 DataFile dataFile = task.file();
                 List<DeleteFile> deleteFiles = task.deletes();
                 totalDataFiles.incrementAndGet();
+                if (smallFileSizeBytes != null && dataFile.fileSizeInBytes() < smallFileSizeBytes) {
+                    smallDataFiles.incrementAndGet();
+                }
 
                 long eqDeleteFileCount = 0;
                 long posDeleteFileCount = 0;
@@ -156,7 +164,8 @@ public class ScanMetricsProcedure extends BaseProcedure {
                     totalEqDeleteRecords.get(),
                     uniqPosDeleteFiles.size(),
                     posDeleteFilesReferenced.get(),
-                    totalPosDeleteRecords.get()
+                    totalPosDeleteRecords.get(),
+                    smallDataFiles.get()
             })};
         });
     }
