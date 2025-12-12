@@ -69,3 +69,7 @@ derby.log
 
 # jenv
 .java-version
+
+# AI assistants
+.claude/
+.cursor/
