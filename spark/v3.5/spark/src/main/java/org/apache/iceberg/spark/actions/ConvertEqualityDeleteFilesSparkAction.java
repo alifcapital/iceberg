@@ -25,6 +25,7 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.math.BigDecimal;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -1513,11 +1514,14 @@ public class ConvertEqualityDeleteFilesSparkAction
               || typeId == org.apache.iceberg.types.Type.TypeID.INTEGER);
       boolean isSingleStringColumn = isSingleColumn
           && typeId == org.apache.iceberg.types.Type.TypeID.STRING;
+      boolean isSingleDecimalColumn = isSingleColumn
+          && typeId == org.apache.iceberg.types.Type.TypeID.DECIMAL;
 
       // Step 1: Read equality delete keys directly into optimized data structure
       long eqReadStart = System.currentTimeMillis();
       Set<Long> longKeys = null;
       Set<String> stringKeys = null;
+      Set<BigDecimal> decimalKeys = null;
       Set<List<Object>> deleteKeys = null;
 
       if (isSingleLongColumn) {
@@ -1531,6 +1535,13 @@ public class ConvertEqualityDeleteFilesSparkAction
         stringKeys = readEqDeleteStringKeysOnExecutor(table, eqDeletePaths);
         eqDeleteRecordsRead.add(stringKeys.size());
         if (stringKeys.isEmpty()) {
+          eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
+          return java.util.Collections.emptyIterator();
+        }
+      } else if (isSingleDecimalColumn) {
+        decimalKeys = readEqDeleteDecimalKeysOnExecutor(table, eqDeletePaths);
+        eqDeleteRecordsRead.add(decimalKeys.size());
+        if (decimalKeys.isEmpty()) {
           eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
           return java.util.Collections.emptyIterator();
         }
@@ -1564,6 +1575,8 @@ public class ConvertEqualityDeleteFilesSparkAction
           bloomFilter = Expressions.in(eqColumnName, longKeys);
         } else if (isSingleStringColumn && stringKeys.size() <= 10000) {
           bloomFilter = Expressions.in(eqColumnName, stringKeys);
+        } else if (isSingleDecimalColumn && decimalKeys.size() <= 10000) {
+          bloomFilter = Expressions.in(eqColumnName, decimalKeys);
         }
 
         boolean anyRowsRead = false;
@@ -1584,6 +1597,10 @@ public class ConvertEqualityDeleteFilesSparkAction
               Object val = record.get(0);
               String key = val != null ? val.toString() : null;
               match = stringKeys.contains(key);
+            } else if (isSingleDecimalColumn) {
+              Object val = record.get(0);
+              BigDecimal key = (BigDecimal) val;
+              match = key != null && decimalKeys.contains(key);
             } else {
               List<Object> recordKey = Lists.newArrayListWithCapacity(keyColumnCount);
               for (int i = 0; i < keyColumnCount; i++) {
@@ -1656,6 +1673,29 @@ public class ConvertEqualityDeleteFilesSparkAction
           for (Record record : reader) {
             Object val = record.get(0);
             keys.add(val != null ? val.toString() : null);
+          }
+        } catch (IOException e) {
+          throw new RuntimeException("Failed to read eq delete file: " + path, e);
+        }
+      }
+
+      return keys;
+    }
+
+    /** Read equality delete keys as BigDecimal directly (no intermediate List allocation). */
+    private Set<BigDecimal> readEqDeleteDecimalKeysOnExecutor(Table table, List<String> eqDeletePaths) {
+      Set<BigDecimal> keys = Sets.newHashSet();
+
+      for (String path : eqDeletePaths) {
+        InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
+        FileFormat format = FileFormat.fromFileName(path);
+
+        try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
+          for (Record record : reader) {
+            Object val = record.get(0);
+            if (val != null) {
+              keys.add((BigDecimal) val);
+            }
           }
         } catch (IOException e) {
           throw new RuntimeException("Failed to read eq delete file: " + path, e);
