@@ -47,6 +47,8 @@ public class ScanMetricsProcedure extends BaseProcedure {
                     new StructField("unique_pos_delete_files", DataTypes.IntegerType, false, Metadata.empty()),
                     new StructField("pos_delete_files_referenced", DataTypes.LongType, false, Metadata.empty()),
                     new StructField("pos_delete_records", DataTypes.LongType, false, Metadata.empty()),
+                    new StructField("data_files_with_eq_deletes", DataTypes.LongType, false, Metadata.empty()),
+                    new StructField("data_files_with_pos_deletes", DataTypes.LongType, false, Metadata.empty()),
                     new StructField("small_data_files", DataTypes.LongType, false, Metadata.empty())
             });
 
@@ -105,6 +107,8 @@ public class ScanMetricsProcedure extends BaseProcedure {
             AtomicLong eqDeleteFilesReferenced = new AtomicLong(0);
             AtomicLong posDeleteFilesReferenced = new AtomicLong(0);
             AtomicLong totalDataFiles = new AtomicLong(0);
+            AtomicLong dataFilesWithEqDeletes = new AtomicLong(0);
+            AtomicLong dataFilesWithPosDeletes = new AtomicLong(0);
             AtomicLong smallDataFiles = new AtomicLong(0);
 
             for (FileScanTask task : tasks) {
@@ -137,6 +141,13 @@ public class ScanMetricsProcedure extends BaseProcedure {
                 long dataRecordCount = dataFile.recordCount();
                 totalDataRecords.addAndGet(dataRecordCount);
 
+                if (eqDeleteFileCount > 0) {
+                    dataFilesWithEqDeletes.incrementAndGet();
+                }
+                if (posDeleteFileCount > 0) {
+                    dataFilesWithPosDeletes.incrementAndGet();
+                }
+
                 if (eqDeleteFileCount == 0 && posDeleteFileCount == 0) {
                     dataRecordsWithNoDeletes.addAndGet(dataRecordCount);
                 } else if (eqDeleteFileCount > 0 && posDeleteFileCount == 0) {
@@ -165,6 +176,8 @@ public class ScanMetricsProcedure extends BaseProcedure {
                     uniqPosDeleteFiles.size(),
                     posDeleteFilesReferenced.get(),
                     totalPosDeleteRecords.get(),
+                    dataFilesWithEqDeletes.get(),
+                    dataFilesWithPosDeletes.get(),
                     smallDataFiles.get()
             })};
         });
