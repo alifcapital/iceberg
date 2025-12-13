@@ -1569,7 +1569,7 @@ public class ConvertEqualityDeleteFilesSparkAction
 
         InputFile inputFile = getInputFileWithCache(fileInfo.path(), table, cacheMountPath, cacheS3Prefix);
 
-        // Build bloom filter for single-column optimized paths
+        // Build bloom filter for row group pruning
         Expression bloomFilter = null;
         if (isSingleLongColumn && longKeys.size() <= 10000) {
           bloomFilter = Expressions.in(eqColumnName, longKeys);
@@ -1577,6 +1577,8 @@ public class ConvertEqualityDeleteFilesSparkAction
           bloomFilter = Expressions.in(eqColumnName, stringKeys);
         } else if (isSingleDecimalColumn && decimalKeys.size() <= 10000) {
           bloomFilter = Expressions.in(eqColumnName, decimalKeys);
+        } else if (deleteKeys != null) {
+          bloomFilter = buildMultiColumnBloomFilter(deleteKeys, 10000);
         }
 
         boolean anyRowsRead = false;
@@ -1728,6 +1730,80 @@ public class ConvertEqualityDeleteFilesSparkAction
       }
 
       return keys;
+    }
+
+    /** Build bloom filter expression for multi-column keys. */
+    private Expression buildMultiColumnBloomFilter(Set<List<Object>> keys, int maxKeysPerColumn) {
+      if (keys.isEmpty()) {
+        return null;
+      }
+
+      int colCount = deleteSchema.columns().size();
+      List<Expression> columnFilters = Lists.newArrayListWithCapacity(colCount);
+
+      for (int colIdx = 0; colIdx < colCount; colIdx++) {
+        Types.NestedField col = deleteSchema.columns().get(colIdx);
+        org.apache.iceberg.types.Type.TypeID colTypeId = col.type().typeId();
+        String colName = col.name();
+
+        // Extract unique values for this column
+        Set<Object> uniqueValues = Sets.newHashSet();
+        for (List<Object> key : keys) {
+          Object val = key.get(colIdx);
+          if (val != null) {
+            uniqueValues.add(val);
+          }
+        }
+
+        if (uniqueValues.isEmpty() || uniqueValues.size() > maxKeysPerColumn) {
+          continue; // Skip this column - too many values or all nulls
+        }
+
+        // Build IN expression based on column type
+        Expression colFilter = null;
+        switch (colTypeId) {
+          case LONG:
+          case INTEGER:
+            Set<Long> longVals = Sets.newHashSetWithExpectedSize(uniqueValues.size());
+            for (Object v : uniqueValues) {
+              longVals.add(v instanceof Integer ? ((Integer) v).longValue() : (Long) v);
+            }
+            colFilter = Expressions.in(colName, longVals);
+            break;
+          case STRING:
+            Set<String> strVals = Sets.newHashSetWithExpectedSize(uniqueValues.size());
+            for (Object v : uniqueValues) {
+              strVals.add(v.toString());
+            }
+            colFilter = Expressions.in(colName, strVals);
+            break;
+          case DECIMAL:
+            @SuppressWarnings("unchecked")
+            Set<BigDecimal> decVals = (Set<BigDecimal>) (Set<?>) uniqueValues;
+            colFilter = Expressions.in(colName, decVals);
+            break;
+          default:
+            // Unsupported type for bloom filter
+            break;
+        }
+
+        if (colFilter != null) {
+          columnFilters.add(colFilter);
+        }
+      }
+
+      if (columnFilters.isEmpty()) {
+        return null;
+      } else if (columnFilters.size() == 1) {
+        return columnFilters.get(0);
+      } else {
+        // AND all column filters together
+        Expression result = columnFilters.get(0);
+        for (int i = 1; i < columnFilters.size(); i++) {
+          result = Expressions.and(result, columnFilters.get(i));
+        }
+        return result;
+      }
     }
 
     /** Open delete file for reading. */
