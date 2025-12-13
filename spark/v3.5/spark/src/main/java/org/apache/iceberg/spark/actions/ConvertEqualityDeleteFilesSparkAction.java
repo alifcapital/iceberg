@@ -1112,16 +1112,44 @@ public class ConvertEqualityDeleteFilesSparkAction
           ? new PartitionWrapper(info.partitionValues())
           : null;
 
-      org.apache.iceberg.DataFiles.Builder builder = org.apache.iceberg.DataFiles.builder(spec);
-      // Use FileMetadata to build DeleteFile
+      // Convert byte[] maps back to ByteBuffer maps
+      Map<Integer, java.nio.ByteBuffer> lowerBounds = null;
+      Map<Integer, java.nio.ByteBuffer> upperBounds = null;
+
+      if (info.lowerBounds() != null) {
+        lowerBounds = Maps.newHashMap();
+        for (Map.Entry<Integer, byte[]> entry : info.lowerBounds().entrySet()) {
+          lowerBounds.put(entry.getKey(), java.nio.ByteBuffer.wrap(entry.getValue()));
+        }
+      }
+
+      if (info.upperBounds() != null) {
+        upperBounds = Maps.newHashMap();
+        for (Map.Entry<Integer, byte[]> entry : info.upperBounds().entrySet()) {
+          upperBounds.put(entry.getKey(), java.nio.ByteBuffer.wrap(entry.getValue()));
+        }
+      }
+
+      // Create Metrics object with bounds for proper file_path indexing
+      org.apache.iceberg.Metrics metrics = new org.apache.iceberg.Metrics(
+          info.recordCount(),
+          null,  // columnSizes
+          null,  // valueCounts
+          null,  // nullValueCounts
+          null,  // nanValueCounts
+          lowerBounds,
+          upperBounds);
+
+      // Use FileMetadata to build DeleteFile with metrics
       DeleteFile deleteFile = org.apache.iceberg.FileMetadata.deleteFileBuilder(spec)
           .ofPositionDeletes()
           .withPath(info.path())
           .withFormat(FileFormat.fromString(info.path().substring(info.path().lastIndexOf('.') + 1).toUpperCase()))
           .withFileSizeInBytes(info.fileSizeInBytes())
-          .withRecordCount(info.recordCount())
+          .withMetrics(metrics)
           .withPartition(partition)
           .build();
+
       result.add(deleteFile);
     }
     return result;
@@ -1217,6 +1245,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     private final long recordCount;
     private final int specId;
     private final Object[] partitionValues;
+    // Bounds are stored as Map<Integer, byte[]> for serialization (ByteBuffer is not serializable)
+    private final Map<Integer, byte[]> lowerBounds;
+    private final Map<Integer, byte[]> upperBounds;
 
     DeleteFileInfo(
         String path,
@@ -1224,23 +1255,53 @@ public class ConvertEqualityDeleteFilesSparkAction
         long fileSizeInBytes,
         long recordCount,
         int specId,
-        Object[] partitionValues) {
+        Object[] partitionValues,
+        Map<Integer, byte[]> lowerBounds,
+        Map<Integer, byte[]> upperBounds) {
       this.path = path;
       this.format = format;
       this.fileSizeInBytes = fileSizeInBytes;
       this.recordCount = recordCount;
       this.specId = specId;
       this.partitionValues = partitionValues;
+      this.lowerBounds = lowerBounds;
+      this.upperBounds = upperBounds;
     }
 
     static DeleteFileInfo from(DeleteFile deleteFile, Object[] partitionValues) {
+      // Convert ByteBuffer maps to byte[] maps for serialization
+      Map<Integer, byte[]> lowerBounds = null;
+      Map<Integer, byte[]> upperBounds = null;
+
+      if (deleteFile.lowerBounds() != null) {
+        lowerBounds = Maps.newHashMap();
+        for (Map.Entry<Integer, java.nio.ByteBuffer> entry : deleteFile.lowerBounds().entrySet()) {
+          java.nio.ByteBuffer buffer = entry.getValue().duplicate();
+          byte[] bytes = new byte[buffer.remaining()];
+          buffer.get(bytes);
+          lowerBounds.put(entry.getKey(), bytes);
+        }
+      }
+
+      if (deleteFile.upperBounds() != null) {
+        upperBounds = Maps.newHashMap();
+        for (Map.Entry<Integer, java.nio.ByteBuffer> entry : deleteFile.upperBounds().entrySet()) {
+          java.nio.ByteBuffer buffer = entry.getValue().duplicate();
+          byte[] bytes = new byte[buffer.remaining()];
+          buffer.get(bytes);
+          upperBounds.put(entry.getKey(), bytes);
+        }
+      }
+
       return new DeleteFileInfo(
           deleteFile.path().toString(),
           deleteFile.format().name(),
           deleteFile.fileSizeInBytes(),
           deleteFile.recordCount(),
           deleteFile.specId(),
-          partitionValues);
+          partitionValues,
+          lowerBounds,
+          upperBounds);
     }
 
     String path() {
@@ -1261,6 +1322,14 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     Object[] partitionValues() {
       return partitionValues;
+    }
+
+    Map<Integer, byte[]> lowerBounds() {
+      return lowerBounds;
+    }
+
+    Map<Integer, byte[]> upperBounds() {
+      return upperBounds;
     }
   }
 
