@@ -166,7 +166,7 @@ public class BinPackRewritePositionDeletePlanner
       Types.StructType partitionType = Partitioning.partitionType(deletesTable);
       StructLikeMap<List<PositionDeletesScanTask>> fileTasksByPartition =
           groupByPartition(partitionType, fileTasks);
-      return fileTasksByPartition.transformValues(this::groupByReferencedDataFile);
+      return fileTasksByPartition.transformValues(this::filterAndBinPackByReferencedDataFile);
     } finally {
       try {
         fileTasks.close();
@@ -177,11 +177,12 @@ public class BinPackRewritePositionDeletePlanner
   }
 
   /**
-   * Groups position delete files by their referenced data file. Delete files that reference the
-   * same data file are grouped together. Delete files without a known referenced data file (null)
-   * fall back to bin packing.
+   * Filters position delete files that need compaction based on their referenced data file.
+   * Files referencing the same data file are considered together - if multiple small files
+   * reference the same data file, they need compaction. The filtered files are then bin-packed
+   * into groups for processing. Repartition during write ensures correct output files.
    */
-  private List<List<PositionDeletesScanTask>> groupByReferencedDataFile(
+  private List<List<PositionDeletesScanTask>> filterAndBinPackByReferencedDataFile(
       List<PositionDeletesScanTask> tasks) {
     Map<String, List<PositionDeletesScanTask>> tasksByDataFile = new HashMap<>();
     List<PositionDeletesScanTask> unknownRefTasks = Lists.newArrayList();
@@ -197,32 +198,24 @@ public class BinPackRewritePositionDeletePlanner
       }
     }
 
-    List<List<PositionDeletesScanTask>> groups = Lists.newArrayList();
+    // Collect tasks that need compaction
+    List<PositionDeletesScanTask> tasksToCompact = Lists.newArrayList();
 
-    // Add groups for delete files with known referenced data file
-    // Include groups with multiple small files (need compaction) or single large files (skip)
     for (List<PositionDeletesScanTask> group : tasksByDataFile.values()) {
       // Skip groups with single file that is already in desired size range
       if (group.size() == 1 && !outsideDesiredFileSizeRange(group.get(0))) {
         continue;
       }
-      // Skip groups where all files are already large enough (no compaction needed)
-      if (group.size() > 1 && group.stream().noneMatch(this::outsideDesiredFileSizeRange)) {
-        continue;
-      }
-      groups.add(group);
+      // Include all files from groups that need compaction
+      tasksToCompact.addAll(group);
     }
 
-    // Fallback: bin pack delete files without known referenced data file
-    if (!unknownRefTasks.isEmpty()) {
-      Iterable<List<PositionDeletesScanTask>> binPackedGroups = planFileGroups(unknownRefTasks);
-      Iterable<List<PositionDeletesScanTask>> filteredGroups = filterFileGroups(Lists.newArrayList(binPackedGroups));
-      for (List<PositionDeletesScanTask> group : filteredGroups) {
-        groups.add(group);
-      }
-    }
+    // Add unknown ref tasks
+    tasksToCompact.addAll(unknownRefTasks);
 
-    return groups;
+    // Bin-pack all tasks that need compaction
+    // Repartition during write will group output by referenced data file
+    return Lists.newArrayList(planFileGroups(tasksToCompact));
   }
 
   private CloseableIterable<PositionDeletesScanTask> planFiles(Table deletesTable) {
