@@ -79,6 +79,17 @@ public interface RewritePositionDeleteFiles
   String REWRITE_JOB_ORDER_DEFAULT = RewriteJobOrder.NONE.orderName();
 
   /**
+   * The maximum number of file groups to process before committing and exiting. This is useful when
+   * combined with {@link #REWRITE_JOB_ORDER} to prioritize certain file groups (e.g., those with
+   * the most files) and process them first, then exit to allow other tables to be compacted.
+   *
+   * <p>Defaults to Integer.MAX_VALUE, meaning all file groups will be processed.
+   */
+  String MAX_FILE_GROUP_COUNT = "max-file-group-count";
+
+  int MAX_FILE_GROUP_COUNT_DEFAULT = Integer.MAX_VALUE;
+
+  /**
    * A filter for finding deletes to rewrite.
    *
    * <p>The filter will be converted to a partition filter with an inclusive projection. Any file
