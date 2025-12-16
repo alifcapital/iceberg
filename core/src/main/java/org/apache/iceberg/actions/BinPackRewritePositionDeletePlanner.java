@@ -19,6 +19,7 @@
 package org.apache.iceberg.actions;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -43,6 +44,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.iceberg.util.PartitionUtil;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.StructLikeMap;
@@ -164,8 +166,7 @@ public class BinPackRewritePositionDeletePlanner
       Types.StructType partitionType = Partitioning.partitionType(deletesTable);
       StructLikeMap<List<PositionDeletesScanTask>> fileTasksByPartition =
           groupByPartition(partitionType, fileTasks);
-      return fileTasksByPartition.transformValues(
-          tasks -> ImmutableList.copyOf(planFileGroups(tasks)));
+      return fileTasksByPartition.transformValues(this::groupByReferencedDataFile);
     } finally {
       try {
         fileTasks.close();
@@ -175,11 +176,64 @@ public class BinPackRewritePositionDeletePlanner
     }
   }
 
+  /**
+   * Groups position delete files by their referenced data file. Delete files that reference the
+   * same data file are grouped together. Delete files without a known referenced data file (null)
+   * fall back to bin packing.
+   */
+  private List<List<PositionDeletesScanTask>> groupByReferencedDataFile(
+      List<PositionDeletesScanTask> tasks) {
+    Map<String, List<PositionDeletesScanTask>> tasksByDataFile = new HashMap<>();
+    List<PositionDeletesScanTask> unknownRefTasks = Lists.newArrayList();
+
+    for (PositionDeletesScanTask task : tasks) {
+      CharSequence referencedDataFile = ContentFileUtil.referencedDataFile(task.file());
+      if (referencedDataFile != null) {
+        tasksByDataFile
+            .computeIfAbsent(referencedDataFile.toString(), k -> Lists.newArrayList())
+            .add(task);
+      } else {
+        unknownRefTasks.add(task);
+      }
+    }
+
+    List<List<PositionDeletesScanTask>> groups = Lists.newArrayList();
+
+    // Add groups for delete files with known referenced data file
+    // Include groups with multiple small files (need compaction) or single large files (skip)
+    for (List<PositionDeletesScanTask> group : tasksByDataFile.values()) {
+      // Skip groups with single file that is already in desired size range
+      if (group.size() == 1 && !outsideDesiredFileSizeRange(group.get(0))) {
+        continue;
+      }
+      // Skip groups where all files are already large enough (no compaction needed)
+      if (group.size() > 1 && group.stream().noneMatch(this::outsideDesiredFileSizeRange)) {
+        continue;
+      }
+      groups.add(group);
+    }
+
+    // Fallback: bin pack delete files without known referenced data file
+    if (!unknownRefTasks.isEmpty()) {
+      Iterable<List<PositionDeletesScanTask>> binPackedGroups = planFileGroups(unknownRefTasks);
+      Iterable<List<PositionDeletesScanTask>> filteredGroups = filterFileGroups(Lists.newArrayList(binPackedGroups));
+      for (List<PositionDeletesScanTask> group : filteredGroups) {
+        groups.add(group);
+      }
+    }
+
+    return groups;
+  }
+
   private CloseableIterable<PositionDeletesScanTask> planFiles(Table deletesTable) {
     PositionDeletesTable.PositionDeletesBatchScan scan =
         (PositionDeletesTable.PositionDeletesBatchScan) deletesTable.newBatchScan();
     return CloseableIterable.transform(
-        scan.baseTableFilter(filter).caseSensitive(caseSensitive).ignoreResiduals().planFiles(),
+        scan.baseTableFilter(filter)
+            .caseSensitive(caseSensitive)
+            .ignoreResiduals()
+            .includeColumnStats()  // needed to get lower/upper bounds for grouping by referenced data file
+            .planFiles(),
         PositionDeletesScanTask.class::cast);
   }
 
