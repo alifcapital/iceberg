@@ -315,7 +315,6 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     Set<DeleteFile> convertedEqDeleteFiles = Sets.newHashSet();
     Set<DeleteFile> addedPosDeleteFiles = Sets.newHashSet();
-    long totalRewrittenRecords = 0;
     long totalAddedRecords = 0;
 
     LOG.info(
@@ -420,9 +419,12 @@ public class ConvertEqualityDeleteFilesSparkAction
 
       convertedEqDeleteFiles.addAll(eqDeleteGroup.deleteFiles());
       addedPosDeleteFiles.addAll(posDeleteFiles);
-      totalRewrittenRecords += eqDeleteRecordsCount;
       totalAddedRecords += posDeleteRecordsCount;
     }
+
+    // Calculate unique rewritten records from converted eq delete files
+    long totalRewrittenRecords =
+        convertedEqDeleteFiles.stream().mapToLong(DeleteFile::recordCount).sum();
 
     // Commit
     if (!convertedEqDeleteFiles.isEmpty()) {
@@ -576,13 +578,12 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     // Track committed eq deletes and pos deletes
     Set<String> committedEqDeletePaths = Sets.newHashSet();
+    Set<DeleteFile> committedEqDeleteFiles = Sets.newHashSet();
     Set<DeleteFile> uncommittedPosDeletes = Sets.newHashSet();
     Map<DeleteFile, Set<DeleteFile>> eqDeleteToPosDeletes = Maps.newHashMap();
 
     // Counters for result
-    int totalConvertedEqDeleteFiles = 0;
     int totalAddedPosDeleteFiles = 0;
-    long totalRewrittenRecords = 0;
     long totalAddedRecords = 0;
     int commitCount = 0;
 
@@ -699,7 +700,6 @@ public class ConvertEqualityDeleteFilesSparkAction
             .addAll(conversionResult.posDeleteFiles);
       }
 
-      totalRewrittenRecords += conversionResult.eqDeleteRecordsCount;
       totalAddedRecords += conversionResult.posDeleteRecordsCount;
 
       // Track bytes read and groups processed since last commit
@@ -758,7 +758,7 @@ public class ConvertEqualityDeleteFilesSparkAction
           long commitDuration = System.currentTimeMillis() - commitStartTime;
 
           commitCount++;
-          totalConvertedEqDeleteFiles += readyToCommitEqDeletes.size();
+          committedEqDeleteFiles.addAll(readyToCommitEqDeletes);
           totalAddedPosDeleteFiles += readyToCommitPosDeletes.size();
 
           // Mark as committed
@@ -797,20 +797,22 @@ public class ConvertEqualityDeleteFilesSparkAction
 
           // Return partial results
           long totalDuration = System.currentTimeMillis() - startTime;
+          long rewrittenRecords =
+              committedEqDeleteFiles.stream().mapToLong(DeleteFile::recordCount).sum();
           LOG.info(
               "{} table={} total_duration_ms={} partial_progress_stopped "
                   + "converted_eq_delete_files={} added_pos_delete_files={} commits={}",
               LOG_PREFIX,
               table.name(),
               totalDuration,
-              totalConvertedEqDeleteFiles,
+              committedEqDeleteFiles.size(),
               totalAddedPosDeleteFiles,
               commitCount);
 
           return ImmutableConvertEqualityDeleteFiles.Result.builder()
-              .convertedEqualityDeleteFilesCount(totalConvertedEqDeleteFiles)
+              .convertedEqualityDeleteFilesCount(committedEqDeleteFiles.size())
               .addedPositionDeleteFilesCount(totalAddedPosDeleteFiles)
-              .rewrittenDeleteRecordsCount(totalRewrittenRecords)
+              .rewrittenDeleteRecordsCount(rewrittenRecords)
               .addedDeleteRecordsCount(totalAddedRecords)
               .build();
         }
@@ -841,7 +843,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         long commitDuration = System.currentTimeMillis() - commitStartTime;
 
         commitCount++;
-        totalConvertedEqDeleteFiles += remainingEqDeletes.size();
+        committedEqDeleteFiles.addAll(remainingEqDeletes);
         totalAddedPosDeleteFiles += uncommittedPosDeletes.size();
 
         LOG.info(
@@ -863,38 +865,42 @@ public class ConvertEqualityDeleteFilesSparkAction
             e);
 
         long totalDuration = System.currentTimeMillis() - startTime;
+        long rewrittenRecords =
+            committedEqDeleteFiles.stream().mapToLong(DeleteFile::recordCount).sum();
         LOG.info(
             "{} table={} total_duration_ms={} partial_progress_stopped_at_final_commit "
                 + "converted_eq_delete_files={} added_pos_delete_files={} commits={}",
             LOG_PREFIX,
             table.name(),
             totalDuration,
-            totalConvertedEqDeleteFiles,
+            committedEqDeleteFiles.size(),
             totalAddedPosDeleteFiles,
             commitCount);
 
         return ImmutableConvertEqualityDeleteFiles.Result.builder()
-            .convertedEqualityDeleteFilesCount(totalConvertedEqDeleteFiles)
+            .convertedEqualityDeleteFilesCount(committedEqDeleteFiles.size())
             .addedPositionDeleteFilesCount(totalAddedPosDeleteFiles)
-            .rewrittenDeleteRecordsCount(totalRewrittenRecords)
+            .rewrittenDeleteRecordsCount(rewrittenRecords)
             .addedDeleteRecordsCount(totalAddedRecords)
             .build();
       }
     }
 
     long totalDuration = System.currentTimeMillis() - startTime;
+    long totalRewrittenRecords =
+        committedEqDeleteFiles.stream().mapToLong(DeleteFile::recordCount).sum();
     LOG.info(
         "{} table={} total_duration_ms={} partial_progress_completed "
             + "converted_eq_delete_files={} added_pos_delete_files={} commits={}",
         LOG_PREFIX,
         table.name(),
         totalDuration,
-        totalConvertedEqDeleteFiles,
+        committedEqDeleteFiles.size(),
         totalAddedPosDeleteFiles,
         commitCount);
 
     return ImmutableConvertEqualityDeleteFiles.Result.builder()
-        .convertedEqualityDeleteFilesCount(totalConvertedEqDeleteFiles)
+        .convertedEqualityDeleteFilesCount(committedEqDeleteFiles.size())
         .addedPositionDeleteFilesCount(totalAddedPosDeleteFiles)
         .rewrittenDeleteRecordsCount(totalRewrittenRecords)
         .addedDeleteRecordsCount(totalAddedRecords)

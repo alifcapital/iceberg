@@ -66,6 +66,12 @@ interface BaseRewriteDataFiles extends RewriteDataFiles {
     default int failedDataFilesCount() {
       return RewriteDataFiles.Result.super.failedDataFilesCount();
     }
+
+    @Override
+    @Value.Default
+    default long removedPosDeleteRecordsCount() {
+      return RewriteDataFiles.Result.super.removedPosDeleteRecordsCount();
+    }
   }
 
   @Value.Immutable

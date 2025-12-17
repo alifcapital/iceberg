@@ -31,6 +31,8 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StructLike;
@@ -306,7 +308,10 @@ public class RewriteDataFilesSparkAction
 
     List<FileGroupRewriteResult> rewriteResults =
         rewrittenGroups.stream().map(RewriteFileGroup::asResult).collect(Collectors.toList());
-    return ImmutableRewriteDataFiles.Result.builder().rewriteResults(rewriteResults);
+    long removedPosDeleteRecords = calculateUniquePosDeleteRecordsCount(rewrittenGroups);
+    return ImmutableRewriteDataFiles.Result.builder()
+        .rewriteResults(rewriteResults)
+        .removedPosDeleteRecordsCount(removedPosDeleteRecords);
   }
 
   private Builder doExecuteWithPartialProgress(
@@ -360,13 +365,32 @@ public class RewriteDataFilesSparkAction
       commitService.close();
     }
 
+    List<RewriteFileGroup> committedGroups = commitService.results();
+    long removedPosDeleteRecords = calculateUniquePosDeleteRecordsCount(committedGroups);
     return ImmutableRewriteDataFiles.Result.builder()
-        .rewriteResults(toRewriteResults(commitService.results()))
-        .rewriteFailures(rewriteFailures);
+        .rewriteResults(toRewriteResults(committedGroups))
+        .rewriteFailures(rewriteFailures)
+        .removedPosDeleteRecordsCount(removedPosDeleteRecords);
   }
 
   private Iterable<FileGroupRewriteResult> toRewriteResults(List<RewriteFileGroup> commitResults) {
     return commitResults.stream().map(RewriteFileGroup::asResult).collect(Collectors.toList());
+  }
+
+  private long calculateUniquePosDeleteRecordsCount(Iterable<RewriteFileGroup> groups) {
+    Set<String> seenPaths = Sets.newHashSet();
+    Set<DeleteFile> uniquePosDeletes = Sets.newHashSet();
+    for (RewriteFileGroup group : groups) {
+      for (FileScanTask task : group.fileScanTasks()) {
+        for (DeleteFile deleteFile : task.deletes()) {
+          if (deleteFile.content() == FileContent.POSITION_DELETES
+              && seenPaths.add(deleteFile.path().toString())) {
+            uniquePosDeletes.add(deleteFile);
+          }
+        }
+      }
+    }
+    return uniquePosDeletes.stream().mapToLong(DeleteFile::recordCount).sum();
   }
 
   void validateAndInitOptions() {

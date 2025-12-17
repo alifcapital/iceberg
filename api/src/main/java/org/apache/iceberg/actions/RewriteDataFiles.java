@@ -256,6 +256,11 @@ public interface RewriteDataFiles
           .mapToInt(FileGroupRewriteResult::removedDeleteFilesCount)
           .sum();
     }
+
+    /** Returns the count of position delete records that were removed during compaction. */
+    default long removedPosDeleteRecordsCount() {
+      return 0L;
+    }
   }
 
   /**
