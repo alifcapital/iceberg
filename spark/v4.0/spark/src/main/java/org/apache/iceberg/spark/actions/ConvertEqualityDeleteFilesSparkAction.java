@@ -59,6 +59,10 @@ import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.Files;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.ManifestFiles;
+import org.apache.iceberg.ManifestReader;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DeleteWriteResult;
 import org.apache.iceberg.io.FileWriter;
@@ -154,6 +158,16 @@ public class ConvertEqualityDeleteFilesSparkAction
   public static final int ASYNC_PIPELINE_DEPTH_DEFAULT = 8;
 
   /**
+   * If enabled, the action will remove orphan equality delete files after conversion.
+   * Orphan eq deletes are files that no longer apply to any data files because all
+   * applicable data files have been compacted with higher sequence numbers.
+   * Default is true.
+   */
+  public static final String CLEANUP_ORPHANS_ENABLED = "cleanup-orphans.enabled";
+
+  public static final boolean CLEANUP_ORPHANS_ENABLED_DEFAULT = true;
+
+  /**
    * Local mount path for s3fs/goofys/mountpoint-s3 FUSE cache.
    * When set, data files will be read from this local path instead of S3.
    * Example: "/mnt/s3-cache/my-bucket"
@@ -190,6 +204,7 @@ public class ConvertEqualityDeleteFilesSparkAction
   private long minCommitSizeBytes = PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT;
   private int maxCommitGroupNum = PARTIAL_PROGRESS_MAX_COMMIT_GROUP_NUM_DEFAULT;
   private int asyncPipelineDepth = ASYNC_PIPELINE_DEPTH_DEFAULT;
+  private boolean cleanupOrphansEnabled = CLEANUP_ORPHANS_ENABLED_DEFAULT;
   private String cacheMountPath = null;
   private String cacheS3Prefix = null;
 
@@ -228,6 +243,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     this.asyncPipelineDepth =
         PropertyUtil.propertyAsInt(
             options(), ASYNC_PIPELINE_DEPTH, ASYNC_PIPELINE_DEPTH_DEFAULT);
+    this.cleanupOrphansEnabled =
+        PropertyUtil.propertyAsBoolean(
+            options(), CLEANUP_ORPHANS_ENABLED, CLEANUP_ORPHANS_ENABLED_DEFAULT);
 
     // Cache options for s3fs/FUSE mount
     this.cacheMountPath = options().get(CACHE_MOUNT_PATH);
@@ -279,33 +297,53 @@ public class ConvertEqualityDeleteFilesSparkAction
         findTasksWithEqualityDeletes(startingSnapshotId);
     long scanDuration = System.currentTimeMillis() - scanStartTime;
 
+    Result conversionResult;
+
     if (tasksWithEqDeletes.isEmpty()) {
       LOG.info(
-          "{} table={} scan_duration_ms={} no equality delete files found",
+          "{} table={} scan_duration_ms={} no equality delete files found via task.deletes()",
           LOG_PREFIX,
           table.name(),
           scanDuration);
-      return EMPTY_RESULT;
-    }
-
-    int totalEqDeleteFiles =
-        tasksWithEqDeletes.keySet().stream().mapToInt(g -> g.deleteFiles().size()).sum();
-    int totalDataFiles = tasksWithEqDeletes.values().stream().mapToInt(List::size).sum();
-
-    LOG.info(
-        "{} table={} scan_duration_ms={} eq_delete_groups={} eq_delete_files={} data_files={}",
-        LOG_PREFIX,
-        table.name(),
-        scanDuration,
-        tasksWithEqDeletes.size(),
-        totalEqDeleteFiles,
-        totalDataFiles);
-
-    if (partialProgressEnabled) {
-      return doExecuteWithPartialProgress(tasksWithEqDeletes, startingSnapshotId, startTime);
+      conversionResult = EMPTY_RESULT;
     } else {
-      return doExecute(tasksWithEqDeletes, startingSnapshotId, startTime);
+      int totalEqDeleteFiles =
+          tasksWithEqDeletes.keySet().stream().mapToInt(g -> g.deleteFiles().size()).sum();
+      int totalDataFiles = tasksWithEqDeletes.values().stream().mapToInt(List::size).sum();
+
+      LOG.info(
+          "{} table={} scan_duration_ms={} eq_delete_groups={} eq_delete_files={} data_files={}",
+          LOG_PREFIX,
+          table.name(),
+          scanDuration,
+          tasksWithEqDeletes.size(),
+          totalEqDeleteFiles,
+          totalDataFiles);
+
+      if (partialProgressEnabled) {
+        conversionResult = doExecuteWithPartialProgress(tasksWithEqDeletes, startingSnapshotId, startTime);
+      } else {
+        conversionResult = doExecute(tasksWithEqDeletes, startingSnapshotId, startTime);
+      }
     }
+
+    // Cleanup phase: remove orphan eq deletes that don't apply to any data files
+    int orphansRemoved = 0;
+    if (cleanupOrphansEnabled) {
+      orphansRemoved = cleanupOrphanEqualityDeletes();
+    }
+
+    if (orphansRemoved > 0) {
+      LOG.info(
+          "{} table={} conversion_result=[converted={}, added_pos={}] orphans_removed={}",
+          LOG_PREFIX,
+          table.name(),
+          conversionResult.convertedEqualityDeleteFilesCount(),
+          conversionResult.addedPositionDeleteFilesCount(),
+          orphansRemoved);
+    }
+
+    return conversionResult;
   }
 
   private Result doExecute(
@@ -1919,5 +1957,155 @@ public class ConvertEqualityDeleteFilesSparkAction
           deleteFiles.stream().map(f -> f.path().toString()).collect(Collectors.toSet());
       return paths.hashCode() * 31 + spec.specId();
     }
+  }
+
+  // ==================== Orphan Equality Delete Cleanup ====================
+
+  /**
+   * Remove orphan equality delete files that no longer apply to any data files.
+   *
+   * <p>An equality delete file is considered orphan when it is NOT returned by task.deletes()
+   * for any data file. This uses the same matching logic as Iceberg's planning phase
+   * (DeleteFileIndex), which includes sequence number check, bounds overlap, null counts, etc.
+   *
+   * <p>This cleanup runs as a separate phase after all conversions complete.
+   *
+   * @return number of orphan equality delete files removed
+   */
+  private int cleanupOrphanEqualityDeletes() {
+    table.refresh();
+    Snapshot currentSnapshot = table.currentSnapshot();
+    if (currentSnapshot == null) {
+      return 0;
+    }
+
+    long cleanupStartTime = System.currentTimeMillis();
+
+    // Step 1: Find all eq delete paths that ARE matched to data files via task.deletes()
+    // This uses the same logic as DeleteFileIndex (seq check, bounds overlap, null counts, etc.)
+    Set<String> matchedEqDeletePaths = findMatchedEqDeletePaths(currentSnapshot.snapshotId());
+
+    // Step 2: Read all equality delete files from manifests
+    Map<String, DeleteFile> allEqDeletes = readAllEqualityDeletesAsMap(currentSnapshot);
+    if (allEqDeletes.isEmpty()) {
+      LOG.info("{} table={} no equality delete files found", LOG_PREFIX, table.name());
+      return 0;
+    }
+
+    // Step 3: Orphans = all eq deletes MINUS those matched via task.deletes()
+    Set<DeleteFile> orphanEqDeletes = Sets.newHashSet();
+    for (Map.Entry<String, DeleteFile> entry : allEqDeletes.entrySet()) {
+      if (!matchedEqDeletePaths.contains(entry.getKey())) {
+        orphanEqDeletes.add(entry.getValue());
+      }
+    }
+
+    long scanMs = System.currentTimeMillis() - cleanupStartTime;
+
+    if (orphanEqDeletes.isEmpty()) {
+      LOG.info(
+          "{} table={} cleanup_scan_ms={} total_eq_deletes={} matched_eq_deletes={} no orphans found",
+          LOG_PREFIX,
+          table.name(),
+          scanMs,
+          allEqDeletes.size(),
+          matchedEqDeletePaths.size());
+      return 0;
+    }
+
+    LOG.info(
+        "{} table={} cleanup_scan_ms={} total_eq_deletes={} matched_eq_deletes={} orphan_eq_deletes={} "
+            + "orphan_seq_range=[{}, {}] removing orphans",
+        LOG_PREFIX,
+        table.name(),
+        scanMs,
+        allEqDeletes.size(),
+        matchedEqDeletePaths.size(),
+        orphanEqDeletes.size(),
+        orphanEqDeletes.stream().mapToLong(DeleteFile::dataSequenceNumber).min().orElse(0),
+        orphanEqDeletes.stream().mapToLong(DeleteFile::dataSequenceNumber).max().orElse(0));
+
+    // Step 4: Remove orphan eq deletes
+    try {
+      long commitStartTime = System.currentTimeMillis();
+      RewriteFiles rewrite = table.newRewrite();
+      for (DeleteFile orphan : orphanEqDeletes) {
+        rewrite.deleteFile(orphan);
+      }
+      rewrite.set("iceberg.operation", "convert-equality-deletes-cleanup");
+      rewrite.commit();
+
+      long totalMs = System.currentTimeMillis() - cleanupStartTime;
+      LOG.info(
+          "{} table={} cleanup_total_ms={} commit_ms={} orphans_removed={} cleanup complete",
+          LOG_PREFIX,
+          table.name(),
+          totalMs,
+          System.currentTimeMillis() - commitStartTime,
+          orphanEqDeletes.size());
+
+      return orphanEqDeletes.size();
+
+    } catch (ValidationException | CommitFailedException e) {
+      LOG.warn(
+          "{} table={} orphan cleanup commit failed due to concurrent modification, skipping",
+          LOG_PREFIX,
+          table.name(),
+          e);
+      return 0;
+    }
+  }
+
+  /**
+   * Find all equality delete file paths that are matched to at least one data file
+   * via task.deletes(). This uses the same matching logic as Iceberg's planning phase.
+   */
+  private Set<String> findMatchedEqDeletePaths(long snapshotId) {
+    Set<String> matchedPaths = Sets.newHashSet();
+
+    try (CloseableIterable<CombinedScanTask> combinedTasks =
+        table
+            .newScan()
+            .useSnapshot(snapshotId)
+            .filter(filter)
+            .includeColumnStats()
+            .planTasks()) {
+
+      for (CombinedScanTask combinedTask : combinedTasks) {
+        for (FileScanTask task : combinedTask.files()) {
+          for (DeleteFile deleteFile : task.deletes()) {
+            if (deleteFile.content() == FileContent.EQUALITY_DELETES) {
+              matchedPaths.add(deleteFile.path().toString());
+            }
+          }
+        }
+      }
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to plan scan tasks for orphan detection", e);
+    }
+
+    return matchedPaths;
+  }
+
+  /**
+   * Read all live equality delete files from delete manifests as a map by path.
+   */
+  private Map<String, DeleteFile> readAllEqualityDeletesAsMap(Snapshot snapshot) {
+    Map<String, DeleteFile> eqDeletes = Maps.newHashMap();
+
+    for (ManifestFile manifest : snapshot.deleteManifests(table.io())) {
+      try (ManifestReader<DeleteFile> reader =
+               ManifestFiles.readDeleteManifest(manifest, table.io(), table.specs())) {
+        for (DeleteFile deleteFile : reader) {
+          if (deleteFile.content() == FileContent.EQUALITY_DELETES) {
+            eqDeletes.put(deleteFile.path().toString(), deleteFile.copy());
+          }
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to read delete manifest: " + manifest.path(), e);
+      }
+    }
+
+    return eqDeletes;
   }
 }
