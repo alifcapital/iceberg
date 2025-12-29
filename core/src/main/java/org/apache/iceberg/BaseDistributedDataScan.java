@@ -379,7 +379,7 @@ abstract class BaseDistributedDataScan
     }
 
     return builder
-        .specsById(table().specs())
+        .specsById(specs())
         .filterData(filter())
         .caseSensitive(isCaseSensitive())
         .scanMetrics(scanMetrics())

@@ -95,7 +95,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     Set<String> deletedFiles = Sets.newHashSet();
 
-    removeSnapshots(table).expireOlderThan(tAfterCommits).deleteWith(deletedFiles::add).commit();
+    removeSnapshots(table).expireOlderThan(tAfterCommits).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(table.currentSnapshot().snapshotId()).isEqualTo(snapshotId);
     assertThat(table.snapshot(firstSnapshot.snapshotId())).isNull();
@@ -128,7 +128,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     Set<String> deletedFiles = Sets.newHashSet();
 
-    removeSnapshots(table).expireOlderThan(tAfterCommits).deleteWith(deletedFiles::add).commit();
+    removeSnapshots(table).expireOlderThan(tAfterCommits).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(table.currentSnapshot().snapshotId()).isEqualTo(snapshotId);
     assertThat(table.snapshot(firstSnapshot.snapshotId())).isNull();
@@ -187,7 +187,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     Set<String> deletedFiles = Sets.newHashSet();
 
-    removeSnapshots(table).expireOlderThan(tAfterCommits).deleteWith(deletedFiles::add).commit();
+    removeSnapshots(table).expireOlderThan(tAfterCommits).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(table.currentSnapshot().snapshotId()).isEqualTo(snapshotId);
     assertThat(table.snapshot(firstSnapshot.snapshotId())).isNull();
@@ -236,7 +236,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     Set<String> deletedFiles = Sets.newHashSet();
 
-    table.expireSnapshots().expireOlderThan(tAfterCommits).deleteWith(deletedFiles::add).commit();
+    table.expireSnapshots().expireOlderThan(tAfterCommits).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(table.currentSnapshot().snapshotId()).isEqualTo(snapshotId);
     assertThat(table.snapshot(firstSnapshot.snapshotId()))
@@ -307,7 +307,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     Set<String> deletedFiles = Sets.newHashSet();
 
-    removeSnapshots(table).expireOlderThan(tAfterCommits).deleteWith(deletedFiles::add).commit();
+    removeSnapshots(table).expireOlderThan(tAfterCommits).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(table.currentSnapshot().snapshotId()).isEqualTo(snapshotId);
     assertThat(table.snapshot(firstSnapshot.snapshotId()))
@@ -601,7 +601,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     Set<String> deletedFiles = Sets.newHashSet();
 
-    removeSnapshots(table).expireOlderThan(t3).deleteWith(deletedFiles::add).commit();
+    removeSnapshots(table).expireOlderThan(t3).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(deletedFiles).contains(FILE_A.location());
   }
@@ -624,7 +624,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     Set<String> deletedFiles = Sets.newHashSet();
 
-    removeSnapshots(table).expireOlderThan(t3).deleteWith(deletedFiles::add).commit();
+    removeSnapshots(table).expireOlderThan(t3).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(deletedFiles).contains(FILE_A.location());
   }
@@ -658,7 +658,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     Set<String> deletedFiles = Sets.newHashSet();
 
-    removeSnapshots(table).expireOlderThan(t4).deleteWith(deletedFiles::add).commit();
+    removeSnapshots(table).expireOlderThan(t4).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(deletedFiles).contains(FILE_A.location().toString());
     assertThat(deletedFiles).contains(FILE_B.location().toString());
@@ -719,9 +719,9 @@ public class TestRemoveSnapshots extends TestBase {
                 }))
         .expireOlderThan(t4)
         .deleteWith(
-            s -> {
+            (path, type) -> {
               deleteThreads.add(Thread.currentThread().getName());
-              deletedFiles.add(s);
+              deletedFiles.add(path);
             })
         .commit();
 
@@ -755,7 +755,7 @@ public class TestRemoveSnapshots extends TestBase {
     removeSnapshots(table)
         .cleanExpiredFiles(false)
         .expireOlderThan(t4)
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .commit();
 
     assertThat(deletedFiles).isEmpty();
@@ -785,7 +785,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     // Expire all commits including dangling staged snapshot.
     removeSnapshots(table)
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .expireOlderThan(snapshotB.timestampMillis() + 1)
         .commit();
 
@@ -875,7 +875,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     // Expire `C`
     removeSnapshots(table)
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .expireOlderThan(snapshotC.timestampMillis() + 1)
         .commit();
 
@@ -921,7 +921,7 @@ public class TestRemoveSnapshots extends TestBase {
     // Expire `B` commit.
     table
         .expireSnapshots()
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .expireSnapshotId(snapshotB.snapshotId())
         .commit();
 
@@ -938,7 +938,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     // Expire all snapshots including cherry-pick
     removeSnapshots(table)
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .expireOlderThan(table.currentSnapshot().timestampMillis() + 1)
         .commit();
 
@@ -983,7 +983,7 @@ public class TestRemoveSnapshots extends TestBase {
 
     removeSnapshots(table)
         .expireOlderThan(System.currentTimeMillis())
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .commit();
 
     assertThat(table.currentSnapshot()).isEqualTo(snapshotBeforeExpiration);
@@ -1015,7 +1015,7 @@ public class TestRemoveSnapshots extends TestBase {
     Set<String> deletedFiles = Sets.newHashSet();
 
     // rely solely on default configs
-    removeSnapshots(table).deleteWith(deletedFiles::add).commit();
+    removeSnapshots(table).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(table.currentSnapshot()).isEqualTo(thirdSnapshot);
     assertThat(table.snapshots()).hasSize(1);
@@ -1062,7 +1062,7 @@ public class TestRemoveSnapshots extends TestBase {
     long fourthSnapshotTs = waitUntilAfter(fourthSnapshot.timestampMillis());
 
     Set<String> deletedFiles = Sets.newHashSet();
-    removeSnapshots(table).expireOlderThan(fourthSnapshotTs).deleteWith(deletedFiles::add).commit();
+    removeSnapshots(table).expireOlderThan(fourthSnapshotTs).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(deletedFiles)
         .as("Should remove old delete files and delete file manifests")
@@ -1553,7 +1553,7 @@ public class TestRemoveSnapshots extends TestBase {
     // Only deletionA's manifest list and manifests should be removed
     expectedDeletes.add(deletionA.manifestListLocation());
     expectedDeletes.addAll(manifestPaths(deletionA, table.io()));
-    table.expireSnapshots().expireOlderThan(tAfterCommits).deleteWith(deletedFiles::add).commit();
+    table.expireSnapshots().expireOlderThan(tAfterCommits).deleteWith((path, type) -> deletedFiles.add(path)).commit();
 
     assertThat(table.snapshots()).hasSize(2);
     assertThat(deletedFiles).isEqualTo(expectedDeletes);
@@ -1566,14 +1566,14 @@ public class TestRemoveSnapshots extends TestBase {
     table.newAppend().appendFile(FILE_C).toBranch(testBranch).commit();
     Snapshot testBranchHead = table.snapshot(testBranch);
 
-    deletedFiles = Sets.newHashSet();
-    expectedDeletes = Sets.newHashSet();
+    deletedFiles.clear();
+    expectedDeletes.clear();
 
     waitUntilAfter(testBranchHead.timestampMillis());
     table
         .expireSnapshots()
         .expireOlderThan(testBranchHead.timestampMillis())
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .commit();
 
     expectedDeletes.add(appendA.manifestListLocation());
@@ -1703,7 +1703,7 @@ public class TestRemoveSnapshots extends TestBase {
     removeSnapshots(table)
         .expireOlderThan(System.currentTimeMillis())
         .cleanExpiredMetadata(true)
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .commit();
 
     assertThat(deletedFiles)
@@ -1738,7 +1738,7 @@ public class TestRemoveSnapshots extends TestBase {
     removeSnapshots(table)
         .expireOlderThan(System.currentTimeMillis())
         .cleanExpiredMetadata(true)
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .commit();
 
     assertThat(deletedFiles).containsExactlyInAnyOrder(append.manifestListLocation());
@@ -1770,7 +1770,7 @@ public class TestRemoveSnapshots extends TestBase {
     removeSnapshots(table)
         .expireOlderThan(System.currentTimeMillis())
         .cleanExpiredMetadata(true)
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .commit();
 
     assertThat(deletedFiles).containsExactlyInAnyOrderElementsOf(expectedDeletedFiles);
@@ -1804,7 +1804,7 @@ public class TestRemoveSnapshots extends TestBase {
     removeSnapshots(table)
         .expireOlderThan(System.currentTimeMillis())
         .cleanExpiredMetadata(true)
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .commit();
 
     assertThat(deletedFiles).containsExactlyInAnyOrderElementsOf(expectedDeletedFiles);
@@ -1902,7 +1902,7 @@ public class TestRemoveSnapshots extends TestBase {
     removeSnapshots(table)
         .cleanExpiredFiles(true)
         .expireOlderThan(System.currentTimeMillis())
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .commit();
     assertThat(deletedFiles).isEqualTo(ImmutableSet.of(snapshotA.manifestListLocation()));
   }
@@ -1928,7 +1928,7 @@ public class TestRemoveSnapshots extends TestBase {
     waitUntilAfter(currentTime + branchAgeMs);
 
     removeSnapshots(table)
-        .deleteWith(deletedFiles::add)
+        .deleteWith((path, type) -> deletedFiles.add(path))
         .expireOlderThan(System.currentTimeMillis())
         .commit();
 
@@ -1949,6 +1949,180 @@ public class TestRemoveSnapshots extends TestBase {
   private RemoveSnapshots removeSnapshots(Table table) {
     RemoveSnapshots removeSnapshots = (RemoveSnapshots) table.expireSnapshots();
     return (RemoveSnapshots) removeSnapshots.withIncrementalCleanup(incrementalCleanup);
+  }
+
+  @TestTemplate
+  public void testCleanupLevelAll() {
+    table.newAppend().appendFile(FILE_A).commit();
+    Snapshot firstSnapshot = table.currentSnapshot();
+    table.newDelete().deleteFile(FILE_A).commit();
+    Snapshot secondSnapshot = table.currentSnapshot();
+    table.newAppend().appendFile(FILE_B).commit();
+    long tAfterCommits = waitUntilAfter(table.currentSnapshot().timestampMillis());
+
+    Set<String> deletedFiles = Sets.newHashSet();
+
+    table
+        .expireSnapshots()
+        .cleanupLevel(ExpireSnapshots.CleanupLevel.ALL)
+        .expireOlderThan(tAfterCommits)
+        .deleteWith((path, type) -> deletedFiles.add(path))
+        .commit();
+
+    assertThat(deletedFiles)
+        .as("CleanupLevel.ALL should delete both metadata and data files")
+        .containsExactlyInAnyOrder(
+            firstSnapshot.manifestListLocation(),
+            firstSnapshot.allManifests(table.io()).get(0).path(),
+            secondSnapshot.manifestListLocation(),
+            secondSnapshot.allManifests(table.io()).get(0).path(),
+            FILE_A.location());
+  }
+
+  @TestTemplate
+  public void testCleanupLevelMetadataOnly() {
+    table.newAppend().appendFile(FILE_A).commit();
+    Snapshot firstSnapshot = table.currentSnapshot();
+    table.newDelete().deleteFile(FILE_A).commit();
+    Snapshot secondSnapshot = table.currentSnapshot();
+    table.newAppend().appendFile(FILE_B).commit();
+    long tAfterCommits = waitUntilAfter(table.currentSnapshot().timestampMillis());
+
+    Set<String> deletedFiles = Sets.newHashSet();
+
+    table
+        .expireSnapshots()
+        .cleanupLevel(ExpireSnapshots.CleanupLevel.METADATA_ONLY)
+        .expireOlderThan(tAfterCommits)
+        .deleteWith((path, type) -> deletedFiles.add(path))
+        .commit();
+
+    assertThat(deletedFiles)
+        .as("CleanupLevel.METADATA_ONLY should delete only metadata files")
+        .containsExactlyInAnyOrder(
+            firstSnapshot.manifestListLocation(),
+            firstSnapshot.allManifests(table.io()).get(0).path(),
+            secondSnapshot.manifestListLocation(),
+            secondSnapshot.allManifests(table.io()).get(0).path());
+  }
+
+  @TestTemplate
+  public void testCleanupLevelNone() {
+    table.newAppend().appendFile(FILE_A).commit();
+    Snapshot firstSnapshot = table.currentSnapshot();
+    table.newDelete().deleteFile(FILE_A).commit();
+    Snapshot secondSnapshot = table.currentSnapshot();
+    table.newAppend().appendFile(FILE_B).commit();
+    long tAfterCommits = waitUntilAfter(table.currentSnapshot().timestampMillis());
+
+    Set<String> deletedFiles = Sets.newHashSet();
+
+    table
+        .expireSnapshots()
+        .cleanupLevel(ExpireSnapshots.CleanupLevel.NONE)
+        .expireOlderThan(tAfterCommits)
+        .deleteWith((path, type) -> deletedFiles.add(path))
+        .commit();
+
+    assertThat(table.snapshot(firstSnapshot.snapshotId()))
+        .as("First snapshot metadata should be removed even with CleanupLevel.NONE")
+        .isNull();
+    assertThat(table.snapshot(secondSnapshot.snapshotId()))
+        .as("Second snapshot metadata should be removed even with CleanupLevel.NONE")
+        .isNull();
+
+    assertThat(deletedFiles).as("CleanupLevel.NONE should not delete any files").isEmpty();
+  }
+
+  @TestTemplate
+  public void testCleanExpiredFilesAPI() {
+    table.newAppend().appendFile(FILE_A).commit();
+    Snapshot firstSnapshot = table.currentSnapshot();
+    waitUntilAfter(firstSnapshot.timestampMillis());
+
+    table.newAppend().appendFile(FILE_B).commit();
+    long tAfterCommits = waitUntilAfter(table.currentSnapshot().timestampMillis());
+
+    Set<String> deletedFiles = Sets.newHashSet();
+
+    // Use deprecated cleanExpiredFiles(false) - should map to CleanupLevel.NONE
+    table
+        .expireSnapshots()
+        .cleanExpiredFiles(false)
+        .expireOlderThan(tAfterCommits)
+        .deleteWith((path, type) -> deletedFiles.add(path))
+        .commit();
+
+    assertThat(deletedFiles)
+        .as("Deprecated cleanExpiredFiles(false) should behave like CleanupLevel.NONE")
+        .isEmpty();
+  }
+
+  @TestTemplate
+  public void testCannotSetCleanExpiredFilesAndCleanupLevelTogether() {
+    // Setting cleanExpiredFiles after cleanupLevel should fail
+    assertThatThrownBy(
+            () ->
+                table
+                    .expireSnapshots()
+                    .cleanupLevel(ExpireSnapshots.CleanupLevel.METADATA_ONLY)
+                    .cleanExpiredFiles(false))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(
+            "Cannot set cleanExpiredFiles when cleanupLevel has already been set");
+
+    // Setting cleanupLevel after cleanExpiredFiles should also fail
+    assertThatThrownBy(
+            () ->
+                table
+                    .expireSnapshots()
+                    .cleanExpiredFiles(false)
+                    .cleanupLevel(ExpireSnapshots.CleanupLevel.METADATA_ONLY))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(
+            "Cannot set cleanupLevel to %s when cleanExpiredFiles was explicitly set to false",
+            ExpireSnapshots.CleanupLevel.METADATA_ONLY);
+  }
+
+  @TestTemplate
+  public void testCanOverrideCleanExpiredFilesWithCleanupLevel() {
+    table.newAppend().appendFile(FILE_A).commit();
+    Snapshot firstSnapshot = table.currentSnapshot();
+    table.newDelete().deleteFile(FILE_A).commit();
+    Snapshot secondSnapshot = table.currentSnapshot();
+    table.newAppend().appendFile(FILE_B).commit();
+    long tAfterCommits = waitUntilAfter(table.currentSnapshot().timestampMillis());
+
+    Set<String> deletedFiles = Sets.newHashSet();
+
+    // Setting cleanExpiredFiles(true) first, then overriding with cleanupLevel should work
+    // because cleanExpiredFiles(true) doesn't create a conflicting intention
+    table
+        .expireSnapshots()
+        .cleanExpiredFiles(true) // This sets cleanupLevel to ALL
+        .cleanupLevel(
+            ExpireSnapshots.CleanupLevel.METADATA_ONLY) // This should override to METADATA_ONLY
+        .expireOlderThan(tAfterCommits)
+        .deleteWith((path, type) -> deletedFiles.add(path))
+        .commit();
+
+    assertThat(deletedFiles)
+        .as("Should only delete metadata files when overridden to METADATA_ONLY")
+        .containsExactlyInAnyOrder(
+            firstSnapshot.manifestListLocation(),
+            firstSnapshot.allManifests(table.io()).get(0).path(),
+            secondSnapshot.manifestListLocation(),
+            secondSnapshot.allManifests(table.io()).get(0).path());
+
+    // FILE_A should NOT be deleted because cleanupLevel was overridden to METADATA_ONLY
+    assertThat(deletedFiles).doesNotContain(FILE_A.location());
+  }
+
+  @TestTemplate
+  public void testCleanupLevelNullValidation() {
+    assertThatThrownBy(() -> table.expireSnapshots().cleanupLevel(null))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Invalid cleanup level: null");
   }
 
   private StatisticsFile writeStatsFile(

@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.apache.iceberg.exceptions.RuntimeIOException;
@@ -45,14 +46,22 @@ class ReachableFileCleanup extends FileCleanupStrategy {
       FileIO fileIO,
       ExecutorService deleteExecutorService,
       ExecutorService planExecutorService,
-      Consumer<String> deleteFunc) {
+      BiConsumer<String, String> deleteFunc) {
     super(fileIO, deleteExecutorService, planExecutorService, deleteFunc);
   }
 
   @Override
-  public void cleanFiles(TableMetadata beforeExpiration, TableMetadata afterExpiration) {
+  public void cleanFiles(
+      TableMetadata beforeExpiration,
+      TableMetadata afterExpiration,
+      ExpireSnapshots.CleanupLevel cleanupLevel) {
     long startTime = System.nanoTime();
     LOG.info("Starting reachable file cleanup");
+
+    if (ExpireSnapshots.CleanupLevel.NONE == cleanupLevel) {
+      LOG.info("Nothing to clean.");
+      return;
+    }
 
     Set<String> manifestListsToDelete = Sets.newHashSet();
 
@@ -88,44 +97,43 @@ class ReachableFileCleanup extends FileCleanupStrategy {
           (pruneEndTime - pruneStartTime) / 1_000_000, manifestsToDelete.size());
 
       if (!manifestsToDelete.isEmpty()) {
-        long findFilesStartTime = System.nanoTime();
-        LOG.info("Starting to find files to delete from {} manifests", manifestsToDelete.size());
-        Set<String> dataFilesToDelete = findFilesToDelete(manifestsToDelete, currentManifests);
-        long findFilesEndTime = System.nanoTime();
-        LOG.info("Completed finding files in {} ms, found {} files to delete",
-            (findFilesEndTime - findFilesStartTime) / 1_000_000, dataFilesToDelete.size());
+        if (ExpireSnapshots.CleanupLevel.ALL == cleanupLevel) {
+          long findFilesStartTime = System.nanoTime();
+          LOG.info("Starting to find files to delete from {} manifests", manifestsToDelete.size());
+          Set<String> dataFilesToDelete = findFilesToDelete(manifestsToDelete, currentManifests);
+          LOG.info("Completed finding files in {} ms, found {} files to delete",
+              (System.nanoTime() - findFilesStartTime) / 1_000_000, dataFilesToDelete.size());
 
-        long deleteStartTime = System.nanoTime();
-        LOG.info("Found {} files to delete", dataFilesToDelete.size());
+          long deleteStartTime = System.nanoTime();
+          boolean supportsBulkDeletes = fileIO instanceof SupportsBulkOperations;
+          LOG.info("File IO {} bulk deletes", supportsBulkDeletes ? "supports" : "does not support");
 
-        boolean supportsBulkDeletes = fileIO instanceof SupportsBulkOperations;
-        LOG.info("File IO {} bulk deletes", supportsBulkDeletes ? "supports" : "does not support");
-
-        deleteFiles(dataFilesToDelete, "data");
-        long dataDeleteEndTime = System.nanoTime();
-        LOG.info("Deleted {} data files in {} ms", dataFilesToDelete.size(),
-            (dataDeleteEndTime - deleteStartTime) / 1_000_000);
+          deleteFiles(dataFilesToDelete, "data");
+          LOG.info("Deleted {} data files in {} ms", dataFilesToDelete.size(),
+              (System.nanoTime() - deleteStartTime) / 1_000_000);
+        }
 
         Set<String> manifestPathsToDelete =
             manifestsToDelete.stream().map(ManifestFile::path).collect(Collectors.toSet());
+        long manifestDeleteStartTime = System.nanoTime();
         deleteFiles(manifestPathsToDelete, "manifest");
         long manifestDeleteEndTime = System.nanoTime();
         LOG.info("Deleted {} manifest files in {} ms", manifestPathsToDelete.size(),
-            (manifestDeleteEndTime - dataDeleteEndTime) / 1_000_000);
-
-        deleteFiles(manifestListsToDelete, "manifest list");
-        long manifestListDeleteEndTime = System.nanoTime();
-        LOG.info("Deleted {} manifest list files in {} ms", manifestListsToDelete.size(),
-            (manifestListDeleteEndTime - manifestDeleteEndTime) / 1_000_000);
+            (manifestDeleteEndTime - manifestDeleteStartTime) / 1_000_000);
       }
     }
 
+    long manifestListDeleteStartTime = System.nanoTime();
+    deleteFiles(manifestListsToDelete, "manifest list");
+    LOG.info("Deleted {} manifest list files in {} ms", manifestListsToDelete.size(),
+        (System.nanoTime() - manifestListDeleteStartTime) / 1_000_000);
+
     if (hasAnyStatisticsFiles(beforeExpiration)) {
+      long statsDeleteStartTime = System.nanoTime();
       Set<String> expiredStatisticsFiles = expiredStatisticsFilesLocations(beforeExpiration, afterExpiration);
       deleteFiles(expiredStatisticsFiles, "statistics files");
-      long statsDeleteEndTime = System.nanoTime();
       LOG.info("Deleted {} statistics files in {} ms", expiredStatisticsFiles.size(),
-          (statsDeleteEndTime - System.nanoTime()) / 1_000_000);
+          (System.nanoTime() - statsDeleteStartTime) / 1_000_000);
     }
 
     long totalTime = System.nanoTime() - startTime;

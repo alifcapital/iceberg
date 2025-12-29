@@ -40,7 +40,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.ValidationException;
@@ -69,16 +69,17 @@ class RemoveSnapshots implements ExpireSnapshots {
   private final Set<Long> idsToRemove = Sets.newHashSet();
   private final long now;
   private final long defaultMaxRefAgeMs;
-  private boolean cleanExpiredFiles = true;
   private TableMetadata base;
   private long defaultExpireOlderThan;
   private int defaultMinNumSnapshots;
-  private Consumer<String> deleteFunc = null;
+  private BiConsumer<String, String> deleteFunc = null;
   private ExecutorService deleteExecutorService = DEFAULT_DELETE_EXECUTOR_SERVICE;
   private ExecutorService planExecutorService;
   private Boolean incrementalCleanup;
   private boolean specifiedSnapshotId = false;
   private boolean cleanExpiredMetadata = false;
+  private boolean cleanExpiredFiles = true;
+  private CleanupLevel cleanupLevel = CleanupLevel.ALL;
 
   RemoveSnapshots(TableOperations ops) {
     this.ops = ops;
@@ -103,7 +104,12 @@ class RemoveSnapshots implements ExpireSnapshots {
 
   @Override
   public ExpireSnapshots cleanExpiredFiles(boolean clean) {
+    Preconditions.checkArgument(
+        cleanupLevel == CleanupLevel.ALL,
+        "Cannot set cleanExpiredFiles when cleanupLevel has already been set to: %s",
+        cleanupLevel);
     this.cleanExpiredFiles = clean;
+    this.cleanupLevel = clean ? CleanupLevel.ALL : CleanupLevel.NONE;
     return this;
   }
 
@@ -136,7 +142,7 @@ class RemoveSnapshots implements ExpireSnapshots {
   }
 
   @Override
-  public ExpireSnapshots deleteWith(Consumer<String> newDeleteFunc) {
+  public ExpireSnapshots deleteWith(BiConsumer<String, String> newDeleteFunc) {
     this.deleteFunc = newDeleteFunc;
     return this;
   }
@@ -164,6 +170,17 @@ class RemoveSnapshots implements ExpireSnapshots {
   @Override
   public ExpireSnapshots cleanExpiredMetadata(boolean clean) {
     this.cleanExpiredMetadata = clean;
+    return this;
+  }
+
+  @Override
+  public ExpireSnapshots cleanupLevel(CleanupLevel level) {
+    Preconditions.checkArgument(null != level, "Invalid cleanup level: null");
+    Preconditions.checkArgument(
+        cleanExpiredFiles || level == CleanupLevel.NONE,
+        "Cannot set cleanupLevel to %s when cleanExpiredFiles was explicitly set to false",
+        level);
+    this.cleanupLevel = level;
     return this;
   }
 
@@ -384,13 +401,15 @@ class RemoveSnapshots implements ExpireSnapshots {
 
     long commitEndTime = System.nanoTime();
     LOG.info("Completed committing metadata changes in {} ms", (commitEndTime - startTime) / 1_000_000);
+    LOG.info(
+        "Committed snapshot changes and prepare to clean up files at level={}",
+        cleanupLevel.name());
 
-if (cleanExpiredFiles && !base.snapshots().isEmpty()) {
+    if (CleanupLevel.NONE != cleanupLevel && !base.snapshots().isEmpty()) {
       long cleanupStartTime = System.nanoTime();
       LOG.info("Starting expired files cleanup");
       cleanExpiredSnapshots();
-      long cleanupEndTime = System.nanoTime();
-      LOG.info("Completed expired files cleanup in {} ms", (cleanupEndTime - cleanupStartTime) / 1_000_000);
+      LOG.info("Completed expired files cleanup in {} ms", (System.nanoTime() - cleanupStartTime) / 1_000_000);
     }
 
     long totalTime = System.nanoTime() - startTime;
@@ -424,7 +443,7 @@ if (cleanExpiredFiles && !base.snapshots().isEmpty()) {
             : new ReachableFileCleanup(
                 ops.io(), deleteExecutorService, planExecutorService(), deleteFunc);
 
-    cleanupStrategy.cleanFiles(base, current);
+    cleanupStrategy.cleanFiles(base, current, cleanupLevel);
   }
 
   private void validateCleanupCanBeIncremental(TableMetadata current) {

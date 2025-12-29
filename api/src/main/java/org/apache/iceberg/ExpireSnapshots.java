@@ -20,7 +20,7 @@ package org.apache.iceberg;
 
 import java.util.List;
 import java.util.concurrent.ExecutorService;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 /**
  * API for removing old {@link Snapshot snapshots} from a table.
@@ -38,6 +38,15 @@ import java.util.function.Consumer;
  * <p>{@link #apply()} returns a list of the snapshots that will be removed.
  */
 public interface ExpireSnapshots extends PendingUpdate<List<Snapshot>> {
+  /** An enum representing possible clean up levels used in snapshot expiration. */
+  enum CleanupLevel {
+    /** Skip all file cleanup, only remove snapshot metadata. */
+    NONE,
+    /** Clean up only metadata files (manifests, manifest lists, statistics), retain data files. */
+    METADATA_ONLY,
+    /** Clean up both metadata and data files (default). */
+    ALL
+  }
 
   /**
    * Expires a specific {@link Snapshot} identified by id.
@@ -79,10 +88,11 @@ public interface ExpireSnapshots extends PendingUpdate<List<Snapshot>> {
    *
    * <p>If this method is not called, unnecessary manifests and data files will still be deleted.
    *
-   * @param deleteFunc a function that will be called to delete manifests and data files
+   * @param deleteFunc a function that will be called with the file path and file type (e.g.,
+   *     "data", "manifest", "manifest list", "statistics files")
    * @return this for method chaining
    */
-  ExpireSnapshots deleteWith(Consumer<String> deleteFunc);
+  ExpireSnapshots deleteWith(BiConsumer<String, String> deleteFunc);
 
   /**
    * Passes an alternative executor service that will be used for manifests and data files deletion.
@@ -116,8 +126,31 @@ public interface ExpireSnapshots extends PendingUpdate<List<Snapshot>> {
    *
    * @param clean setting this to false will skip deleting expired manifests and files
    * @return this for method chaining
+   * @deprecated since 1.11.0, will be removed in 2.0.0; use {@link #cleanupLevel(CleanupLevel)}
+   *     instead.
    */
+  @Deprecated
   ExpireSnapshots cleanExpiredFiles(boolean clean);
+
+  /**
+   * Configures the cleanup level for expired files.
+   *
+   * <p>This method provides fine-grained control over which files are cleaned up during snapshot
+   * expiration.
+   *
+   * <p>Consider {@link CleanupLevel#METADATA_ONLY} when data files are shared across tables or when
+   * using procedures like add-files that may reference the same data files.
+   *
+   * <p>Consider {@link CleanupLevel#NONE} when data and metadata files may be more efficiently
+   * removed using a distributed framework through the actions API.
+   *
+   * @param level the cleanup level to use for expired snapshots
+   * @return this for method chaining
+   */
+  default ExpireSnapshots cleanupLevel(CleanupLevel level) {
+    throw new UnsupportedOperationException(
+        this.getClass().getName() + " doesn't implement cleanupLevel");
+  }
 
   /**
    * Enable cleaning up unused metadata, such as partition specs, schemas, etc.

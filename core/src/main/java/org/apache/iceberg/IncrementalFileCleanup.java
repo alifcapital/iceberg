@@ -25,7 +25,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.io.CloseableIterable;
@@ -52,26 +52,28 @@ class IncrementalFileCleanup extends FileCleanupStrategy {
       FileIO fileIO,
       ExecutorService deleteExecutorService,
       ExecutorService planExecutorService,
-      Consumer<String> deleteFunc) {
+      BiConsumer<String, String> deleteFunc) {
     super(fileIO, deleteExecutorService, planExecutorService, deleteFunc);
   }
 
   @Override
   @SuppressWarnings({"checkstyle:CyclomaticComplexity", "MethodLength"})
-  public void cleanFiles(TableMetadata beforeExpiration, TableMetadata afterExpiration) {
+  public void cleanFiles(
+      TableMetadata beforeExpiration,
+      TableMetadata afterExpiration,
+      ExpireSnapshots.CleanupLevel cleanupLevel) {
     long startTime = System.nanoTime();
     LOG.info("Starting incremental file cleanup");
 
-    if (afterExpiration.refs().size() > 1) {
-      throw new UnsupportedOperationException(
-          "Cannot incrementally clean files for tables with more than 1 ref");
-    }
-
-    // clean up the expired snapshots:
+    // clean up required underlying files based on the expired snapshots
     // 1. Get a list of the snapshots that were removed
     // 2. Delete any data files that were deleted by those snapshots and are not in the table
     // 3. Delete any manifests that are no longer used by current snapshots
     // 4. Delete the manifest lists
+    if (ExpireSnapshots.CleanupLevel.NONE == cleanupLevel) {
+      LOG.info("Nothing to clean.");
+      return;
+    }
 
     Set<Long> validIds = Sets.newHashSet();
     for (Snapshot snapshot : afterExpiration.snapshots()) {
@@ -282,26 +284,40 @@ class IncrementalFileCleanup extends FileCleanupStrategy {
     LOG.info("Completed scanning expired snapshots in {} ms, found {} manifests to delete and {} manifests to revert",
         (scanExpiredEndTime - scanExpiredStartTime) / 1_000_000, manifestsToDelete.size(), manifestsToRevert.size());
 
-    Set<String> filesToDelete =
-        findFilesToDelete(
-            manifestsToScan, manifestsToRevert, validIds, beforeExpiration.specsById());
+    if (ExpireSnapshots.CleanupLevel.ALL == cleanupLevel) {
+      long deleteStartTime = System.nanoTime();
+      Set<String> filesToDelete =
+          findFilesToDelete(
+              manifestsToScan, manifestsToRevert, validIds, beforeExpiration.specsById());
+      LOG.info("Found {} candidate files to delete", filesToDelete.size());
 
-    long deleteStartTime = System.nanoTime();
-    LOG.info("Found {} files to delete", filesToDelete.size());
+      // Filter out files that are still referenced by valid snapshots
+      // This handles the case where a file was deleted and then re-added
+      if (!filesToDelete.isEmpty()) {
+        Set<String> liveFiles =
+            findLiveFiles(afterExpiration.snapshots(), afterExpiration.specsById());
+        int beforeFilter = filesToDelete.size();
+        filesToDelete.removeAll(liveFiles);
+        LOG.info(
+            "Filtered out {} live files, {} files remain to delete",
+            beforeFilter - filesToDelete.size(),
+            filesToDelete.size());
+      }
 
-    boolean supportsBulkDeletes = fileIO instanceof SupportsBulkOperations;
-    LOG.info("File IO {} bulk deletes", supportsBulkDeletes ? "supports" : "does not support");
+      boolean supportsBulkDeletes = fileIO instanceof SupportsBulkOperations;
+      LOG.info("File IO {} bulk deletes", supportsBulkDeletes ? "supports" : "does not support");
 
-    LOG.info("Starting to delete files");
-    deleteFiles(filesToDelete, "data");
-    long dataDeleteEndTime = System.nanoTime();
-    LOG.info("Deleted {} data files in {} ms", filesToDelete.size(),
-        (dataDeleteEndTime - deleteStartTime) / 1_000_000);
+      LOG.info("Starting to delete files");
+      deleteFiles(filesToDelete, "data");
+      LOG.info("Deleted {} data files in {} ms", filesToDelete.size(),
+          (System.nanoTime() - deleteStartTime) / 1_000_000);
+    }
 
+    long manifestDeleteStartTime = System.nanoTime();
     deleteFiles(manifestsToDelete, "manifest");
     long manifestDeleteEndTime = System.nanoTime();
     LOG.info("Deleted {} manifest files in {} ms", manifestsToDelete.size(),
-        (manifestDeleteEndTime - dataDeleteEndTime) / 1_000_000);
+        (manifestDeleteEndTime - manifestDeleteStartTime) / 1_000_000);
 
     deleteFiles(manifestListsToDelete, "manifest list");
     long manifestListDeleteEndTime = System.nanoTime();
@@ -311,6 +327,7 @@ class IncrementalFileCleanup extends FileCleanupStrategy {
     if (hasAnyStatisticsFiles(beforeExpiration)) {
       Set<String> expiredStatisticsFilesLocations =
           expiredStatisticsFilesLocations(beforeExpiration, afterExpiration);
+      LOG.debug("Deleting {} statistics files", expiredStatisticsFilesLocations.size());
       deleteFiles(expiredStatisticsFilesLocations, "statistics files");
       long statsDeleteEndTime = System.nanoTime();
       LOG.info("Deleted {} statistics files in {} ms", expiredStatisticsFilesLocations.size(),
@@ -319,6 +336,46 @@ class IncrementalFileCleanup extends FileCleanupStrategy {
 
     long totalTime = System.nanoTime() - startTime;
     LOG.info("Completed incremental file cleanup in {} ms", totalTime / 1_000_000);
+  }
+
+  private Set<String> findLiveFiles(
+      List<Snapshot> validSnapshots, Map<Integer, PartitionSpec> specsById) {
+    Set<String> liveFiles = ConcurrentHashMap.newKeySet();
+    Set<String> scannedManifests = ConcurrentHashMap.newKeySet();
+
+    Tasks.foreach(validSnapshots)
+        .retry(3)
+        .suppressFailureWhenFinished()
+        .executeWith(planExecutorService)
+        .onFailure(
+            (snapshot, exc) ->
+                LOG.warn("Failed to scan manifests for snapshot {}", snapshot.snapshotId(), exc))
+        .run(
+            snapshot -> {
+              try (CloseableIterable<ManifestFile> manifests = readManifests(snapshot)) {
+                for (ManifestFile manifest : manifests) {
+                  // Only scan each manifest once
+                  if (scannedManifests.add(manifest.path())) {
+                    try (ManifestReader<?> reader =
+                        ManifestFiles.open(manifest, fileIO, specsById)) {
+                      for (ManifestEntry<?> entry : reader.entries()) {
+                        // Any file that is EXISTING or ADDED in a valid manifest is live
+                        if (entry.status() != ManifestEntry.Status.DELETED) {
+                          liveFiles.add(entry.file().location());
+                        }
+                      }
+                    } catch (IOException e) {
+                      throw new RuntimeIOException(e, "Failed to read manifest: %s", manifest);
+                    }
+                  }
+                }
+              } catch (IOException e) {
+                throw new RuntimeIOException(
+                    e, "Failed to read manifest list: %s", snapshot.manifestListLocation());
+              }
+            });
+
+    return liveFiles;
   }
 
   private Set<String> findFilesToDelete(

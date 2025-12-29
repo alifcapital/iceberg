@@ -109,13 +109,13 @@ public abstract class SizeBasedFileRewritePlanner<
   public static final long MAX_FILE_GROUP_SIZE_BYTES_DEFAULT = 100L * 1024 * 1024 * 1024; // 100 GB
 
   /**
-   * This option controls the maximum number of files that should be rewritten in a single file
-   * group. It helps with breaking down the rewriting of partitions with many small files which may not be
-   * rewritable otherwise due to the resource constraints of the cluster.
+   * This option controls the largest count of data that should be rewritten in a single file group.
+   * It helps with breaking down the rewriting of very large partitions which may not be rewritable
+   * otherwise due to the resource constraints of the cluster.
    */
-  public static final String MAX_FILE_GROUP_SIZE_NUM = "max-file-group-size-num";
+  public static final String MAX_FILE_GROUP_INPUT_FILES = "max-file-group-input-files";
 
-  public static final int MAX_FILE_GROUP_SIZE_NUM_DEFAULT = 1000; // 1k files
+  public static final long MAX_FILE_GROUP_INPUT_FILES_DEFAULT = Long.MAX_VALUE;
 
   private static final long SPLIT_OVERHEAD = 5L * 1024;
 
@@ -126,7 +126,7 @@ public abstract class SizeBasedFileRewritePlanner<
   private int minInputFiles;
   private boolean rewriteAll;
   private long maxGroupSize;
-  private int maxGroupNumFiles;
+  private long maxGroupCount;
   private int outputSpecId;
 
   protected SizeBasedFileRewritePlanner(Table table) {
@@ -151,7 +151,7 @@ public abstract class SizeBasedFileRewritePlanner<
         MIN_INPUT_FILES,
         REWRITE_ALL,
         MAX_FILE_GROUP_SIZE_BYTES,
-        MAX_FILE_GROUP_SIZE_NUM);
+        MAX_FILE_GROUP_INPUT_FILES);
   }
 
   @Override
@@ -163,7 +163,7 @@ public abstract class SizeBasedFileRewritePlanner<
     this.minInputFiles = minInputFiles(options);
     this.rewriteAll = rewriteAll(options);
     this.maxGroupSize = maxGroupSize(options);
-    this.maxGroupNumFiles = maxGroupNumFiles(options);
+    this.maxGroupCount = maxGroupCount(options);
     this.outputSpecId = outputSpecId(options);
 
     if (rewriteAll) {
@@ -181,18 +181,9 @@ public abstract class SizeBasedFileRewritePlanner<
 
   protected Iterable<List<T>> planFileGroups(Iterable<T> tasks) {
     Iterable<T> filteredTasks = rewriteAll ? tasks : filterFiles(tasks);
-
-    // First pack by size
-    BinPacking.ListPacker<T> sizePacker = new BinPacking.ListPacker<>(maxGroupSize, 1, false);
-    List<List<T>> sizeGroups = sizePacker.pack(filteredTasks, ContentScanTask::length);
-
-    // Then pack by count
-    BinPacking.ListPacker<T> countPacker = new BinPacking.ListPacker<>(maxGroupNumFiles, 1, false);
-    List<List<T>> groups = Lists.newArrayList();
-    for (List<T> sizeGroup : sizeGroups) {
-      groups.addAll(countPacker.pack(sizeGroup, item -> 1L));
-    }
-
+    BinPacking.ListPacker<T> packer =
+        new BinPacking.ListPacker<>(maxGroupSize, 1, false, maxGroupCount);
+    List<List<T>> groups = packer.pack(filteredTasks, ContentScanTask::length);
     return rewriteAll ? groups : filterFileGroups(groups);
   }
 
@@ -360,10 +351,12 @@ public abstract class SizeBasedFileRewritePlanner<
     return value;
   }
 
-  private int maxGroupNumFiles(Map<String, String> options) {
-    int value = PropertyUtil.propertyAsInt(options, MAX_FILE_GROUP_SIZE_NUM, MAX_FILE_GROUP_SIZE_NUM_DEFAULT);
+  private long maxGroupCount(Map<String, String> options) {
+    long value =
+        PropertyUtil.propertyAsLong(
+            options, MAX_FILE_GROUP_INPUT_FILES, MAX_FILE_GROUP_INPUT_FILES_DEFAULT);
     Preconditions.checkArgument(
-        value > 0, "'%s' is set to %s but must be > 0", MAX_FILE_GROUP_SIZE_NUM, value);
+        value > 0, "'%s' is set to %s but must be > 0", MAX_FILE_GROUP_INPUT_FILES, value);
     return value;
   }
 

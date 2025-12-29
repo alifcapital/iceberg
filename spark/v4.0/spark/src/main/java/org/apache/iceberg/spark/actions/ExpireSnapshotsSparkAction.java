@@ -24,7 +24,8 @@ import static org.apache.iceberg.TableProperties.GC_ENABLED_DEFAULT;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
-import java.util.function.Consumer;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.ExpireSnapshots;
 import org.apache.iceberg.actions.ImmutableExpireSnapshots;
@@ -58,7 +59,7 @@ public class ExpireSnapshotsSparkAction extends BaseSparkAction<ExpireSnapshotsS
   private final Set<Long> expiredSnapshotIds = Sets.newHashSet();
   private Long expireOlderThanValue = null;
   private Integer retainLastValue = null;
-  private Consumer<String> deleteFunc = null;
+  private BiConsumer<String, String> deleteFunc = null;
   private ExecutorService deleteExecutorService = null;
   private Boolean cleanExpiredMetadata = null;
 
@@ -105,7 +106,7 @@ public class ExpireSnapshotsSparkAction extends BaseSparkAction<ExpireSnapshotsS
   }
 
   @Override
-  public ExpireSnapshotsSparkAction deleteWith(Consumer<String> newDeleteFunc) {
+  public ExpireSnapshotsSparkAction deleteWith(BiConsumer<String, String> newDeleteFunc) {
     this.deleteFunc = newDeleteFunc;
     return this;
   }
@@ -126,9 +127,33 @@ public class ExpireSnapshotsSparkAction extends BaseSparkAction<ExpireSnapshotsS
     long startTime = System.nanoTime();
     LOG.info("Starting snapshot expiration for table {}", table.name());
 
+    // Counters to track deleted files by type
+    AtomicLong deletedDataFiles = new AtomicLong(0L);
+    AtomicLong deletedPosDeleteFiles = new AtomicLong(0L);
+    AtomicLong deletedEqDeleteFiles = new AtomicLong(0L);
+    AtomicLong deletedManifests = new AtomicLong(0L);
+    AtomicLong deletedManifestLists = new AtomicLong(0L);
+    AtomicLong deletedStatisticsFiles = new AtomicLong(0L);
+
+    // Wrap delete function to count files by type
+    BiConsumer<String, String> countingDeleteFunc =
+        (path, fileType) -> {
+          if (deleteFunc != null) {
+            deleteFunc.accept(path, fileType);
+          } else {
+            table.io().deleteFile(path);
+          }
+          countByType(
+              fileType,
+              deletedDataFiles,
+              deletedManifests,
+              deletedManifestLists,
+              deletedStatisticsFiles);
+        };
+
     // perform expiration with file cleanup using core implementation
     org.apache.iceberg.ExpireSnapshots expireSnapshots =
-        table.expireSnapshots().cleanExpiredFiles(true);
+        table.expireSnapshots().cleanExpiredFiles(true).deleteWith(countingDeleteFunc);
 
     for (long id : expiredSnapshotIds) {
       expireSnapshots = expireSnapshots.expireSnapshotId(id);
@@ -146,10 +171,6 @@ public class ExpireSnapshotsSparkAction extends BaseSparkAction<ExpireSnapshotsS
       expireSnapshots = expireSnapshots.cleanExpiredMetadata(cleanExpiredMetadata);
     }
 
-    if (deleteFunc != null) {
-      expireSnapshots = expireSnapshots.deleteWith(deleteFunc);
-    }
-
     if (deleteExecutorService != null) {
       expireSnapshots = expireSnapshots.executeDeleteWith(deleteExecutorService);
     }
@@ -163,16 +184,38 @@ public class ExpireSnapshotsSparkAction extends BaseSparkAction<ExpireSnapshotsS
         table.name(),
         (endTime - startTime) / 1_000_000);
 
-    // Return zeros since core implementation handles the actual deletion
-    // and logs detailed statistics
     return ImmutableExpireSnapshots.Result.builder()
-        .deletedDataFilesCount(0L)
-        .deletedPositionDeleteFilesCount(0L)
-        .deletedEqualityDeleteFilesCount(0L)
-        .deletedManifestsCount(0L)
-        .deletedManifestListsCount(0L)
-        .deletedStatisticsFilesCount(0L)
+        .deletedDataFilesCount(deletedDataFiles.get())
+        .deletedPositionDeleteFilesCount(deletedPosDeleteFiles.get())
+        .deletedEqualityDeleteFilesCount(deletedEqDeleteFiles.get())
+        .deletedManifestsCount(deletedManifests.get())
+        .deletedManifestListsCount(deletedManifestLists.get())
+        .deletedStatisticsFilesCount(deletedStatisticsFiles.get())
         .build();
+  }
+
+  private void countByType(
+      String fileType,
+      AtomicLong dataFiles,
+      AtomicLong manifests,
+      AtomicLong manifestLists,
+      AtomicLong statisticsFiles) {
+    switch (fileType) {
+      case "data":
+        dataFiles.incrementAndGet();
+        break;
+      case "manifest":
+        manifests.incrementAndGet();
+        break;
+      case "manifest list":
+        manifestLists.incrementAndGet();
+        break;
+      case "statistics files":
+        statisticsFiles.incrementAndGet();
+        break;
+      default:
+        LOG.warn("Unknown file type: {}", fileType);
+    }
   }
 
   private String jobDesc() {

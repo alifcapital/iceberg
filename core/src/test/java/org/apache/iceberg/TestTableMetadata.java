@@ -55,6 +55,7 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.apache.iceberg.TableMetadata.MetadataLogEntry;
 import org.apache.iceberg.TableMetadata.SnapshotLogEntry;
+import org.apache.iceberg.encryption.PlaintextEncryptionManager;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
@@ -71,6 +72,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class TestTableMetadata {
   private static final String TEST_LOCATION = "s3://bucket/test/location";
@@ -1093,6 +1095,24 @@ public class TestTableMetadata {
         .isNotNull();
   }
 
+  @ParameterizedTest
+  @ValueSource(ints = {1, 2})
+  void testEncryptionVersionValidation(int formatVersion) {
+    assertThatThrownBy(
+            () ->
+                TableMetadata.newTableMetadata(
+                    TEST_SCHEMA,
+                    PartitionSpec.unpartitioned(),
+                    SortOrder.unsorted(),
+                    TEST_LOCATION,
+                    ImmutableMap.of("encryption.key-id", "test", "encryption.data-key-length", "5"),
+                    formatVersion))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage(
+            "Invalid properties for v%s: [encryption.key-id, encryption.data-key-length]",
+            formatVersion);
+  }
+
   @Test
   public void testParserVersionValidation() throws Exception {
     String supportedVersion1 = readTableMetadataInputFile("TableMetadataV1Valid.json");
@@ -1834,7 +1854,13 @@ public class TestTableMetadata {
 
     try (ManifestListWriter writer =
         ManifestLists.write(
-            1, Files.localOutput(manifestList), snapshotId, parentSnapshotId, 0, 0L)) {
+            1,
+            Files.localOutput(manifestList),
+            PlaintextEncryptionManager.instance(),
+            snapshotId,
+            parentSnapshotId,
+            0,
+            0L)) {
       writer.addAll(
           ImmutableList.of(
               new GenericManifestFile(localInput(manifestFile), SPEC_5.specId(), snapshotId)));

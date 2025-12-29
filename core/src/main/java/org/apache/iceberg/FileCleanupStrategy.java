@@ -20,7 +20,7 @@ package org.apache.iceberg;
 
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.io.BulkDeletionFailureException;
 import org.apache.iceberg.io.CloseableIterable;
@@ -33,10 +33,10 @@ import org.slf4j.LoggerFactory;
 
 @SuppressWarnings("checkstyle:VisibilityModifier")
 abstract class FileCleanupStrategy {
-  private final Consumer<String> defaultDeleteFunc =
-      new Consumer<>() {
+  private final BiConsumer<String, String> defaultDeleteFunc =
+      new BiConsumer<>() {
         @Override
-        public void accept(String file) {
+        public void accept(String file, String fileType) {
           fileIO.deleteFile(file);
         }
       };
@@ -45,21 +45,37 @@ abstract class FileCleanupStrategy {
 
   protected final FileIO fileIO;
   protected final ExecutorService planExecutorService;
-  private final Consumer<String> deleteFunc;
+  private final BiConsumer<String, String> deleteFunc;
   private final ExecutorService deleteExecutorService;
 
   protected FileCleanupStrategy(
       FileIO fileIO,
       ExecutorService deleteExecutorService,
       ExecutorService planExecutorService,
-      Consumer<String> deleteFunc) {
+      BiConsumer<String, String> deleteFunc) {
     this.fileIO = fileIO;
     this.deleteExecutorService = deleteExecutorService;
     this.planExecutorService = planExecutorService;
     this.deleteFunc = deleteFunc;
   }
 
-  public abstract void cleanFiles(TableMetadata beforeExpiration, TableMetadata afterExpiration);
+  /**
+   * Clean up files that are only reachable by expired snapshots.
+   *
+   * <p>This method is responsible for identifying and deleting files that are safe to remove based
+   * on the table metadata state before and after snapshot expiration. The cleanup level controls
+   * which types of files are eligible for deletion.
+   *
+   * <p>Note that {@link ExpireSnapshots.CleanupLevel#NONE} is handled before reaching this method
+   *
+   * @param beforeExpiration table metadata before snapshot expiration
+   * @param afterExpiration table metadata after snapshot expiration
+   * @param cleanupLevel controls which types of files are eligible for deletion
+   */
+  public abstract void cleanFiles(
+      TableMetadata beforeExpiration,
+      TableMetadata afterExpiration,
+      ExpireSnapshots.CleanupLevel cleanupLevel);
 
   private static final Schema MANIFEST_PROJECTION =
       ManifestFile.schema()
@@ -98,7 +114,8 @@ abstract class FileCleanupStrategy {
         LOG.warn("Bulk deletion failed", e);
       }
     } else {
-      Consumer<String> deleteFuncToUse = deleteFunc == null ? defaultDeleteFunc : deleteFunc;
+      BiConsumer<String, String> deleteFuncToUse =
+          deleteFunc == null ? defaultDeleteFunc : deleteFunc;
 
       Tasks.foreach(pathsToDelete)
           .executeWith(deleteExecutorService)
@@ -108,7 +125,7 @@ abstract class FileCleanupStrategy {
           .suppressFailureWhenFinished()
           .onFailure(
               (file, thrown) -> LOG.warn("Delete failed for {} file: {}", fileType, file, thrown))
-          .run(deleteFuncToUse::accept);
+          .run(file -> deleteFuncToUse.accept(file, fileType));
     }
   }
 

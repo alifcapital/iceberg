@@ -19,7 +19,7 @@
 package org.apache.iceberg.actions;
 
 import java.util.concurrent.ExecutorService;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.io.SupportsBulkOperations;
 
@@ -73,16 +73,15 @@ public interface ExpireSnapshots extends Action<ExpireSnapshots, ExpireSnapshots
    *
    * <p>If this method is not called, unnecessary manifests and content files will still be deleted.
    *
-   * <p>Identical to {@link org.apache.iceberg.ExpireSnapshots#deleteWith(Consumer)}
-   *
-   * @param deleteFunc a function that will be called to delete manifests and data files
+   * @param deleteFunc a function that will be called with the file path and file type (e.g.,
+   *     "data", "manifest", "manifest list", "statistics files")
    * @return this for method chaining
    */
-  ExpireSnapshots deleteWith(Consumer<String> deleteFunc);
+  ExpireSnapshots deleteWith(BiConsumer<String, String> deleteFunc);
 
   /**
    * Passes an alternative executor service that will be used for files removal. This service will
-   * only be used if a custom delete function is provided by {@link #deleteWith(Consumer)} or if the
+   * only be used if a custom delete function is provided by {@link #deleteWith(BiConsumer)} or if the
    * FileIO does not {@link SupportsBulkOperations support bulk deletes}. Otherwise, parallelism
    * should be controlled by the IO specific {@link SupportsBulkOperations#deleteFiles(Iterable)
    * deleteFiles} method.
