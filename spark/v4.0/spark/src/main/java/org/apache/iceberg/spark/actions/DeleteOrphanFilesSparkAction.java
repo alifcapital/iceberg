@@ -119,8 +119,7 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
     this.hadoopConf = spark.sessionState().newHadoopConf();
     this.table = table;
     this.location = table.location();
-    // Auto-detect: use FileIO prefix listing if supported (e.g. S3), otherwise use Hadoop
-    this.usePrefixListing = table.io() instanceof SupportsPrefixOperations;
+    this.usePrefixListing = false;
     // Create executor for parallel manifest reading based on available processors
     int parallelism = Math.max(1, Runtime.getRuntime().availableProcessors());
     this.planExecutorService = Executors.newFixedThreadPool(parallelism);
@@ -477,6 +476,18 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
     return uri.getPath();
   }
 
+  private static String normalizeScheme(String scheme, Map<String, String> equalSchemes) {
+    // Treat null or empty scheme as "file"
+    String normalized = (scheme == null || scheme.isEmpty()) ? "file" : scheme;
+    return equalSchemes.getOrDefault(normalized, normalized);
+  }
+
+  private static String normalizeAuthority(String authority, Map<String, String> equalAuthorities) {
+    // Treat null authority as empty string
+    String normalized = (authority == null) ? "" : authority;
+    return equalAuthorities.getOrDefault(normalized, normalized);
+  }
+
   @VisibleForTesting
   static List<String> findOrphanFiles(
       Map<String, String> actualFiles,
@@ -493,8 +504,8 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
       URI uri = new Path(validPath).toUri();
       String normalizedPath = uri.getPath();
       normalizedValidPaths.add(normalizedPath);
-      String scheme = equalSchemes.getOrDefault(uri.getScheme(), uri.getScheme());
-      String authority = equalAuthorities.getOrDefault(uri.getAuthority(), uri.getAuthority());
+      String scheme = normalizeScheme(uri.getScheme(), equalSchemes);
+      String authority = normalizeAuthority(uri.getAuthority(), equalAuthorities);
       validPathPrefixes.put(normalizedPath, Pair.of(scheme, authority));
     }
 
@@ -511,9 +522,8 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
       } else {
         // Path exists in valid set - check scheme/authority
         URI actualUri = new Path(originalUri).toUri();
-        String actualScheme = equalSchemes.getOrDefault(actualUri.getScheme(), actualUri.getScheme());
-        String actualAuthority =
-            equalAuthorities.getOrDefault(actualUri.getAuthority(), actualUri.getAuthority());
+        String actualScheme = normalizeScheme(actualUri.getScheme(), equalSchemes);
+        String actualAuthority = normalizeAuthority(actualUri.getAuthority(), equalAuthorities);
 
         Pair<String, String> validPrefix = validPathPrefixes.get(normalizedActualPath);
         String validScheme = validPrefix.first();

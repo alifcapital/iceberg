@@ -79,7 +79,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.spark.SparkSQLProperties;
 import org.apache.iceberg.spark.TestBase;
-import org.apache.iceberg.spark.actions.DeleteOrphanFilesSparkAction.StringToFileURI;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.source.FilePathLastModifiedRecord;
 import org.apache.iceberg.spark.source.ThreeColumnRecord;
 import org.apache.iceberg.types.Types;
@@ -1198,14 +1198,19 @@ public abstract class TestRemoveOrphanFilesAction extends TestBase {
       Map<String, String> equalAuthorities,
       DeleteOrphanFiles.PrefixMismatchMode mode) {
 
-    StringToFileURI toFileUri = new StringToFileURI(equalSchemes, equalAuthorities);
+    // Build actualFiles map: normalized path -> original URI
+    Map<String, String> actualFilesMap = Maps.newHashMap();
+    for (String file : actualFiles) {
+      org.apache.hadoop.fs.Path path = new org.apache.hadoop.fs.Path(file);
+      actualFilesMap.put(path.toUri().getPath(), file);
+    }
 
-    Dataset<String> validFileDS = spark.createDataset(validFiles, Encoders.STRING());
-    Dataset<String> actualFileDS = spark.createDataset(actualFiles, Encoders.STRING());
+    // Build validFilePaths set
+    Set<String> validFilePaths = Sets.newHashSet(validFiles);
 
     List<String> orphanFiles =
         DeleteOrphanFilesSparkAction.findOrphanFiles(
-            spark, toFileUri.apply(actualFileDS), toFileUri.apply(validFileDS), mode);
+            actualFilesMap, validFilePaths, mode, equalSchemes, equalAuthorities);
     assertThat(orphanFiles).isEqualTo(expectedOrphanFiles);
   }
 }
