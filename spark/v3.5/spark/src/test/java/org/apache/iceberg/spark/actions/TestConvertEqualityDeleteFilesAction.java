@@ -329,4 +329,134 @@ public class TestConvertEqualityDeleteFilesAction extends TestBase {
 
     table.newRowDelta().addDeletes(eqDeleteWriter.toDeleteFile()).commit();
   }
+
+  @TestTemplate
+  public void testNullValueInEqualityDeleteKey() {
+    // Test that NULL values in equality delete keys match NULL values in data rows
+    // per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+
+    // Create table with nullable id column
+    Table table =
+        TABLES.create(
+            SCHEMA,
+            PartitionSpec.unpartitioned(),
+            ImmutableMap.of(
+                TableProperties.FORMAT_VERSION, String.valueOf(formatVersion),
+                TableProperties.DEFAULT_FILE_FORMAT, "parquet"),
+            tableLocation);
+
+    // Insert data including NULL values
+    // ids: 1, 2, NULL, NULL, 5 (two NULL rows)
+    spark
+        .sql(
+            "SELECT * FROM VALUES "
+                + "(1, 'a'), (2, 'b'), (NULL, 'c'), (NULL, 'd'), (5, 'e') "
+                + "AS t(id, data)")
+        .write()
+        .format("iceberg")
+        .mode("append")
+        .save(tableLocation);
+
+    table.refresh();
+
+    // Verify we have 5 rows including 2 with NULL id
+    List<Row> allData = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(allData).hasSize(5);
+    long nullCount = allData.stream().filter(r -> r.isNullAt(0)).count();
+    assertThat(nullCount).isEqualTo(2);
+
+    // Write equality delete for NULL id (should delete both rows with NULL id)
+    writeEqualityDeleteWithNull(table);
+
+    table.refresh();
+
+    // Verify we have equality delete file
+    List<DeleteFile> eqDeletesBefore =
+        TestHelpers.deleteFiles(table).stream()
+            .filter(f -> f.content() == FileContent.EQUALITY_DELETES)
+            .collect(Collectors.toList());
+    assertThat(eqDeletesBefore).hasSize(1);
+
+    // Read data BEFORE conversion - should have 3 rows (5 - 2 with NULL id)
+    List<Row> dataBefore = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataBefore).hasSize(3);
+    assertThat(dataBefore.stream().filter(r -> r.isNullAt(0)).count()).isEqualTo(0);
+
+    // Convert equality deletes to position deletes
+    ConvertEqualityDeleteFiles.Result result =
+        SparkActions.get().convertEqualityDeletes(table).execute();
+
+    assertThat(result.convertedEqualityDeleteFilesCount()).isEqualTo(1);
+    assertThat(result.addedPositionDeleteFilesCount()).isGreaterThan(0);
+    // Should have 2 position delete records (one for each NULL row)
+    assertThat(result.addedDeleteRecordsCount()).isEqualTo(2);
+
+    table.refresh();
+
+    // Verify data AFTER conversion - still 3 rows, no NULL ids
+    List<Row> dataAfter = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataAfter).hasSize(3);
+    assertThat(dataAfter.stream().filter(r -> r.isNullAt(0)).count()).isEqualTo(0);
+
+    // Verify remaining ids are 1, 2, 5
+    List<Integer> idsAfter =
+        dataAfter.stream()
+            .filter(r -> !r.isNullAt(0))
+            .map(r -> r.getInt(0))
+            .sorted()
+            .collect(Collectors.toList());
+    assertThat(idsAfter).containsExactly(1, 2, 5);
+
+    // Verify no more equality delete files after conversion
+    List<DeleteFile> eqDeletesAfter =
+        TestHelpers.deleteFiles(table).stream()
+            .filter(f -> f.content() == FileContent.EQUALITY_DELETES)
+            .collect(Collectors.toList());
+    assertThat(eqDeletesAfter).isEmpty();
+
+    // Verify position delete files exist
+    List<DeleteFile> posDeletesAfter =
+        TestHelpers.deleteFiles(table).stream()
+            .filter(f -> f.content() == FileContent.POSITION_DELETES)
+            .collect(Collectors.toList());
+    assertThat(posDeletesAfter).isNotEmpty();
+  }
+
+  private void writeEqualityDeleteWithNull(Table table) {
+    table.refresh();
+    List<Integer> equalityFieldIds = Lists.newArrayList(table.schema().findField("id").fieldId());
+    Schema eqDeleteRowSchema = table.schema().select("id");
+
+    OutputFileFactory fileFactory =
+        OutputFileFactory.builderFor(table, 1, System.nanoTime())
+            .format(FileFormat.PARQUET)
+            .build();
+
+    GenericAppenderFactory appenderFactory =
+        new GenericAppenderFactory(
+            table.schema(),
+            table.spec(),
+            ArrayUtil.toIntArray(equalityFieldIds),
+            eqDeleteRowSchema,
+            null);
+
+    OutputFile outputFile = fileFactory.newOutputFile().encryptingOutputFile();
+
+    EqualityDeleteWriter<Record> eqDeleteWriter =
+        appenderFactory.newEqDeleteWriter(
+            EncryptedFiles.encryptedOutput(outputFile, EncryptionKeyMetadata.EMPTY),
+            FileFormat.PARQUET,
+            null);
+
+    try (EqualityDeleteWriter<Record> writer = eqDeleteWriter) {
+      // Write a delete record with NULL id
+      Record deleteRecord = GenericRecord.create(eqDeleteRowSchema);
+      deleteRecord.setField("id", null);
+      writer.write(deleteRecord);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+
+    table.newRowDelta().addDeletes(eqDeleteWriter.toDeleteFile()).commit();
+  }
 }

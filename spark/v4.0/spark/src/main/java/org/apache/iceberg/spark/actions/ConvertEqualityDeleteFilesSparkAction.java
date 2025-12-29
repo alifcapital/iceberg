@@ -1614,13 +1614,36 @@ public class ConvertEqualityDeleteFilesSparkAction
         InputFile inputFile = getInputFileWithCache(fileInfo.path(), table, cacheMountPath, cacheS3Prefix);
 
         // Build bloom filter for row group pruning
+        // Note: Expressions.in() cannot handle null values, so we filter them out
+        // and add isNull() predicate separately if needed
         Expression bloomFilter = null;
         if (isSingleLongColumn && longKeys.size() <= 10000) {
-          bloomFilter = Expressions.in(eqColumnName, longKeys);
+          Set<Long> nonNullKeys = longKeys.stream().filter(k -> k != null).collect(Collectors.toSet());
+          if (!nonNullKeys.isEmpty()) {
+            bloomFilter = Expressions.in(eqColumnName, nonNullKeys);
+          }
+          if (longKeys.contains(null)) {
+            Expression isNullExpr = Expressions.isNull(eqColumnName);
+            bloomFilter = bloomFilter != null ? Expressions.or(bloomFilter, isNullExpr) : isNullExpr;
+          }
         } else if (isSingleStringColumn && stringKeys.size() <= 10000) {
-          bloomFilter = Expressions.in(eqColumnName, stringKeys);
+          Set<String> nonNullKeys = stringKeys.stream().filter(k -> k != null).collect(Collectors.toSet());
+          if (!nonNullKeys.isEmpty()) {
+            bloomFilter = Expressions.in(eqColumnName, nonNullKeys);
+          }
+          if (stringKeys.contains(null)) {
+            Expression isNullExpr = Expressions.isNull(eqColumnName);
+            bloomFilter = bloomFilter != null ? Expressions.or(bloomFilter, isNullExpr) : isNullExpr;
+          }
         } else if (isSingleDecimalColumn && decimalKeys.size() <= 10000) {
-          bloomFilter = Expressions.in(eqColumnName, decimalKeys);
+          Set<BigDecimal> nonNullKeys = decimalKeys.stream().filter(k -> k != null).collect(Collectors.toSet());
+          if (!nonNullKeys.isEmpty()) {
+            bloomFilter = Expressions.in(eqColumnName, nonNullKeys);
+          }
+          if (decimalKeys.contains(null)) {
+            Expression isNullExpr = Expressions.isNull(eqColumnName);
+            bloomFilter = bloomFilter != null ? Expressions.or(bloomFilter, isNullExpr) : isNullExpr;
+          }
         } else if (deleteKeys != null) {
           bloomFilter = buildMultiColumnBloomFilter(deleteKeys, 10000);
         }
@@ -1637,16 +1660,25 @@ public class ConvertEqualityDeleteFilesSparkAction
 
             if (isSingleLongColumn) {
               Object val = record.get(0);
-              long key = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
-              match = longKeys.contains(key);
+              // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+              if (val == null) {
+                match = longKeys.contains(null);
+              } else {
+                long key = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+                match = longKeys.contains(key);
+              }
             } else if (isSingleStringColumn) {
               Object val = record.get(0);
               String key = val != null ? val.toString() : null;
               match = stringKeys.contains(key);
             } else if (isSingleDecimalColumn) {
               Object val = record.get(0);
-              BigDecimal key = (BigDecimal) val;
-              match = key != null && decimalKeys.contains(key);
+              // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+              if (val == null) {
+                match = decimalKeys.contains(null);
+              } else {
+                match = decimalKeys.contains((BigDecimal) val);
+              }
             } else {
               List<Object> recordKey = Lists.newArrayListWithCapacity(keyColumnCount);
               for (int i = 0; i < keyColumnCount; i++) {
@@ -1697,7 +1729,12 @@ public class ConvertEqualityDeleteFilesSparkAction
         try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
           for (Record record : reader) {
             Object val = record.get(0);
-            keys.add(val instanceof Integer ? ((Integer) val).longValue() : (Long) val);
+            // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+            if (val == null) {
+              keys.add(null);
+            } else {
+              keys.add(val instanceof Integer ? ((Integer) val).longValue() : (Long) val);
+            }
           }
         } catch (IOException e) {
           throw new RuntimeException("Failed to read eq delete file: " + path, e);
@@ -1739,9 +1776,8 @@ public class ConvertEqualityDeleteFilesSparkAction
         try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
           for (Record record : reader) {
             Object val = record.get(0);
-            if (val != null) {
-              keys.add((BigDecimal) val);
-            }
+            // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+            keys.add((BigDecimal) val);  // null is valid and will be added to the set
           }
         } catch (IOException e) {
           throw new RuntimeException("Failed to read eq delete file: " + path, e);
