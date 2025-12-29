@@ -101,6 +101,11 @@ public class SparkActions implements ActionsProvider {
   }
 
   @Override
+  public ConvertEqualityDeleteFilesSparkAction convertEqualityDeletes(Table table) {
+    return new ConvertEqualityDeleteFilesSparkAction(spark, table);
+  }
+
+  @Override
   public ComputeTableStats computeTableStats(Table table) {
     return new ComputeTableStatsSparkAction(spark, table);
   }

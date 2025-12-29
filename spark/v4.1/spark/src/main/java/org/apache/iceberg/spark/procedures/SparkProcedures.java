@@ -65,6 +65,8 @@ public class SparkProcedures {
     mapBuilder.put(ComputeTableStatsProcedure.NAME, ComputeTableStatsProcedure::builder);
     mapBuilder.put(ComputePartitionStatsProcedure.NAME, ComputePartitionStatsProcedure::builder);
     mapBuilder.put(RewriteTablePathProcedure.NAME, RewriteTablePathProcedure::builder);
+    mapBuilder.put("convert_equality_deletes", ConvertEqualityDeleteFilesProcedure::builder);
+    mapBuilder.put("scan_metrics", ScanMetricsProcedure::builder);
     return mapBuilder.build();
   }
 

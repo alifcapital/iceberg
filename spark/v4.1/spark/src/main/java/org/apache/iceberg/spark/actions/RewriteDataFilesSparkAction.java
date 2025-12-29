@@ -28,8 +28,11 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StructLike;
@@ -73,9 +76,10 @@ public class RewriteDataFilesSparkAction
       ImmutableSet.of(
           MAX_CONCURRENT_FILE_GROUP_REWRITES,
           MAX_FILE_GROUP_SIZE_BYTES,
+          MAX_FILE_GROUP_SIZE_NUM,
+          MAX_FILE_GROUP_COUNT,
           PARTIAL_PROGRESS_ENABLED,
           PARTIAL_PROGRESS_MAX_COMMITS,
-          PARTIAL_PROGRESS_MAX_FAILED_COMMITS,
           TARGET_FILE_SIZE_BYTES,
           USE_STARTING_SEQUENCE_NUMBER,
           REWRITE_JOB_ORDER,
@@ -91,7 +95,7 @@ public class RewriteDataFilesSparkAction
   private Expression filter = Expressions.alwaysTrue();
   private int maxConcurrentFileGroupRewrites;
   private int maxCommits;
-  private int maxFailedCommits;
+  private int maxFileGroupCount;
   private boolean partialProgressEnabled;
   private boolean removeDanglingDeletes;
   private boolean useStartingSequenceNumber;
@@ -174,6 +178,15 @@ public class RewriteDataFilesSparkAction
       return EMPTY_RESULT;
     }
 
+    if (maxFileGroupCount < plan.totalGroupCount()) {
+      LOG.info(
+          "Limiting rewrite to {} of {} file groups in {} due to {}",
+          maxFileGroupCount,
+          plan.totalGroupCount(),
+          table.name(),
+          MAX_FILE_GROUP_COUNT);
+    }
+
     Builder resultBuilder =
         partialProgressEnabled
             ? doExecuteWithPartialProgress(plan, commitManager(startingSnapshotId))
@@ -240,8 +253,9 @@ public class RewriteDataFilesSparkAction
 
     ConcurrentLinkedQueue<RewriteFileGroup> rewrittenGroups = Queues.newConcurrentLinkedQueue();
 
+    Iterable<RewriteFileGroup> groupsToRewrite = Iterables.limit(plan.groups(), maxFileGroupCount);
     Tasks.Builder<RewriteFileGroup> rewriteTaskBuilder =
-        Tasks.foreach(plan.groups())
+        Tasks.foreach(groupsToRewrite)
             .executeWith(rewriteService)
             .stopOnFailure()
             .noRetry()
@@ -294,7 +308,10 @@ public class RewriteDataFilesSparkAction
 
     List<FileGroupRewriteResult> rewriteResults =
         rewrittenGroups.stream().map(RewriteFileGroup::asResult).collect(Collectors.toList());
-    return ImmutableRewriteDataFiles.Result.builder().rewriteResults(rewriteResults);
+    long removedPosDeleteRecords = calculateUniquePosDeleteRecordsCount(rewrittenGroups);
+    return ImmutableRewriteDataFiles.Result.builder()
+        .rewriteResults(rewriteResults)
+        .removedPosDeleteRecordsCount(removedPosDeleteRecords);
   }
 
   private Builder doExecuteWithPartialProgress(
@@ -303,63 +320,77 @@ public class RewriteDataFilesSparkAction
     ExecutorService rewriteService = rewriteService();
 
     // start commit service
-    int groupsPerCommit = IntMath.divide(plan.totalGroupCount(), maxCommits, RoundingMode.CEILING);
+    int effectiveGroupCount = Math.min(plan.totalGroupCount(), maxFileGroupCount);
+    int groupsPerCommit = IntMath.divide(effectiveGroupCount, maxCommits, RoundingMode.CEILING);
     RewriteDataFilesCommitManager.CommitService commitService =
         commitManager.service(groupsPerCommit);
     commitService.start();
 
     Collection<FileGroupFailureResult> rewriteFailures = new ConcurrentLinkedQueue<>();
+
+    Iterable<RewriteFileGroup> groupsToRewrite = Iterables.limit(plan.groups(), maxFileGroupCount);
+    Tasks.Builder<RewriteFileGroup> rewriteTaskBuilder =
+        Tasks.foreach(groupsToRewrite)
+            .executeWith(rewriteService)
+            .stopOnFailure()
+            .noRetry()
+            .onFailure(
+                (fileGroup, exception) -> {
+                  LOG.warn(
+                      "Failure during rewrite process for group {}", fileGroup.info(), exception);
+                  rewriteFailures.add(
+                      ImmutableRewriteDataFiles.FileGroupFailureResult.builder()
+                          .info(fileGroup.info())
+                          .dataFilesCount(fileGroup.inputFileNum())
+                          .build());
+                });
+
     // start rewrite tasks
-    Tasks.foreach(plan.groups())
-        .suppressFailureWhenFinished()
-        .executeWith(rewriteService)
-        .noRetry()
-        .onFailure(
-            (fileGroup, exception) -> {
-              LOG.error("Failure during rewrite group {}", fileGroup.info(), exception);
-              rewriteFailures.add(
-                  ImmutableRewriteDataFiles.FileGroupFailureResult.builder()
-                      .info(fileGroup.info())
-                      .dataFilesCount(fileGroup.inputFileNum())
-                      .build());
-            })
-        .run(fileGroup -> commitService.offer(rewriteFiles(plan, fileGroup)));
-    rewriteService.shutdown();
-
-    // stop commit service
-    commitService.close();
-
-    int totalCommits = Math.min(plan.totalGroupCount(), maxCommits);
-    int failedCommits = totalCommits - commitService.succeededCommits();
-    if (failedCommits > 0 && failedCommits <= maxFailedCommits) {
-      LOG.warn(
-          "{} is true but {} rewrite commits failed. Check the logs to determine why the individual "
-              + "commits failed. If this is persistent it may help to increase {} which will split the rewrite operation "
-              + "into smaller commits.",
-          PARTIAL_PROGRESS_ENABLED,
-          failedCommits,
-          PARTIAL_PROGRESS_MAX_COMMITS);
-    } else if (failedCommits > maxFailedCommits) {
-      String errorMessage =
-          String.format(
-              Locale.ROOT,
-              "%s is true but %d rewrite commits failed. This is more than the maximum allowed failures of %d. "
-                  + "Check the logs to determine why the individual commits failed. If this is persistent it may help to "
-                  + "increase %s which will split the rewrite operation into smaller commits.",
-              PARTIAL_PROGRESS_ENABLED,
-              failedCommits,
-              maxFailedCommits,
-              PARTIAL_PROGRESS_MAX_COMMITS);
-      throw new RuntimeException(errorMessage);
+    try {
+      rewriteTaskBuilder.run(fileGroup -> commitService.offer(rewriteFiles(plan, fileGroup)));
+    } catch (ValidationException e) {
+      // Some commit failed, lets abort future work
+      LOG.error(
+          "Cannot commit rewrite because of a ValidationException. This usually means that "
+              + "this rewrite has conflicted with another concurrent Iceberg operation.");
+      List<Runnable> tasks = rewriteService.shutdownNow();
+      tasks.forEach(
+          task -> {
+            if (task instanceof Future) {
+              ((Future<?>) task).cancel(true);
+            }
+          });
+    } finally {
+      rewriteService.shutdown();
+      commitService.close();
     }
 
+    List<RewriteFileGroup> committedGroups = commitService.results();
+    long removedPosDeleteRecords = calculateUniquePosDeleteRecordsCount(committedGroups);
     return ImmutableRewriteDataFiles.Result.builder()
-        .rewriteResults(toRewriteResults(commitService.results()))
-        .rewriteFailures(rewriteFailures);
+        .rewriteResults(toRewriteResults(committedGroups))
+        .rewriteFailures(rewriteFailures)
+        .removedPosDeleteRecordsCount(removedPosDeleteRecords);
   }
 
   private Iterable<FileGroupRewriteResult> toRewriteResults(List<RewriteFileGroup> commitResults) {
     return commitResults.stream().map(RewriteFileGroup::asResult).collect(Collectors.toList());
+  }
+
+  private long calculateUniquePosDeleteRecordsCount(Iterable<RewriteFileGroup> groups) {
+    Set<String> seenPaths = Sets.newHashSet();
+    Set<DeleteFile> uniquePosDeletes = Sets.newHashSet();
+    for (RewriteFileGroup group : groups) {
+      for (FileScanTask task : group.fileScanTasks()) {
+        for (DeleteFile deleteFile : task.deletes()) {
+          if (deleteFile.content() == FileContent.POSITION_DELETES
+              && seenPaths.add(deleteFile.path().toString())) {
+            uniquePosDeletes.add(deleteFile);
+          }
+        }
+      }
+    }
+    return uniquePosDeletes.stream().mapToLong(DeleteFile::recordCount).sum();
   }
 
   void validateAndInitOptions() {
@@ -385,12 +416,12 @@ public class RewriteDataFilesSparkAction
             MAX_CONCURRENT_FILE_GROUP_REWRITES,
             MAX_CONCURRENT_FILE_GROUP_REWRITES_DEFAULT);
 
+    maxFileGroupCount =
+        PropertyUtil.propertyAsInt(options(), MAX_FILE_GROUP_COUNT, MAX_FILE_GROUP_COUNT_DEFAULT);
+
     maxCommits =
         PropertyUtil.propertyAsInt(
             options(), PARTIAL_PROGRESS_MAX_COMMITS, PARTIAL_PROGRESS_MAX_COMMITS_DEFAULT);
-
-    maxFailedCommits =
-        PropertyUtil.propertyAsInt(options(), PARTIAL_PROGRESS_MAX_FAILED_COMMITS, maxCommits);
 
     partialProgressEnabled =
         PropertyUtil.propertyAsBoolean(
@@ -411,6 +442,12 @@ public class RewriteDataFilesSparkAction
         maxConcurrentFileGroupRewrites);
 
     Preconditions.checkArgument(
+        maxFileGroupCount >= 1,
+        "Cannot set %s to %s, the value must be positive.",
+        MAX_FILE_GROUP_COUNT,
+        maxFileGroupCount);
+
+    Preconditions.checkArgument(
         !partialProgressEnabled || maxCommits > 0,
         "Cannot set %s to %s, the value must be positive when %s is true",
         PARTIAL_PROGRESS_MAX_COMMITS,
@@ -425,8 +462,9 @@ public class RewriteDataFilesSparkAction
     if (partition.size() > 0) {
       return String.format(
           Locale.ROOT,
-          "Rewriting %d files (%s, file group %d/%d, %s (%d/%d)) in %s",
+          "Rewriting %d files with %d delete files (%s, file group %d/%d, %s (%d/%d)) in %s",
           group.rewrittenFiles().size(),
+          group.numDeletes(),
           runner.description(),
           group.info().globalIndex(),
           plan.totalGroupCount(),
@@ -437,8 +475,9 @@ public class RewriteDataFilesSparkAction
     } else {
       return String.format(
           Locale.ROOT,
-          "Rewriting %d files (%s, file group %d/%d) in %s",
+          "Rewriting %d files with %d delete files (%s, file group %d/%d) in %s",
           group.rewrittenFiles().size(),
+          group.numDeletes(),
           runner.description(),
           group.info().globalIndex(),
           plan.totalGroupCount(),

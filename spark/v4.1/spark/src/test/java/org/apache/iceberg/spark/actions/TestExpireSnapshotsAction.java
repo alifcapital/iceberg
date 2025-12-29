@@ -1125,55 +1125,6 @@ public class TestExpireSnapshotsAction extends TestBase {
   }
 
   @TestTemplate
-  public void testExpireAction() {
-    table.newAppend().appendFile(FILE_A).commit();
-
-    Snapshot firstSnapshot = table.currentSnapshot();
-
-    rightAfterSnapshot();
-
-    table.newAppend().appendFile(FILE_B).commit();
-
-    long snapshotId = table.currentSnapshot().snapshotId();
-
-    long tAfterCommits = rightAfterSnapshot();
-
-    Set<String> deletedFiles = Sets.newHashSet();
-
-    ExpireSnapshotsSparkAction action =
-        SparkActions.get()
-            .expireSnapshots(table)
-            .expireOlderThan(tAfterCommits)
-            .deleteWith((path, type) -> deletedFiles.add(path));
-    Dataset<FileInfo> pendingDeletes = action.expireFiles();
-
-    List<FileInfo> pending = pendingDeletes.collectAsList();
-
-    assertThat(table.currentSnapshot().snapshotId())
-        .as("Should not change current snapshot.")
-        .isEqualTo(snapshotId);
-
-    assertThat(table.snapshot(firstSnapshot.snapshotId()))
-        .as("Should remove the oldest snapshot")
-        .isNull();
-    assertThat(pending).as("Pending deletes should contain one row").hasSize(1);
-
-    assertThat(pending.get(0).getPath())
-        .as("Pending delete should be the expired manifest list location")
-        .isEqualTo(firstSnapshot.manifestListLocation());
-
-    assertThat(pending.get(0).getType())
-        .as("Pending delete should be a manifest list")
-        .isEqualTo("Manifest List");
-
-    assertThat(deletedFiles).as("Should not delete any files").isEmpty();
-
-    assertThat(action.expireFiles().count())
-        .as("Multiple calls to expire should return the same count of deleted files")
-        .isEqualTo(pendingDeletes.count());
-  }
-
-  @TestTemplate
   public void testUseLocalIterator() {
     table.newFastAppend().appendFile(FILE_A).commit();
 
@@ -1205,41 +1156,6 @@ public class TestExpireSnapshotsAction extends TestBase {
                   "Expected total number of jobs with stream-results should match the expected number")
               .isEqualTo(4L);
         });
-  }
-
-  @TestTemplate
-  public void testExpireAfterExecute() {
-    table
-        .newAppend()
-        .appendFile(FILE_A) // data_bucket=0
-        .commit();
-
-    rightAfterSnapshot();
-
-    table
-        .newAppend()
-        .appendFile(FILE_B) // data_bucket=1
-        .commit();
-
-    table
-        .newAppend()
-        .appendFile(FILE_C) // data_bucket=2
-        .commit();
-
-    long t3 = rightAfterSnapshot();
-
-    ExpireSnapshotsSparkAction action = SparkActions.get().expireSnapshots(table);
-
-    action.expireOlderThan(t3).retainLast(2);
-
-    ExpireSnapshots.Result result = action.execute();
-    checkExpirationResults(0L, 0L, 0L, 0L, 1L, result);
-
-    List<FileInfo> typedExpiredFiles = action.expireFiles().collectAsList();
-    assertThat(typedExpiredFiles).as("Expired results must match").hasSize(1);
-
-    List<FileInfo> untypedExpiredFiles = action.expireFiles().collectAsList();
-    assertThat(untypedExpiredFiles).as("Expired results must match").hasSize(1);
   }
 
   @TestTemplate

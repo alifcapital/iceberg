@@ -115,8 +115,9 @@ class SparkRewritePositionDeleteRunner
     Column joinCond = posDeletes.col("file_path").equalTo(dataFiles.col("file_path"));
     Dataset<Row> validDeletes = posDeletes.join(dataFiles, joinCond, "leftsemi");
 
-    // write the packed deletes into new files where each split becomes a new file
+    // write the packed deletes into new files, one per referenced data file
     validDeletes
+        .repartition(col("file_path"))
         .sortWithinPartitions("file_path", "pos")
         .write()
         .format("iceberg")
