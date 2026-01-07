@@ -119,7 +119,8 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
     this.hadoopConf = spark.sessionState().newHadoopConf();
     this.table = table;
     this.location = table.location();
-    this.usePrefixListing = false;
+    // Auto-detect: use FileIO prefix listing if supported (e.g. S3), otherwise use Hadoop
+    this.usePrefixListing = table.io() instanceof SupportsPrefixOperations;
     // Create executor for parallel manifest reading based on available processors
     int parallelism = Math.max(1, Runtime.getRuntime().availableProcessors());
     this.planExecutorService = Executors.newFixedThreadPool(parallelism);
