@@ -21,13 +21,19 @@ package org.apache.iceberg.spark.actions;
 import java.io.File;
 import java.io.IOException;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.math.BigDecimal;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import org.apache.spark.api.java.JavaFutureAction;
 import org.apache.iceberg.CombinedScanTask;
@@ -1487,6 +1493,12 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     private static final Logger LOG = LoggerFactory.getLogger(ProcessPartitionFunction.class);
 
+    /** Minimum number of eq delete files to use parallel reading. */
+    private static final int MIN_FILES_FOR_PARALLEL_READ = 3;
+
+    /** Maximum number of threads for parallel eq delete file reading. */
+    private static final int MAX_PARALLEL_READ_THREADS = 16;
+
     private final Broadcast<Table> tableBroadcast;
     private final Broadcast<List<String>> eqDeletePathsBroadcast;
     private final Schema deleteSchema;
@@ -1720,96 +1732,219 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     /** Read equality delete keys as Long directly (no intermediate List allocation). */
     private Set<Long> readEqDeleteLongKeysOnExecutor(Table table, List<String> eqDeletePaths) {
-      Set<Long> keys = Sets.newHashSet();
-
-      for (String path : eqDeletePaths) {
-        InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
-        FileFormat format = FileFormat.fromFileName(path);
-
-        try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
-          for (Record record : reader) {
-            Object val = record.get(0);
-            // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
-            if (val == null) {
-              keys.add(null);
-            } else {
-              keys.add(val instanceof Integer ? ((Integer) val).longValue() : (Long) val);
-            }
-          }
-        } catch (IOException e) {
-          throw new RuntimeException("Failed to read eq delete file: " + path, e);
+      if (eqDeletePaths.size() < MIN_FILES_FOR_PARALLEL_READ) {
+        // Sequential read for small number of files
+        Set<Long> keys = new HashSet<>();
+        for (String path : eqDeletePaths) {
+          readLongKeysFromFile(table, path, keys);
         }
+        return keys;
       }
 
-      return keys;
+      // Parallel read for multiple files
+      int threads = Math.min(eqDeletePaths.size(), MAX_PARALLEL_READ_THREADS);
+      ExecutorService executor = Executors.newFixedThreadPool(threads);
+      try {
+        List<Future<Set<Long>>> futures = new ArrayList<>(eqDeletePaths.size());
+        for (String path : eqDeletePaths) {
+          futures.add(executor.submit(() -> {
+            Set<Long> localKeys = new HashSet<>();
+            readLongKeysFromFile(table, path, localKeys);
+            return localKeys;
+          }));
+        }
+
+        Set<Long> keys = new HashSet<>();
+        for (Future<Set<Long>> future : futures) {
+          keys.addAll(future.get());
+        }
+        return keys;
+      } catch (ExecutionException e) {
+        throw new RuntimeException("Failed to read eq delete files", e.getCause());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("Interrupted while reading eq delete files", e);
+      } finally {
+        executor.shutdownNow();
+      }
+    }
+
+    private void readLongKeysFromFile(Table table, String path, Set<Long> keys) {
+      InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
+      FileFormat format = FileFormat.fromFileName(path);
+
+      try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
+        for (Record record : reader) {
+          Object val = record.get(0);
+          // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+          if (val == null) {
+            keys.add(null);
+          } else {
+            keys.add(val instanceof Integer ? ((Integer) val).longValue() : (Long) val);
+          }
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to read eq delete file: " + path, e);
+      }
     }
 
     /** Read equality delete keys as String directly (no intermediate List allocation). */
     private Set<String> readEqDeleteStringKeysOnExecutor(Table table, List<String> eqDeletePaths) {
-      Set<String> keys = Sets.newHashSet();
-
-      for (String path : eqDeletePaths) {
-        InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
-        FileFormat format = FileFormat.fromFileName(path);
-
-        try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
-          for (Record record : reader) {
-            Object val = record.get(0);
-            keys.add(val != null ? val.toString() : null);
-          }
-        } catch (IOException e) {
-          throw new RuntimeException("Failed to read eq delete file: " + path, e);
+      if (eqDeletePaths.size() < MIN_FILES_FOR_PARALLEL_READ) {
+        Set<String> keys = new HashSet<>();
+        for (String path : eqDeletePaths) {
+          readStringKeysFromFile(table, path, keys);
         }
+        return keys;
       }
 
-      return keys;
+      int threads = Math.min(eqDeletePaths.size(), MAX_PARALLEL_READ_THREADS);
+      ExecutorService executor = Executors.newFixedThreadPool(threads);
+      try {
+        List<Future<Set<String>>> futures = new ArrayList<>(eqDeletePaths.size());
+        for (String path : eqDeletePaths) {
+          futures.add(executor.submit(() -> {
+            Set<String> localKeys = new HashSet<>();
+            readStringKeysFromFile(table, path, localKeys);
+            return localKeys;
+          }));
+        }
+
+        Set<String> keys = new HashSet<>();
+        for (Future<Set<String>> future : futures) {
+          keys.addAll(future.get());
+        }
+        return keys;
+      } catch (ExecutionException e) {
+        throw new RuntimeException("Failed to read eq delete files", e.getCause());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("Interrupted while reading eq delete files", e);
+      } finally {
+        executor.shutdownNow();
+      }
+    }
+
+    private void readStringKeysFromFile(Table table, String path, Set<String> keys) {
+      InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
+      FileFormat format = FileFormat.fromFileName(path);
+
+      try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
+        for (Record record : reader) {
+          Object val = record.get(0);
+          keys.add(val != null ? val.toString() : null);
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to read eq delete file: " + path, e);
+      }
     }
 
     /** Read equality delete keys as BigDecimal directly (no intermediate List allocation). */
     private Set<BigDecimal> readEqDeleteDecimalKeysOnExecutor(Table table, List<String> eqDeletePaths) {
-      Set<BigDecimal> keys = Sets.newHashSet();
-
-      for (String path : eqDeletePaths) {
-        InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
-        FileFormat format = FileFormat.fromFileName(path);
-
-        try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
-          for (Record record : reader) {
-            Object val = record.get(0);
-            // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
-            keys.add((BigDecimal) val);  // null is valid and will be added to the set
-          }
-        } catch (IOException e) {
-          throw new RuntimeException("Failed to read eq delete file: " + path, e);
+      if (eqDeletePaths.size() < MIN_FILES_FOR_PARALLEL_READ) {
+        Set<BigDecimal> keys = new HashSet<>();
+        for (String path : eqDeletePaths) {
+          readDecimalKeysFromFile(table, path, keys);
         }
+        return keys;
       }
 
-      return keys;
+      int threads = Math.min(eqDeletePaths.size(), MAX_PARALLEL_READ_THREADS);
+      ExecutorService executor = Executors.newFixedThreadPool(threads);
+      try {
+        List<Future<Set<BigDecimal>>> futures = new ArrayList<>(eqDeletePaths.size());
+        for (String path : eqDeletePaths) {
+          futures.add(executor.submit(() -> {
+            Set<BigDecimal> localKeys = new HashSet<>();
+            readDecimalKeysFromFile(table, path, localKeys);
+            return localKeys;
+          }));
+        }
+
+        Set<BigDecimal> keys = new HashSet<>();
+        for (Future<Set<BigDecimal>> future : futures) {
+          keys.addAll(future.get());
+        }
+        return keys;
+      } catch (ExecutionException e) {
+        throw new RuntimeException("Failed to read eq delete files", e.getCause());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("Interrupted while reading eq delete files", e);
+      } finally {
+        executor.shutdownNow();
+      }
+    }
+
+    private void readDecimalKeysFromFile(Table table, String path, Set<BigDecimal> keys) {
+      InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
+      FileFormat format = FileFormat.fromFileName(path);
+
+      try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
+        for (Record record : reader) {
+          Object val = record.get(0);
+          // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+          keys.add((BigDecimal) val);  // null is valid and will be added to the set
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to read eq delete file: " + path, e);
+      }
     }
 
     /** Read equality delete keys for multi-column keys. */
     private Set<List<Object>> readEqDeleteKeysOnExecutor(Table table, List<String> eqDeletePaths) {
-      Set<List<Object>> keys = Sets.newHashSet();
       int keyColumnCount = deleteSchema.columns().size();
 
-      for (String path : eqDeletePaths) {
-        InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
-        FileFormat format = FileFormat.fromFileName(path);
-
-        try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
-          for (Record record : reader) {
-            List<Object> keyValues = Lists.newArrayListWithCapacity(keyColumnCount);
-            for (int i = 0; i < keyColumnCount; i++) {
-              keyValues.add(record.get(i));
-            }
-            keys.add(keyValues);
-          }
-        } catch (IOException e) {
-          throw new RuntimeException("Failed to read eq delete file: " + path, e);
+      if (eqDeletePaths.size() < MIN_FILES_FOR_PARALLEL_READ) {
+        Set<List<Object>> keys = new HashSet<>();
+        for (String path : eqDeletePaths) {
+          readMultiColumnKeysFromFile(table, path, keys, keyColumnCount);
         }
+        return keys;
       }
 
-      return keys;
+      int threads = Math.min(eqDeletePaths.size(), MAX_PARALLEL_READ_THREADS);
+      ExecutorService executor = Executors.newFixedThreadPool(threads);
+      try {
+        List<Future<Set<List<Object>>>> futures = new ArrayList<>(eqDeletePaths.size());
+        for (String path : eqDeletePaths) {
+          futures.add(executor.submit(() -> {
+            Set<List<Object>> localKeys = new HashSet<>();
+            readMultiColumnKeysFromFile(table, path, localKeys, keyColumnCount);
+            return localKeys;
+          }));
+        }
+
+        Set<List<Object>> keys = new HashSet<>();
+        for (Future<Set<List<Object>>> future : futures) {
+          keys.addAll(future.get());
+        }
+        return keys;
+      } catch (ExecutionException e) {
+        throw new RuntimeException("Failed to read eq delete files", e.getCause());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("Interrupted while reading eq delete files", e);
+      } finally {
+        executor.shutdownNow();
+      }
+    }
+
+    private void readMultiColumnKeysFromFile(Table table, String path, Set<List<Object>> keys, int keyColumnCount) {
+      InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
+      FileFormat format = FileFormat.fromFileName(path);
+
+      try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
+        for (Record record : reader) {
+          List<Object> keyValues = Lists.newArrayListWithCapacity(keyColumnCount);
+          for (int i = 0; i < keyColumnCount; i++) {
+            keyValues.add(record.get(i));
+          }
+          keys.add(keyValues);
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to read eq delete file: " + path, e);
+      }
     }
 
     /** Build bloom filter expression for multi-column keys. */
