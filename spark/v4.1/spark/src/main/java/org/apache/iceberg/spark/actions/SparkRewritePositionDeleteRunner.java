@@ -23,6 +23,7 @@ import static org.apache.spark.sql.functions.col;
 import static org.apache.spark.sql.functions.lit;
 
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -101,13 +102,19 @@ class SparkRewritePositionDeleteRunner
     StructLike partition = deleteFile.partition();
 
     // read the deletes packing them into splits of the required size
+    // FILE_OPEN_COST = 4MB to account for S3 latency (~50ms) when reading many small files
+    // Limit read split size to ensure parallelism: aim for ~16 files per task max
+    long fileOpenCost = 4 * 1024 * 1024L;
+    int numFiles = group.rewrittenDeleteFiles().size();
+    long maxReadSplitSize = Math.max(fileOpenCost, (long) numFiles * fileOpenCost / 32);
+    long readSplitSize = Math.min(group.inputSplitSize(), maxReadSplitSize);
     Dataset<Row> posDeletes =
         spark()
             .read()
             .format("iceberg")
             .option(SparkReadOptions.SCAN_TASK_SET_ID, groupId)
-            .option(SparkReadOptions.SPLIT_SIZE, group.inputSplitSize())
-            .option(SparkReadOptions.FILE_OPEN_COST, "0")
+            .option(SparkReadOptions.SPLIT_SIZE, readSplitSize)
+            .option(SparkReadOptions.FILE_OPEN_COST, fileOpenCost)
             .load(groupId);
 
     // keep only valid position deletes
@@ -115,9 +122,20 @@ class SparkRewritePositionDeleteRunner
     Column joinCond = posDeletes.col("file_path").equalTo(dataFiles.col("file_path"));
     Dataset<Row> validDeletes = posDeletes.join(dataFiles, joinCond, "leftsemi");
 
+    // count unique referenced data files from delete file metadata
+    int numReferencedDataFiles =
+        (int) group.rewrittenDeleteFiles().stream()
+            .map(DeleteFile::referencedDataFile)
+            .filter(Objects::nonNull)
+            .distinct()
+            .count();
+
     // write the packed deletes into new files, one per referenced data file
-    validDeletes
-        .repartition(col("file_path"))
+    Dataset<Row> repartitioned =
+        numReferencedDataFiles > 0
+            ? validDeletes.repartition(numReferencedDataFiles, col("file_path"))
+            : validDeletes.repartition(col("file_path"));
+    repartitioned
         .sortWithinPartitions("file_path", "pos")
         .write()
         .format("iceberg")

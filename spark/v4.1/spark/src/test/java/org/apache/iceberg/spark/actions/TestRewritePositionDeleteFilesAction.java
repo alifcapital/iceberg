@@ -173,8 +173,8 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
             .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
             .execute();
 
-    int expectedDeleteFilesCount = deleteGranularity == DeleteGranularity.FILE ? 2 : 1;
-    assertThat(result.addedDeleteFilesCount()).isEqualTo(expectedDeleteFilesCount);
+    // Always FILE granularity: one delete file per data file
+    assertThat(result.addedDeleteFilesCount()).isEqualTo(2);
   }
 
   @TestTemplate
@@ -198,7 +198,8 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
             .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
             .execute();
     List<DeleteFile> newDeleteFiles = deleteFiles(table);
-    assertThat(newDeleteFiles).as("New delete files").hasSize(1);
+    // 2 data files → 2 delete files (one per data file, FILE granularity)
+    assertThat(newDeleteFiles).as("New delete files").hasSize(2);
     assertLocallySorted(newDeleteFiles);
     assertNotContains(deleteFiles, newDeleteFiles);
     checkResult(result, deleteFiles, newDeleteFiles, 1);
@@ -334,7 +335,8 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
             .option(SizeBasedFileRewritePlanner.TARGET_FILE_SIZE_BYTES, String.valueOf(avgSize / 2))
             .execute();
     List<DeleteFile> newDeleteFiles = deleteFiles(table);
-    assertThat(newDeleteFiles).as("New delete files").hasSize(8);
+    // 4 partitions × 1 delete file per data file = 4 output files (merged from 8 input)
+    assertThat(newDeleteFiles).as("New delete files").hasSize(4);
     assertNotContains(deleteFiles, newDeleteFiles);
     assertLocallySorted(newDeleteFiles);
     checkResult(result, deleteFiles, newDeleteFiles, 4);
@@ -623,7 +625,8 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
         Stream.concat(unpartitionedDeleteFiles.stream(), partitionedDeleteFiles.stream())
             .collect(Collectors.toList());
     List<DeleteFile> newDeleteFiles = deleteFiles(table);
-    assertThat(newDeleteFiles).as("New delete files").hasSize(3);
+    // 4 data files → 4 delete files (FILE granularity)
+    assertThat(newDeleteFiles).as("New delete files").hasSize(4);
     assertNotContains(rewrittenDeleteFiles, newDeleteFiles);
     assertLocallySorted(newDeleteFiles);
     checkResult(result, rewrittenDeleteFiles, newDeleteFiles, 3);
@@ -670,7 +673,8 @@ public class TestRewritePositionDeleteFilesAction extends CatalogTestBase {
             .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
             .execute();
     List<DeleteFile> newDeleteFiles = deleteFiles(table);
-    assertThat(newDeleteFiles).as("New delete files").hasSize(3);
+    // 4 data files → 4 delete files (FILE granularity)
+    assertThat(newDeleteFiles).as("New delete files").hasSize(4);
     assertNotContains(expectedRewritten, newDeleteFiles);
     assertLocallySorted(newDeleteFiles);
     checkResult(result, expectedRewritten, newDeleteFiles, 3);
