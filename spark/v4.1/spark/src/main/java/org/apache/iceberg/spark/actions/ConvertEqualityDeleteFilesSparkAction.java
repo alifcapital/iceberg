@@ -853,6 +853,11 @@ public class ConvertEqualityDeleteFilesSparkAction
               totalAddedPosDeleteFiles,
               commitCount);
 
+          // If no commits succeeded, propagate the error so caller can rescan
+          if (commitCount == 0) {
+            throw e;
+          }
+
           return ImmutableConvertEqualityDeleteFiles.Result.builder()
               .convertedEqualityDeleteFilesCount(committedEqDeleteFiles.size())
               .addedPositionDeleteFilesCount(totalAddedPosDeleteFiles)
@@ -920,6 +925,11 @@ public class ConvertEqualityDeleteFilesSparkAction
             committedEqDeleteFiles.size(),
             totalAddedPosDeleteFiles,
             commitCount);
+
+        // If no commits succeeded, propagate the error so caller can rescan
+        if (commitCount == 0) {
+          throw e;
+        }
 
         return ImmutableConvertEqualityDeleteFiles.Result.builder()
             .convertedEqualityDeleteFilesCount(committedEqDeleteFiles.size())

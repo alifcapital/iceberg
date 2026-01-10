@@ -313,6 +313,10 @@ public class RewritePositionDeleteFilesSparkAction
               ((Future<?>) task).cancel(true);
             }
           });
+      // If no commits succeeded, propagate the error so caller can rescan
+      if (commitService.succeededCommits() == 0) {
+        throw e;
+      }
     } finally {
       rewriteService.shutdown();
       commitService.close();
