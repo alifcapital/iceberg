@@ -1142,12 +1142,13 @@ public class ConvertEqualityDeleteFilesSparkAction
             groupIndex,
             operationId));
 
-    // Set job description and submit async
-    spark().sparkContext().setJobDescription(
-        String.format("ConvertEqDeletes: %s group=%d data_files=%d eq_deletes=%d",
-            table.name(), groupIndex, dataFileInfos.size(), eqDeleteFilePaths.size()));
+    // Set job group and description, then submit async
+    String desc = String.format("ConvertEqDeletes: %s group=%d data_files=%d eq_deletes=%d",
+        table.name(), groupIndex, dataFileInfos.size(), eqDeleteFilePaths.size());
 
-    JavaFutureAction<List<DeleteFileInfo>> future = deleteFileInfosRDD.collectAsync();
+    JavaFutureAction<List<DeleteFileInfo>> future = withJobGroupInfo(
+        newJobGroupInfo("CONVERT-EQ-DELETES", desc),
+        () -> deleteFileInfosRDD.collectAsync());
 
     return new PendingConversionJob(
         groupIndex, eqDeleteGroup, dataFileTasks, dataFileInfos.size(), totalDataFileSize, future,
