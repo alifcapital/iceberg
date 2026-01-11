@@ -105,6 +105,7 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
   private final Map<String, String> extraSnapshotMetadata;
   private final boolean useFanoutWriter;
   private final SparkWriteRequirements writeRequirements;
+  private final org.apache.iceberg.SortOrder icebergOrdering;
   private final Map<String, String> writeProperties;
 
   private boolean cleanupOnAbort = false;
@@ -133,6 +134,7 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
     this.extraSnapshotMetadata = writeConf.extraSnapshotMetadata();
     this.useFanoutWriter = writeConf.useFanoutWriter(writeRequirements);
     this.writeRequirements = writeRequirements;
+    this.icebergOrdering = writeRequirements.icebergOrdering();
     this.outputSpecId = writeConf.outputSpecId();
     this.writeProperties = writeConf.writeProperties();
   }
@@ -205,6 +207,7 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
         writeSchema,
         dsSchema,
         useFanoutWriter,
+        icebergOrdering,
         writeProperties);
   }
 
@@ -674,6 +677,7 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
     private final StructType dsSchema;
     private final boolean useFanoutWriter;
     private final String queryId;
+    private final org.apache.iceberg.SortOrder icebergSortOrder;
     private final Map<String, String> writeProperties;
 
     protected WriterFactory(
@@ -685,6 +689,7 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
         Schema writeSchema,
         StructType dsSchema,
         boolean useFanoutWriter,
+        org.apache.iceberg.SortOrder icebergSortOrder,
         Map<String, String> writeProperties) {
       this.tableBroadcast = tableBroadcast;
       this.format = format;
@@ -694,6 +699,7 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
       this.dsSchema = dsSchema;
       this.useFanoutWriter = useFanoutWriter;
       this.queryId = queryId;
+      this.icebergSortOrder = icebergSortOrder;
       this.writeProperties = writeProperties;
     }
 
@@ -718,6 +724,7 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
               .dataFileFormat(format)
               .dataSchema(writeSchema)
               .dataSparkType(dsSchema)
+              .dataSortOrder(icebergSortOrder)
               .writeProperties(writeProperties)
               .build();
 

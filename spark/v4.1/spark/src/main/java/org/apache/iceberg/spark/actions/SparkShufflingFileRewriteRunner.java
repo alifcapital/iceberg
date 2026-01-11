@@ -133,6 +133,13 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
             .option(SparkWriteOptions.USE_TABLE_DISTRIBUTION_AND_ORDERING, "false")
             .option(SparkWriteOptions.OUTPUT_SPEC_ID, fileGroup.outputSpecId());
 
+    // Try to find matching sort order in table to set sort_order_id in data files
+    org.apache.iceberg.SortOrder matchingTableSortOrder =
+        SortOrderUtil.maybeFindTableSortOrder(table(), sortOrder());
+    if (matchingTableSortOrder.isSorted()) {
+      writer.option(SparkWriteOptions.OUTPUT_SORT_ORDER_ID, matchingTableSortOrder.orderId());
+    }
+
     if (rowGroupSizeBytes != null) {
       writer.option(SparkWriteOptions.TARGET_ROW_GROUP_SIZE_BYTES, rowGroupSizeBytes);
     }

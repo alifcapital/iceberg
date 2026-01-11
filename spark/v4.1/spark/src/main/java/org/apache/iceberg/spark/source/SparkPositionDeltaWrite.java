@@ -427,6 +427,7 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
               .dataFileFormat(context.dataFileFormat())
               .dataSchema(context.dataSchema())
               .dataSparkType(context.dataSparkType())
+              .dataSortOrder(context.icebergOrdering())
               .deleteFileFormat(context.deleteFileFormat())
               .positionDeleteSparkType(context.deleteSparkType())
               .writeProperties(writeProperties)
@@ -840,6 +841,7 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
     private final String queryId;
     private final boolean useFanoutWriter;
     private final boolean inputOrdered;
+    private final org.apache.iceberg.SortOrder icebergOrdering;
 
     Context(
         Schema dataSchema,
@@ -865,6 +867,7 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
       this.queryId = info.queryId();
       this.useFanoutWriter = writeConf.useFanoutWriter(writeRequirements);
       this.inputOrdered = writeRequirements.hasOrdering();
+      this.icebergOrdering = writeRequirements.icebergOrdering();
     }
 
     Schema dataSchema() {
@@ -912,6 +915,10 @@ class SparkPositionDeltaWrite implements DeltaWrite, RequiresDistributionAndOrde
 
     boolean inputOrdered() {
       return inputOrdered;
+    }
+
+    org.apache.iceberg.SortOrder icebergOrdering() {
+      return icebergOrdering;
     }
 
     boolean useDVs() {
