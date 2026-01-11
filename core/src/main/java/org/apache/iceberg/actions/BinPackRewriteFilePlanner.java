@@ -287,6 +287,11 @@ public class BinPackRewriteFilePlanner
     return task.deletes() != null && task.deletes().size() >= deleteFileThreshold;
   }
 
+  /** Override to include column stats in scan. Default is false. */
+  protected boolean shouldIncludeColumnStats() {
+    return false;
+  }
+
   private boolean tooHighDeleteRatio(FileScanTask task) {
     if (task.deletes() == null || task.deletes().isEmpty()) {
       return false;
@@ -306,6 +311,10 @@ public class BinPackRewriteFilePlanner
   private StructLikeMap<List<List<FileScanTask>>> planFileGroups() {
     TableScan scan =
         table().newScan().filter(filter).caseSensitive(caseSensitive).ignoreResiduals();
+
+    if (shouldIncludeColumnStats()) {
+      scan = scan.includeColumnStats();
+    }
 
     if (snapshotId != null) {
       scan = scan.useSnapshot(snapshotId);
