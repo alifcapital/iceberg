@@ -55,8 +55,5 @@ public interface ConvertEqualityDeleteFiles
 
     /** Returns the total count of data records in files that were processed. */
     long dataRecordsTotal();
-
-    /** Returns the count of files where merge join early termination was used. */
-    long filesWithEarlyTermination();
   }
 }

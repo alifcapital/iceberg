@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
@@ -532,9 +533,6 @@ public class TestConvertEqualityDeleteFilesAction extends TestBase {
     assertThat(result.convertedEqualityDeleteFilesCount()).isEqualTo(1);
     assertThat(result.addedDeleteRecordsCount()).isEqualTo(3);
 
-    // Verify early termination was used
-    assertThat(result.filesWithEarlyTermination()).isEqualTo(1);
-
     // Verify that we scanned significantly fewer records than total due to early termination
     // With delete keys 1, 5, 10 on sorted file, we should stop around id=10
     // dataRecordsScanned should be much less than dataRecordsTotal (1000)
@@ -825,6 +823,183 @@ public class TestConvertEqualityDeleteFilesAction extends TestBase {
       Record deleteRecord = GenericRecord.create(eqDeleteRowSchema);
       deleteRecord.setField("id", null);
       writer.write(deleteRecord);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+
+    table.newRowDelta().addDeletes(eqDeleteWriter.toDeleteFile()).commit();
+  }
+
+  @TestTemplate
+  public void testRowGroupLevelMergeJoinWithSkipAndEarlyTermination() throws Exception {
+    // Test row group level merge join optimization using pre-generated parquet files
+    // with deterministic row group structure:
+    //   File1: RG1 (ids 1-10), RG2 (ids 11-20)
+    //   File2: RG3 (ids 21-30), RG4 (ids 31-40)
+    //
+    // Delete keys: 5, 15, 35
+    //   - RG1 (1-10): scan 1-5 (match id=5), exit when key=15 > max=10. 5 records.
+    //   - RG2 (11-20): scan 11-15 (match id=15), exit when key=35 > max=20. 5 records.
+    //   - RG3 (21-30): SKIP (key=35 > max=30). 0 records.
+    //   - RG4 (31-40): scan 31-35 (match id=35), exit when deletePtr exhausted. 5 records.
+    // Expected: 5 + 5 + 0 + 5 = 15 records scanned (vs 40 total)
+
+    Schema longIdSchema =
+        new Schema(
+            optional(1, "id", Types.LongType.get()),
+            optional(2, "data", Types.StringType.get()));
+
+    SortOrder sortOrder = SortOrder.builderFor(longIdSchema).asc("id").build();
+    Table table =
+        TABLES.create(
+            longIdSchema,
+            PartitionSpec.unpartitioned(),
+            sortOrder,
+            ImmutableMap.of(
+                TableProperties.FORMAT_VERSION, String.valueOf(formatVersion),
+                TableProperties.DEFAULT_FILE_FORMAT, "parquet"),
+            tableLocation);
+
+    // Copy pre-generated parquet files with deterministic row group structure
+    File dataDir = new File(tableDir, "data");
+    dataDir.mkdirs();
+
+    java.net.URL file1Url = getClass().getResource("/rowgroup-test/test_file1.parquet");
+    java.net.URL file2Url = getClass().getResource("/rowgroup-test/test_file2.parquet");
+    assertThat(file1Url).as("test_file1.parquet resource").isNotNull();
+    assertThat(file2Url).as("test_file2.parquet resource").isNotNull();
+
+    File file1 = new File(dataDir, "test_file1.parquet");
+    File file2 = new File(dataDir, "test_file2.parquet");
+    java.nio.file.Files.copy(java.nio.file.Paths.get(file1Url.toURI()), file1.toPath());
+    java.nio.file.Files.copy(java.nio.file.Paths.get(file2Url.toURI()), file2.toPath());
+
+    // Register files in table with proper metadata
+    DataFile dataFile1 =
+        DataFiles.builder(PartitionSpec.unpartitioned())
+            .withPath(file1.toURI().toString())
+            .withFileSizeInBytes(file1.length())
+            .withRecordCount(20)
+            .withFormat(FileFormat.PARQUET)
+            .withSortOrder(table.sortOrder())
+            .build();
+
+    DataFile dataFile2 =
+        DataFiles.builder(PartitionSpec.unpartitioned())
+            .withPath(file2.toURI().toString())
+            .withFileSizeInBytes(file2.length())
+            .withRecordCount(20)
+            .withFormat(FileFormat.PARQUET)
+            .withSortOrder(table.sortOrder())
+            .build();
+
+    table.newAppend().appendFile(dataFile1).appendFile(dataFile2).commit();
+    table.refresh();
+
+    // Verify we have 2 data files
+    List<DataFile> dataFiles = TestHelpers.dataFiles(table);
+    assertThat(dataFiles).hasSize(2);
+
+    // Write equality delete for ids: 5, 15, 35
+    // - id=5 is in RG1 (1-10)
+    // - id=15 is in RG2 (11-20)
+    // - id=35 is in RG4 (31-40)
+    // - RG3 (21-30) has no matching delete keys and should be skipped
+    writeEqualityDeleteLong(table, Lists.newArrayList(5L, 15L, 35L));
+
+    table.refresh();
+
+    // Read data BEFORE conversion
+    List<Row> dataBefore = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataBefore).hasSize(37); // 40 - 3 deleted
+
+    // Verify deleted IDs are not present before conversion
+    List<Long> idsBefore =
+        dataBefore.stream().map(r -> r.getLong(0)).sorted().collect(Collectors.toList());
+    assertThat(idsBefore).doesNotContain(5L, 15L, 35L);
+
+    // Convert equality deletes to position deletes
+    ConvertEqualityDeleteFiles.Result result =
+        SparkActions.get().convertEqualityDeletes(table).execute();
+
+    // Verify conversion happened
+    assertThat(result.convertedEqualityDeleteFilesCount()).isEqualTo(1);
+    assertThat(result.addedPositionDeleteFilesCount()).isGreaterThan(0);
+    assertThat(result.addedDeleteRecordsCount()).isEqualTo(3); // 3 position deletes
+
+    // KEY ASSERTION: Row group skip and early termination should reduce records scanned
+    // Expected scan pattern with row groups of 10 records each:
+    //   RG1 (1-10): scan 1-6 (match id=5, read 6 to trigger exit). 6 records.
+    //   RG2 (11-20): scan 11-16 (match id=15, read 16 to trigger exit). 6 records.
+    //   RG3 (21-30): SKIP (key=35 > max=30). 0 records.
+    //   RG4 (31-40): scan 31-36 (match id=35, read 36 to trigger exit). 6 records.
+    // Expected: 6 + 6 + 0 + 6 = 18 records scanned (vs 40 total)
+    assertThat(result.dataRecordsTotal()).isEqualTo(40);
+    assertThat(result.dataRecordsScanned()).isEqualTo(18);
+
+    table.refresh();
+
+    // CRITICAL: Read data AFTER conversion - verify correctness
+    List<Row> dataAfter = spark.read().format("iceberg").load(tableLocation).collectAsList();
+
+    // Data count must match before conversion
+    assertThat(dataAfter).hasSize(dataBefore.size());
+
+    // Verify the SAME IDs are deleted (position deletes are correct)
+    List<Long> idsAfter =
+        dataAfter.stream().map(r -> r.getLong(0)).sorted().collect(Collectors.toList());
+    assertThat(idsAfter).doesNotContain(5L, 15L, 35L);
+
+    // Verify all expected IDs are present
+    assertThat(idsAfter).containsExactlyElementsOf(idsBefore);
+
+    // Verify no equality deletes remain
+    List<DeleteFile> eqDeletesAfter =
+        TestHelpers.deleteFiles(table).stream()
+            .filter(f -> f.content() == FileContent.EQUALITY_DELETES)
+            .collect(Collectors.toList());
+    assertThat(eqDeletesAfter).isEmpty();
+
+    // Verify position deletes were created
+    List<DeleteFile> posDeletesAfter =
+        TestHelpers.deleteFiles(table).stream()
+            .filter(f -> f.content() == FileContent.POSITION_DELETES)
+            .collect(Collectors.toList());
+    assertThat(posDeletesAfter).isNotEmpty();
+  }
+
+  private void writeEqualityDeleteLong(Table table, List<Long> idsToDelete) {
+    table.refresh();
+    List<Integer> equalityFieldIds = Lists.newArrayList(table.schema().findField("id").fieldId());
+    Schema eqDeleteRowSchema = table.schema().select("id");
+
+    OutputFileFactory fileFactory =
+        OutputFileFactory.builderFor(table, 1, System.nanoTime())
+            .format(FileFormat.PARQUET)
+            .build();
+
+    GenericAppenderFactory appenderFactory =
+        new GenericAppenderFactory(
+            table.schema(),
+            table.spec(),
+            ArrayUtil.toIntArray(equalityFieldIds),
+            eqDeleteRowSchema,
+            null);
+
+    OutputFile outputFile = fileFactory.newOutputFile().encryptingOutputFile();
+
+    EqualityDeleteWriter<Record> eqDeleteWriter =
+        appenderFactory.newEqDeleteWriter(
+            EncryptedFiles.encryptedOutput(outputFile, EncryptionKeyMetadata.EMPTY),
+            FileFormat.PARQUET,
+            null);
+
+    try (EqualityDeleteWriter<Record> writer = eqDeleteWriter) {
+      for (Long id : idsToDelete) {
+        Record deleteRecord =
+            GenericRecord.create(eqDeleteRowSchema).copy(ImmutableMap.of("id", id));
+        writer.write(deleteRecord);
+      }
     } catch (Exception e) {
       throw new RuntimeException(e);
     }

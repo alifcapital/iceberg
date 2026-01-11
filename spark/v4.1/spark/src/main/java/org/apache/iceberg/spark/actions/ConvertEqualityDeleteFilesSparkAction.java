@@ -22,6 +22,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -79,6 +80,14 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
+import org.apache.iceberg.parquet.ParquetSchemaUtil;
+import org.apache.iceberg.parquet.ParquetValueReader;
+import org.apache.parquet.ParquetReadOptions;
+import org.apache.parquet.column.page.PageReadStore;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.metadata.BlockMetaData;
+import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
+import org.apache.parquet.schema.MessageType;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -205,7 +214,6 @@ public class ConvertEqualityDeleteFilesSparkAction
           .addedDeleteRecordsCount(0L)
           .dataRecordsScanned(0L)
           .dataRecordsTotal(0L)
-          .filesWithEarlyTermination(0L)
           .build();
 
   private final Table table;
@@ -368,7 +376,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     long totalAddedRecords = 0;
     long totalDataRecordsScanned = 0;
     long totalDataRecordsTotal = 0;
-    long totalFilesWithEarlyTermination = 0;
 
     LOG.info(
         "{} table={} total_groups={} pipeline_depth={} processing with async pipeline",
@@ -442,7 +449,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       LOG.info(
           "{} table={} group={} total_ms={} eq_read_ms={} data_read_ms={} pos_write_ms={} "
               + "data_files={} data_bytes_total={} data_bytes_read={} files_skipped={} "
-              + "data_records_scanned={} data_records_total={} files_early_term={} "
+              + "data_records_scanned={} data_records_total={} "
               + "eq_delete_records={} pos_delete_files={} pos_delete_records={}",
           LOG_PREFIX,
           table.name(),
@@ -457,7 +464,6 @@ public class ConvertEqualityDeleteFilesSparkAction
           job.filesSkipped.value(),
           job.dataRecordsScanned.value(),
           job.dataRecordsTotal.value(),
-          job.filesWithEarlyTermination.value(),
           eqDeleteRecordsCount,
           deleteFileInfos.size(),
           posDeleteRecordsCount);
@@ -479,7 +485,6 @@ public class ConvertEqualityDeleteFilesSparkAction
       totalAddedRecords += posDeleteRecordsCount;
       totalDataRecordsScanned += job.dataRecordsScanned.value();
       totalDataRecordsTotal += job.dataRecordsTotal.value();
-      totalFilesWithEarlyTermination += job.filesWithEarlyTermination.value();
     }
 
     // Calculate unique rewritten records from converted eq delete files
@@ -544,7 +549,6 @@ public class ConvertEqualityDeleteFilesSparkAction
         .addedDeleteRecordsCount(totalAddedRecords)
         .dataRecordsScanned(totalDataRecordsScanned)
         .dataRecordsTotal(totalDataRecordsTotal)
-        .filesWithEarlyTermination(totalFilesWithEarlyTermination)
         .build();
   }
 
@@ -566,7 +570,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     final org.apache.spark.util.LongAccumulator dataFileBytesRead;
     final org.apache.spark.util.LongAccumulator dataRecordsScanned;
     final org.apache.spark.util.LongAccumulator dataRecordsTotal;
-    final org.apache.spark.util.LongAccumulator filesWithEarlyTermination;
 
     PendingConversionJob(
         int groupIndex,
@@ -583,8 +586,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         org.apache.spark.util.LongAccumulator filesSkipped,
         org.apache.spark.util.LongAccumulator dataFileBytesRead,
         org.apache.spark.util.LongAccumulator dataRecordsScanned,
-        org.apache.spark.util.LongAccumulator dataRecordsTotal,
-        org.apache.spark.util.LongAccumulator filesWithEarlyTermination) {
+        org.apache.spark.util.LongAccumulator dataRecordsTotal) {
       this.groupIndex = groupIndex;
       this.eqDeleteGroup = eqDeleteGroup;
       this.dataFileTasks = dataFileTasks;
@@ -601,7 +603,6 @@ public class ConvertEqualityDeleteFilesSparkAction
       this.dataFileBytesRead = dataFileBytesRead;
       this.dataRecordsScanned = dataRecordsScanned;
       this.dataRecordsTotal = dataRecordsTotal;
-      this.filesWithEarlyTermination = filesWithEarlyTermination;
     }
 
     long dataFilesSize() {
@@ -660,7 +661,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     int commitCount = 0;
     long totalDataRecordsScanned = 0;
     long totalDataRecordsTotal = 0;
-    long totalFilesWithEarlyTermination = 0;
 
     // Track bytes read and groups processed since last commit for commit threshold
     long bytesReadSinceLastCommit = 0;
@@ -736,7 +736,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       LOG.info(
           "{} table={} group={} total_ms={} eq_read_ms={} data_read_ms={} pos_write_ms={} "
               + "data_files={} data_bytes_total={} data_bytes_read={} files_skipped={} "
-              + "data_records_scanned={} data_records_total={} files_early_term={} "
+              + "data_records_scanned={} data_records_total={} "
               + "eq_delete_records={} pos_delete_files={} pos_delete_records={}",
           LOG_PREFIX,
           table.name(),
@@ -751,7 +751,6 @@ public class ConvertEqualityDeleteFilesSparkAction
           job.filesSkipped.value(),
           job.dataRecordsScanned.value(),
           job.dataRecordsTotal.value(),
-          job.filesWithEarlyTermination.value(),
           eqDeleteRecordsCount,
           deleteFileInfos.size(),
           posDeleteRecordsCount);
@@ -782,7 +781,6 @@ public class ConvertEqualityDeleteFilesSparkAction
       totalAddedRecords += conversionResult.posDeleteRecordsCount;
       totalDataRecordsScanned += job.dataRecordsScanned.value();
       totalDataRecordsTotal += job.dataRecordsTotal.value();
-      totalFilesWithEarlyTermination += job.filesWithEarlyTermination.value();
 
       // Track bytes read and groups processed since last commit
       bytesReadSinceLastCommit += job.dataFilesSize();
@@ -903,8 +901,7 @@ public class ConvertEqualityDeleteFilesSparkAction
               .addedDeleteRecordsCount(totalAddedRecords)
               .dataRecordsScanned(totalDataRecordsScanned)
               .dataRecordsTotal(totalDataRecordsTotal)
-              .filesWithEarlyTermination(totalFilesWithEarlyTermination)
-              .build();
+                            .build();
         }
       }
     }
@@ -979,8 +976,7 @@ public class ConvertEqualityDeleteFilesSparkAction
             .addedDeleteRecordsCount(totalAddedRecords)
             .dataRecordsScanned(totalDataRecordsScanned)
             .dataRecordsTotal(totalDataRecordsTotal)
-            .filesWithEarlyTermination(totalFilesWithEarlyTermination)
-            .build();
+                        .build();
       }
     }
 
@@ -1004,8 +1000,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         .addedDeleteRecordsCount(totalAddedRecords)
         .dataRecordsScanned(totalDataRecordsScanned)
         .dataRecordsTotal(totalDataRecordsTotal)
-        .filesWithEarlyTermination(totalFilesWithEarlyTermination)
-        .build();
+                .build();
   }
 
   private void cleanUpFiles(Set<DeleteFile> files) {
@@ -1109,7 +1104,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       return new PendingConversionJob(
           groupIndex, eqDeleteGroup, dataFileTasks, 0, 0L, emptyFuture,
           zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc,
-          zeroAcc, zeroAcc, zeroAcc);
+          zeroAcc, zeroAcc);
     }
 
     Table serializableTable = SerializableTableWithSize.copyOf(table);
@@ -1132,7 +1127,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     org.apache.spark.util.LongAccumulator dataFileBytesRead = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator dataRecordsScanned = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator dataRecordsTotal = new org.apache.spark.util.LongAccumulator();
-    org.apache.spark.util.LongAccumulator filesWithEarlyTermination = new org.apache.spark.util.LongAccumulator();
     spark().sparkContext().register(eqDeleteRecordsRead, "ConvertEqDeletes.eqDeleteRecordsRead.g" + groupIndex);
     spark().sparkContext().register(eqDeleteReadTimeMs, "ConvertEqDeletes.eqDeleteReadTimeMs.g" + groupIndex);
     spark().sparkContext().register(dataFileReadTimeMs, "ConvertEqDeletes.dataFileReadTimeMs.g" + groupIndex);
@@ -1143,7 +1137,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     spark().sparkContext().register(dataFileBytesRead, "ConvertEqDeletes.dataFileBytesRead.g" + groupIndex);
     spark().sparkContext().register(dataRecordsScanned, "ConvertEqDeletes.dataRecordsScanned.g" + groupIndex);
     spark().sparkContext().register(dataRecordsTotal, "ConvertEqDeletes.dataRecordsTotal.g" + groupIndex);
-    spark().sparkContext().register(filesWithEarlyTermination, "ConvertEqDeletes.filesWithEarlyTermination.g" + groupIndex);
 
     // Initialize accumulators with 0 so they appear in Spark UI even if not updated
     eqDeleteRecordsRead.add(0);
@@ -1156,7 +1149,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     dataFileBytesRead.add(0);
     dataRecordsScanned.add(0);
     dataRecordsTotal.add(0);
-    filesWithEarlyTermination.add(0);
 
     // Distribute data files evenly by size (greedy bin packing)
     int numPartitions = Math.max(1, Math.min(dataFileInfos.size(),
@@ -1208,7 +1200,6 @@ public class ConvertEqualityDeleteFilesSparkAction
             dataFileBytesRead,
             dataRecordsScanned,
             dataRecordsTotal,
-            filesWithEarlyTermination,
             cacheMountPath,
             cacheS3Prefix,
             groupIndex,
@@ -1226,7 +1217,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         groupIndex, eqDeleteGroup, dataFileTasks, dataFileInfos.size(), totalDataFileSize, future,
         eqDeleteRecordsRead, eqDeleteReadTimeMs, dataFileReadTimeMs, posDeleteWriteTimeMs,
         posDeleteRecordsWritten, filesSkipped, dataFileBytesRead,
-        dataRecordsScanned, dataRecordsTotal, filesWithEarlyTermination);
+        dataRecordsScanned, dataRecordsTotal);
   }
 
   /** Convert serializable DeleteFileInfo from executors to DeleteFile for commit. */
@@ -1599,7 +1590,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     private final org.apache.spark.util.LongAccumulator dataFileBytesRead;
     private final org.apache.spark.util.LongAccumulator dataRecordsScanned;
     private final org.apache.spark.util.LongAccumulator dataRecordsTotal;
-    private final org.apache.spark.util.LongAccumulator filesWithEarlyTermination;
     private final String cacheMountPath;
     private final String cacheS3Prefix;
     private final int groupIndex;
@@ -1620,7 +1610,6 @@ public class ConvertEqualityDeleteFilesSparkAction
         org.apache.spark.util.LongAccumulator dataFileBytesRead,
         org.apache.spark.util.LongAccumulator dataRecordsScanned,
         org.apache.spark.util.LongAccumulator dataRecordsTotal,
-        org.apache.spark.util.LongAccumulator filesWithEarlyTermination,
         String cacheMountPath,
         String cacheS3Prefix,
         int groupIndex,
@@ -1639,7 +1628,6 @@ public class ConvertEqualityDeleteFilesSparkAction
       this.dataFileBytesRead = dataFileBytesRead;
       this.dataRecordsScanned = dataRecordsScanned;
       this.dataRecordsTotal = dataRecordsTotal;
-      this.filesWithEarlyTermination = filesWithEarlyTermination;
       this.cacheMountPath = cacheMountPath;
       this.cacheS3Prefix = cacheS3Prefix;
       this.groupIndex = groupIndex;
@@ -1793,8 +1781,37 @@ public class ConvertEqualityDeleteFilesSparkAction
         long recordsScannedInFile = 0;
         boolean earlyTerminationUsed = false;
         long dataReadStart = System.currentTimeMillis();
-        try (CloseableIterable<Record> reader =
-            openDataFileForRead(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
+
+        // Use row-group level merge join for Parquet files with Long column
+        // This allows skipping row groups where delete keys don't overlap
+        boolean useRowGroupMergeJoin = useMergeJoin
+            && isSingleLongColumn
+            && sortedLongKeys != null
+            && fileInfo.format() == FileFormat.PARQUET;
+
+        if (useRowGroupMergeJoin) {
+          try {
+            LOG.info("Using ROW-GROUP merge join for file={}, sortedLongKeys.size={}",
+                fileInfo.path(), sortedLongKeys.size());
+            MergeJoinResult result = mergeJoinWithRowGroups(
+                inputFile, projectionSchema, sortedLongKeys,
+                eqDeleteFieldId, eqColumnName, fileInfo.path());
+            matches.addAll(result.matches);
+            recordsScannedInFile = result.recordsScanned;
+            earlyTerminationUsed = result.earlyTerminationUsed;
+            anyRowsRead = result.recordsScanned > 0 || result.rowGroupsProcessed > 0;
+            LOG.info("Row-group merge join DONE: file={}, rgProcessed={}, rgSkipped={}, recordsScanned={}, matches={}, earlyTerm={}",
+                fileInfo.path(), result.rowGroupsProcessed, result.rowGroupsSkipped,
+                result.recordsScanned, result.matches.size(), result.earlyTerminationUsed);
+          } catch (IOException e) {
+            throw new RuntimeException("Failed to perform row-group merge join on " + fileInfo.path(), e);
+          }
+        } else {
+          // Standard reader path
+          LOG.info("Using STANDARD path for file={}, useMergeJoin={}, isSingleLongColumn={}, sortedLongKeys!=null={}, format={}",
+              fileInfo.path(), useMergeJoin, isSingleLongColumn, sortedLongKeys != null, fileInfo.format());
+          try (CloseableIterable<Record> reader =
+              openDataFileForRead(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
 
           if (useMergeJoin) {
             // Merge join: data file is sorted by eq delete column ASC
@@ -1933,14 +1950,12 @@ public class ConvertEqualityDeleteFilesSparkAction
             }
           }
         }
+        } // end else (standard reader path)
         dataFileReadTimeMs.add(System.currentTimeMillis() - dataReadStart);
 
         // Update data records metrics
         dataRecordsTotal.add(fileInfo.recordCount());
         dataRecordsScanned.add(recordsScannedInFile);
-        if (earlyTerminationUsed) {
-          filesWithEarlyTermination.add(1);
-        }
 
         if (!anyRowsRead) {
           // File was skipped by bloom filter (no rows read at all)
@@ -2296,6 +2311,314 @@ public class ConvertEqualityDeleteFilesSparkAction
       return firstField.sourceId() == eqDeleteFieldId
           && firstField.direction() == SortDirection.ASC
           && firstField.transform().isIdentity();
+    }
+
+    /** Result of merge join with row group level processing. */
+    private static class MergeJoinResult {
+      final List<PositionDelete<Record>> matches;
+      final long recordsScanned;
+      final int rowGroupsSkipped;
+      final int rowGroupsProcessed;
+      final boolean earlyTerminationUsed;
+
+      MergeJoinResult(
+          List<PositionDelete<Record>> matches,
+          long recordsScanned,
+          int rowGroupsSkipped,
+          int rowGroupsProcessed,
+          boolean earlyTerminationUsed) {
+        this.matches = matches;
+        this.recordsScanned = recordsScanned;
+        this.rowGroupsSkipped = rowGroupsSkipped;
+        this.rowGroupsProcessed = rowGroupsProcessed;
+        this.earlyTerminationUsed = earlyTerminationUsed;
+      }
+    }
+
+    /**
+     * Perform merge join with row group level control.
+     * This method reads Parquet files at the row group level, allowing:
+     * 1. Skipping row groups with no overlap with delete keys
+     * 2. Early termination when delete keys exceed row group upper bound
+     * 3. Binary search for initial delete pointer position
+     */
+    @SuppressWarnings("unchecked")
+    private static MergeJoinResult mergeJoinWithRowGroups(
+        InputFile inputFile,
+        Schema projectionSchema,
+        List<Long> sortedDeleteKeys,
+        int eqDeleteFieldId,
+        String eqColumnName,
+        String dataFilePath) throws IOException {
+
+      List<PositionDelete<Record>> matches = Lists.newArrayList();
+      long recordsScanned = 0;
+      int rowGroupsSkipped = 0;
+      int rowGroupsProcessed = 0;
+      boolean earlyTerminationUsed = false;
+
+      if (sortedDeleteKeys.isEmpty()) {
+        return new MergeJoinResult(matches, 0, 0, 0, false);
+      }
+
+      long minDeleteKey = sortedDeleteKeys.get(0);
+      long maxDeleteKey = sortedDeleteKeys.get(sortedDeleteKeys.size() - 1);
+
+      // Build schema without ROW_POSITION since we track position manually
+      List<Types.NestedField> readFields = Lists.newArrayList();
+      for (Types.NestedField field : projectionSchema.columns()) {
+        if (field.fieldId() != MetadataColumns.ROW_POSITION.fieldId()) {
+          readFields.add(field);
+        }
+      }
+      Schema readSchema = new Schema(readFields);
+
+      // Open low-level Parquet reader
+      ParquetReadOptions options = ParquetReadOptions.builder().build();
+      org.apache.parquet.io.InputFile parquetInputFile = new org.apache.parquet.io.InputFile() {
+        @Override
+        public long getLength() throws IOException {
+          return inputFile.getLength();
+        }
+        @Override
+        public org.apache.parquet.io.SeekableInputStream newStream() throws IOException {
+          org.apache.iceberg.io.SeekableInputStream stream = inputFile.newStream();
+          return new org.apache.parquet.io.DelegatingSeekableInputStream(stream) {
+            @Override
+            public long getPos() throws IOException {
+              return stream.getPos();
+            }
+            @Override
+            public void seek(long newPos) throws IOException {
+              stream.seek(newPos);
+            }
+          };
+        }
+      };
+
+      try (ParquetFileReader reader = ParquetFileReader.open(parquetInputFile, options)) {
+        MessageType fileSchema = reader.getFileMetaData().getSchema();
+        List<BlockMetaData> rowGroups = reader.getRowGroups();
+
+        // Create Iceberg reader for records (without ROW_POSITION)
+        ParquetValueReader<Record> model = (ParquetValueReader<Record>)
+            GenericParquetReaders.buildReader(readSchema, fileSchema);
+
+        int deletePtr = 0;  // Shared across row groups for efficiency
+        long rowPosition = 0;  // Track row position manually
+
+        for (int rgIdx = 0; rgIdx < rowGroups.size(); rgIdx++) {
+          BlockMetaData rowGroup = rowGroups.get(rgIdx);
+          long rgRowCount = rowGroup.getRowCount();
+
+          // Get row group bounds for eq delete column
+          ColumnChunkMetaData colMeta = null;
+          for (ColumnChunkMetaData col : rowGroup.getColumns()) {
+            if (col.getPath().toDotString().equals(eqColumnName)) {
+              colMeta = col;
+              break;
+            }
+          }
+
+          // Check if we have valid statistics for this row group
+          org.apache.parquet.column.statistics.Statistics<?> stats =
+              (colMeta != null) ? colMeta.getStatistics() : null;
+          boolean hasValidStats = stats != null && stats.hasNonNullValue();
+
+          if (!hasValidStats) {
+            // No stats, must read this row group
+            PageReadStore pages = reader.readNextRowGroup();
+            model.setPageSource(pages);
+            rowGroupsProcessed++;
+
+            for (long i = 0; i < rgRowCount; i++) {
+              Record record = model.read(null);
+              if (record == null) {
+                rowPosition++;
+                continue;
+              }
+              recordsScanned++;
+              Object val = record.get(0);
+              if (val == null) {
+                rowPosition++;
+                continue;
+              }
+
+              long dataKey = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+
+              while (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < dataKey) {
+                deletePtr++;
+              }
+
+              if (deletePtr >= sortedDeleteKeys.size()) {
+                earlyTerminationUsed = true;
+                rowPosition++;
+                break;
+              }
+
+              if (sortedDeleteKeys.get(deletePtr).equals(dataKey)) {
+                PositionDelete<Record> posDelete = PositionDelete.create();
+                posDelete.set(dataFilePath, rowPosition, null);
+                matches.add(posDelete);
+              }
+              rowPosition++;
+            }
+
+            if (earlyTerminationUsed) break;
+            continue;
+          }
+
+          // Get row group bounds (stats is guaranteed non-null here due to hasValidStats check)
+          // But genericGetMin/Max can still return null even when hasNonNullValue() is true
+          Object minObj = stats.genericGetMin();
+          Object maxObj = stats.genericGetMax();
+          if (minObj == null || maxObj == null || !(minObj instanceof Number) || !(maxObj instanceof Number)) {
+            // Statistics type doesn't match expected numeric type, read row group without optimization
+            PageReadStore pages = reader.readNextRowGroup();
+            model.setPageSource(pages);
+            rowGroupsProcessed++;
+            for (long i = 0; i < rgRowCount; i++) {
+              Record record = model.read(null);
+              if (record == null) {
+                rowPosition++;
+                continue;
+              }
+              recordsScanned++;
+              Object val = record.get(0);
+              if (val == null) {
+                rowPosition++;
+                continue;
+              }
+              long dataKey = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+              while (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < dataKey) {
+                deletePtr++;
+              }
+              if (deletePtr >= sortedDeleteKeys.size()) {
+                earlyTerminationUsed = true;
+                rowPosition++;
+                break;
+              }
+              if (sortedDeleteKeys.get(deletePtr).equals(dataKey)) {
+                PositionDelete<Record> posDelete = PositionDelete.create();
+                posDelete.set(dataFilePath, rowPosition, null);
+                matches.add(posDelete);
+              }
+              rowPosition++;
+            }
+            if (earlyTerminationUsed) break;
+            continue;
+          }
+          long rgMin = ((Number) minObj).longValue();
+          long rgMax = ((Number) maxObj).longValue();
+
+          // Skip row group if all delete keys < row group min (and we're done)
+          if (maxDeleteKey < rgMin) {
+            reader.skipNextRowGroup();
+            rowGroupsSkipped++;
+            rowPosition += rgRowCount;
+            earlyTerminationUsed = true;
+            break;
+          }
+
+          // Skip row group if all delete keys > row group max
+          if (minDeleteKey > rgMax) {
+            reader.skipNextRowGroup();
+            rowGroupsSkipped++;
+            rowPosition += rgRowCount;
+            continue;
+          }
+
+          // Check if current delete pointer is already past this row group
+          if (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) > rgMax) {
+            reader.skipNextRowGroup();
+            rowGroupsSkipped++;
+            rowPosition += rgRowCount;
+            continue;
+          }
+
+          // Binary search to find starting deletePtr for this row group
+          if (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < rgMin) {
+            int searchResult = Collections.binarySearch(sortedDeleteKeys, rgMin);
+            if (searchResult < 0) {
+              deletePtr = -(searchResult + 1);
+            } else {
+              deletePtr = searchResult;
+            }
+          }
+
+          // Check again after binary search
+          if (deletePtr >= sortedDeleteKeys.size()) {
+            reader.skipNextRowGroup();
+            rowGroupsSkipped++;
+            rowPosition += rgRowCount;
+            earlyTerminationUsed = true;
+            break;
+          }
+
+          if (sortedDeleteKeys.get(deletePtr) > rgMax) {
+            reader.skipNextRowGroup();
+            rowGroupsSkipped++;
+            rowPosition += rgRowCount;
+            continue;
+          }
+
+          // Read row group
+          PageReadStore pages = reader.readNextRowGroup();
+          model.setPageSource(pages);
+          rowGroupsProcessed++;
+
+          for (long i = 0; i < rgRowCount; i++) {
+            Record record = model.read(null);
+            if (record == null) {
+              rowPosition++;
+              continue;
+            }
+            recordsScanned++;
+            Object val = record.get(0);
+            if (val == null) {
+              rowPosition++;
+              continue;
+            }
+
+            long dataKey = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+
+            // Move delete pointer while deleteKey < dataKey
+            while (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < dataKey) {
+              deletePtr++;
+            }
+
+            // Early termination if all delete keys exhausted
+            if (deletePtr >= sortedDeleteKeys.size()) {
+              earlyTerminationUsed = true;
+              rowPosition++;
+              break;
+            }
+
+            // Early termination if current delete key > row group max
+            if (sortedDeleteKeys.get(deletePtr) > rgMax) {
+              // Skip remaining rows in this row group
+              rowPosition += (rgRowCount - i);
+              // If this is the last row group, mark as file-level early termination
+              if (rgIdx == rowGroups.size() - 1) {
+                earlyTerminationUsed = true;
+              }
+              break;
+            }
+
+            // Match: deleteKey == dataKey
+            if (sortedDeleteKeys.get(deletePtr).equals(dataKey)) {
+              PositionDelete<Record> posDelete = PositionDelete.create();
+              posDelete.set(dataFilePath, rowPosition, null);
+              matches.add(posDelete);
+            }
+            rowPosition++;
+          }
+
+          if (earlyTerminationUsed) break;
+        }
+      }
+
+      return new MergeJoinResult(matches, recordsScanned, rowGroupsSkipped, rowGroupsProcessed, earlyTerminationUsed);
     }
   }
 
