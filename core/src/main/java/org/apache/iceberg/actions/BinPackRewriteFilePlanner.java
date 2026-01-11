@@ -199,10 +199,10 @@ public class BinPackRewriteFilePlanner
         groups,
         group ->
             enoughInputFiles(group)
-                || enoughContent(group)
-                || tooMuchContent(group)
-                || group.stream().anyMatch(this::tooManyDeletes)
-                || group.stream().anyMatch(this::tooHighDeleteRatio));
+                && (enoughContent(group)
+                    || tooMuchContent(group)
+                    || group.stream().anyMatch(this::tooManyDeletes)
+                    || group.stream().anyMatch(this::tooHighDeleteRatio)));
   }
 
   @Override
