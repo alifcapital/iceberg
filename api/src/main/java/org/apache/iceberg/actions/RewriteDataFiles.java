@@ -211,6 +211,21 @@ public interface RewriteDataFiles
   }
 
   /**
+   * Choose OVERLAP as a strategy for this rewrite operation. This strategy groups files based on
+   * overlapping bounds to minimize data skipping inefficiency. Files are selected for rewrite when
+   * merging and re-sorting them would reduce the overlap cost.
+   *
+   * <p>The columns to check for overlap must be specified via options: either 'columns' (comma
+   * separated list) or 'use-identifier-keys' set to true.
+   *
+   * @return this for method chaining
+   */
+  default RewriteDataFiles overlap() {
+    throw new UnsupportedOperationException(
+        "OVERLAP Rewrite Strategy not implemented for this framework");
+  }
+
+  /**
    * A user provided filter for determining which files will be considered by the rewrite strategy.
    * This will be used in addition to whatever rules the rewrite strategy generates. For example
    * this would be used for providing a restriction to only run rewrite on a specific partition.

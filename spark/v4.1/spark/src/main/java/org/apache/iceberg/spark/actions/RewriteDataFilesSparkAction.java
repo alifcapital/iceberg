@@ -39,7 +39,9 @@ import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.BinPackRewriteFilePlanner;
 import org.apache.iceberg.actions.FileRewritePlan;
+import org.apache.iceberg.actions.FileRewritePlanner;
 import org.apache.iceberg.actions.FileRewriteRunner;
+import org.apache.iceberg.actions.OverlapRewriteFilePlanner;
 import org.apache.iceberg.actions.ImmutableRewriteDataFiles;
 import org.apache.iceberg.actions.ImmutableRewriteDataFiles.Result.Builder;
 import org.apache.iceberg.actions.RewriteDataFiles;
@@ -100,7 +102,7 @@ public class RewriteDataFilesSparkAction
   private boolean removeDanglingDeletes;
   private boolean useStartingSequenceNumber;
   private boolean caseSensitive;
-  private BinPackRewriteFilePlanner planner = null;
+  private FileRewritePlanner<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> planner = null;
   private FileRewriteRunner<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> runner = null;
 
   RewriteDataFilesSparkAction(SparkSession spark, Table table) {
@@ -145,6 +147,13 @@ public class RewriteDataFilesSparkAction
   public RewriteDataFilesSparkAction zOrder(String... columnNames) {
     ensureRunnerNotSet();
     this.runner = new SparkZOrderFileRewriteRunner(spark(), table, Arrays.asList(columnNames));
+    return this;
+  }
+
+  @Override
+  public RewriteDataFilesSparkAction overlap() {
+    ensureRunnerNotSet();
+    this.runner = new SparkOverlapFileRewriteRunner(spark(), table);
     return this;
   }
 
@@ -205,14 +214,21 @@ public class RewriteDataFilesSparkAction
   }
 
   private void init(long startingSnapshotId) {
-    this.planner =
-        runner instanceof SparkShufflingFileRewriteRunner
-            ? new SparkShufflingDataRewritePlanner(table, filter, startingSnapshotId, caseSensitive)
-            : new BinPackRewriteFilePlanner(table, filter, startingSnapshotId, caseSensitive);
-
     // Default to BinPack if no strategy selected
     if (this.runner == null) {
       this.runner = new SparkBinPackFileRewriteRunner(spark(), table);
+    }
+
+    // Select appropriate planner based on runner type
+    if (runner instanceof SparkOverlapFileRewriteRunner) {
+      this.planner =
+          new OverlapRewriteFilePlanner(table, filter, startingSnapshotId, caseSensitive);
+    } else if (runner instanceof SparkShufflingFileRewriteRunner) {
+      this.planner =
+          new SparkShufflingDataRewritePlanner(table, filter, startingSnapshotId, caseSensitive);
+    } else {
+      this.planner =
+          new BinPackRewriteFilePlanner(table, filter, startingSnapshotId, caseSensitive);
     }
 
     validateAndInitOptions();

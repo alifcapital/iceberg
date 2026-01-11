@@ -188,9 +188,15 @@ class RewriteDataFilesProcedure extends BaseProcedure {
         return rewriteDataFiles.sort(buildSortOrder(sortOrderFields, schema));
       }
       return rewriteDataFiles;
+    } else if (strategy.equalsIgnoreCase("overlap")) {
+      if (sortOrderString != null) {
+        throw new IllegalArgumentException(
+            "Cannot specify sort_order with overlap strategy. Use 'columns' option instead.");
+      }
+      return action.overlap();
     } else {
       throw new IllegalArgumentException(
-          "unsupported strategy: " + strategy + ". Only binpack or sort is supported");
+          "unsupported strategy: " + strategy + ". Only binpack, sort, or overlap is supported");
     }
   }
 
