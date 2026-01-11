@@ -18,19 +18,41 @@
  */
 package org.apache.iceberg.spark.actions;
 
+import java.util.Map;
+import java.util.Set;
 import org.apache.iceberg.DistributionMode;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.RewriteFileGroup;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.SparkWriteOptions;
+import org.apache.spark.sql.DataFrameWriter;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 
 class SparkBinPackFileRewriteRunner extends SparkDataFileRewriteRunner {
 
+  public static final String TARGET_ROW_GROUP_SIZE_BYTES = "target-row-group-size-bytes";
+
+  private String rowGroupSizeBytes;
+
   SparkBinPackFileRewriteRunner(SparkSession spark, Table table) {
     super(spark, table);
+  }
+
+  @Override
+  public Set<String> validOptions() {
+    return ImmutableSet.<String>builder()
+        .addAll(super.validOptions())
+        .add(TARGET_ROW_GROUP_SIZE_BYTES)
+        .build();
+  }
+
+  @Override
+  public void init(Map<String, String> options) {
+    super.init(options);
+    this.rowGroupSizeBytes = options.get(TARGET_ROW_GROUP_SIZE_BYTES);
   }
 
   @Override
@@ -51,15 +73,20 @@ class SparkBinPackFileRewriteRunner extends SparkDataFileRewriteRunner {
             .load(groupId);
 
     // write the packed data into new files where each split becomes a new file
-    scanDF
-        .write()
-        .format("iceberg")
-        .option(SparkWriteOptions.REWRITTEN_FILE_SCAN_TASK_SET_ID, groupId)
-        .option(SparkWriteOptions.TARGET_FILE_SIZE_BYTES, group.maxOutputFileSize())
-        .option(SparkWriteOptions.DISTRIBUTION_MODE, distributionMode(group).modeName())
-        .option(SparkWriteOptions.OUTPUT_SPEC_ID, group.outputSpecId())
-        .mode("append")
-        .save(groupId);
+    DataFrameWriter<Row> writer =
+        scanDF
+            .write()
+            .format("iceberg")
+            .option(SparkWriteOptions.REWRITTEN_FILE_SCAN_TASK_SET_ID, groupId)
+            .option(SparkWriteOptions.TARGET_FILE_SIZE_BYTES, group.maxOutputFileSize())
+            .option(SparkWriteOptions.DISTRIBUTION_MODE, distributionMode(group).modeName())
+            .option(SparkWriteOptions.OUTPUT_SPEC_ID, group.outputSpecId());
+
+    if (rowGroupSizeBytes != null) {
+      writer.option(SparkWriteOptions.TARGET_ROW_GROUP_SIZE_BYTES, rowGroupSizeBytes);
+    }
+
+    writer.mode("append").save(groupId);
   }
 
   // invoke a shuffle if the original spec does not match the output spec

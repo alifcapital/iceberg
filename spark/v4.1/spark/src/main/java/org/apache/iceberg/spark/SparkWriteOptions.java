@@ -29,6 +29,9 @@ public class SparkWriteOptions {
   // Overrides this table's write.target-file-size-bytes
   public static final String TARGET_FILE_SIZE_BYTES = "target-file-size-bytes";
 
+  // Overrides this table's write.parquet.row-group-size-bytes
+  public static final String TARGET_ROW_GROUP_SIZE_BYTES = "target-row-group-size-bytes";
+
   // Overrides the default file format for delete files
   public static final String DELETE_FORMAT = "delete-format";
 

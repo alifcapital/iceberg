@@ -67,7 +67,10 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
   public static final int SHUFFLE_PARTITIONS_PER_FILE_DEFAULT = 1;
 
+  public static final String TARGET_ROW_GROUP_SIZE_BYTES = "target-row-group-size-bytes";
+
   private int numShufflePartitionsPerFile;
+  private String rowGroupSizeBytes;
 
   protected SparkShufflingFileRewriteRunner(SparkSession spark, Table table) {
     super(spark, table);
@@ -93,6 +96,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     return ImmutableSet.<String>builder()
         .addAll(super.validOptions())
         .add(SHUFFLE_PARTITIONS_PER_FILE)
+        .add(TARGET_ROW_GROUP_SIZE_BYTES)
         .build();
   }
 
@@ -100,6 +104,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   public void init(Map<String, String> options) {
     super.init(options);
     this.numShufflePartitionsPerFile = numShufflePartitionsPerFile(options);
+    this.rowGroupSizeBytes = options.get(TARGET_ROW_GROUP_SIZE_BYTES);
   }
 
   @Override
@@ -119,15 +124,20 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
                 spec(fileGroup.outputSpecId()),
                 fileGroup.expectedOutputFiles()));
 
-    sortedDF
-        .write()
-        .format("iceberg")
-        .option(SparkWriteOptions.REWRITTEN_FILE_SCAN_TASK_SET_ID, groupId)
-        .option(SparkWriteOptions.TARGET_FILE_SIZE_BYTES, fileGroup.maxOutputFileSize())
-        .option(SparkWriteOptions.USE_TABLE_DISTRIBUTION_AND_ORDERING, "false")
-        .option(SparkWriteOptions.OUTPUT_SPEC_ID, fileGroup.outputSpecId())
-        .mode("append")
-        .save(groupId);
+    org.apache.spark.sql.DataFrameWriter<Row> writer =
+        sortedDF
+            .write()
+            .format("iceberg")
+            .option(SparkWriteOptions.REWRITTEN_FILE_SCAN_TASK_SET_ID, groupId)
+            .option(SparkWriteOptions.TARGET_FILE_SIZE_BYTES, fileGroup.maxOutputFileSize())
+            .option(SparkWriteOptions.USE_TABLE_DISTRIBUTION_AND_ORDERING, "false")
+            .option(SparkWriteOptions.OUTPUT_SPEC_ID, fileGroup.outputSpecId());
+
+    if (rowGroupSizeBytes != null) {
+      writer.option(SparkWriteOptions.TARGET_ROW_GROUP_SIZE_BYTES, rowGroupSizeBytes);
+    }
+
+    writer.mode("append").save(groupId);
   }
 
   private Function<Dataset<Row>, Dataset<Row>> sortFunction(

@@ -509,6 +509,10 @@ public class SparkWriteConf {
         if (parquetCompressionLevel != null) {
           writeProperties.put(PARQUET_COMPRESSION_LEVEL, parquetCompressionLevel);
         }
+        String parquetRowGroupSize = parquetRowGroupSizeBytes();
+        if (parquetRowGroupSize != null) {
+          writeProperties.put(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, parquetRowGroupSize);
+        }
         break;
 
       case AVRO:
@@ -591,6 +595,14 @@ public class SparkWriteConf {
         .sessionConf(SparkSQLProperties.COMPRESSION_LEVEL)
         .tableProperty(TableProperties.PARQUET_COMPRESSION_LEVEL)
         .defaultValue(TableProperties.PARQUET_COMPRESSION_LEVEL_DEFAULT)
+        .parseOptional();
+  }
+
+  private String parquetRowGroupSizeBytes() {
+    return confParser
+        .stringConf()
+        .option(SparkWriteOptions.TARGET_ROW_GROUP_SIZE_BYTES)
+        .tableProperty(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES)
         .parseOptional();
   }
 
