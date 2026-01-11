@@ -91,6 +91,14 @@ public class BinPackRewriteFilePlanner
    */
   public static final String MAX_FILES_TO_REWRITE = "max-files-to-rewrite";
 
+  /**
+   * If set to true, skip rewriting if the table has identifier keys. This is useful when running
+   * bin-pack after clustering by identifier keys to avoid breaking optimized bounds.
+   */
+  public static final String SKIP_IF_HAS_IDENTIFIER_KEYS = "skip-if-has-identifier-keys";
+
+  public static final boolean SKIP_IF_HAS_IDENTIFIER_KEYS_DEFAULT = false;
+
   private static final Logger LOG = LoggerFactory.getLogger(BinPackRewriteFilePlanner.class);
 
   private final Expression filter;
@@ -101,6 +109,7 @@ public class BinPackRewriteFilePlanner
   private double deleteRatioThreshold;
   private RewriteJobOrder rewriteJobOrder;
   private Integer maxFilesToRewrite;
+  private boolean skipIfHasIdentifierKeys;
 
   public BinPackRewriteFilePlanner(Table table) {
     this(table, Expressions.alwaysTrue());
@@ -139,6 +148,7 @@ public class BinPackRewriteFilePlanner
         .add(DELETE_RATIO_THRESHOLD)
         .add(RewriteDataFiles.REWRITE_JOB_ORDER)
         .add(MAX_FILES_TO_REWRITE)
+        .add(SKIP_IF_HAS_IDENTIFIER_KEYS)
         .build();
   }
 
@@ -154,6 +164,9 @@ public class BinPackRewriteFilePlanner
                 RewriteDataFiles.REWRITE_JOB_ORDER,
                 RewriteDataFiles.REWRITE_JOB_ORDER_DEFAULT));
     this.maxFilesToRewrite = maxFilesToRewrite(options);
+    this.skipIfHasIdentifierKeys =
+        PropertyUtil.propertyAsBoolean(
+            options, SKIP_IF_HAS_IDENTIFIER_KEYS, SKIP_IF_HAS_IDENTIFIER_KEYS_DEFAULT);
   }
 
   private int deleteFileThreshold(Map<String, String> options) {
@@ -215,6 +228,13 @@ public class BinPackRewriteFilePlanner
 
   @Override
   public FileRewritePlan<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> plan() {
+    if (skipIfHasIdentifierKeys && !table().schema().identifierFieldNames().isEmpty()) {
+      LOG.info(
+          "Skipping bin-pack rewrite for table {} because it has identifier keys",
+          table().name());
+      return new FileRewritePlan<>(CloseableIterable.empty(), 0, StructLikeMap.create(table().spec().partitionType()));
+    }
+
     StructLikeMap<List<List<FileScanTask>>> plan = planFileGroups();
     RewriteExecutionContext ctx = new RewriteExecutionContext();
     List<RewriteFileGroup> selectedFileGroups = Lists.newArrayList();
