@@ -80,14 +80,6 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
-import org.apache.iceberg.parquet.ParquetSchemaUtil;
-import org.apache.iceberg.parquet.ParquetValueReader;
-import org.apache.parquet.ParquetReadOptions;
-import org.apache.parquet.column.page.PageReadStore;
-import org.apache.parquet.hadoop.ParquetFileReader;
-import org.apache.parquet.hadoop.metadata.BlockMetaData;
-import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
-import org.apache.parquet.schema.MessageType;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -108,6 +100,13 @@ import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.internal.SQLConf;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+// Model classes extracted to separate file for clarity
+import static org.apache.iceberg.spark.actions.ConvertEqualityDeleteModels.DataFileInfo;
+import static org.apache.iceberg.spark.actions.ConvertEqualityDeleteModels.DeleteFileInfo;
+import static org.apache.iceberg.spark.actions.ConvertEqualityDeleteModels.PartitionWrapper;
+import static org.apache.iceberg.spark.actions.ConvertEqualityDeleteModels.DeleteFileGroup;
+import static org.apache.iceberg.spark.actions.ConvertEqualityDeleteModels.ConversionResult;
 
 /**
  * Spark implementation of {@link ConvertEqualityDeleteFiles}.
@@ -1271,196 +1270,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     return result;
   }
 
-  /** Serializable data file info for distribution to executors. */
-  private static class DataFileInfo implements Serializable {
-    private final String path;
-    private final String format;
-    private final long fileSizeInBytes;
-    private final long recordCount;
-    private final int specId;
-    private final Object[] partitionValues;
-    private final Integer sortOrderId;
-
-    DataFileInfo(String path, String format, long fileSizeInBytes, long recordCount, int specId,
-        StructLike partition, int partitionSize, Integer sortOrderId) {
-      this.path = path;
-      this.format = format;
-      this.fileSizeInBytes = fileSizeInBytes;
-      this.recordCount = recordCount;
-      this.specId = specId;
-      this.sortOrderId = sortOrderId;
-      if (partition != null && partitionSize > 0) {
-        this.partitionValues = new Object[partitionSize];
-        for (int i = 0; i < partitionSize; i++) {
-          this.partitionValues[i] = partition.get(i, Object.class);
-        }
-      } else {
-        this.partitionValues = null;
-      }
-    }
-
-    String path() {
-      return path;
-    }
-
-    FileFormat format() {
-      return FileFormat.fromString(format);
-    }
-
-    long fileSizeInBytes() {
-      return fileSizeInBytes;
-    }
-
-    long recordCount() {
-      return recordCount;
-    }
-
-    int specId() {
-      return specId;
-    }
-
-    Object[] partitionValues() {
-      return partitionValues;
-    }
-
-    Integer sortOrderId() {
-      return sortOrderId;
-    }
-
-    @Override
-    public boolean equals(Object o) {
-      if (this == o) return true;
-      if (o == null || getClass() != o.getClass()) return false;
-      DataFileInfo that = (DataFileInfo) o;
-      return path.equals(that.path);
-    }
-
-    @Override
-    public int hashCode() {
-      return path.hashCode();
-    }
-  }
-
-  /** Serializable wrapper for partition values. */
-  private static class PartitionWrapper implements StructLike, Serializable {
-    private final Object[] values;
-
-    PartitionWrapper(Object[] values) {
-      this.values = values;
-    }
-
-    @Override
-    public int size() {
-      return values != null ? values.length : 0;
-    }
-
-    @Override
-    public <T> T get(int pos, Class<T> javaClass) {
-      return javaClass.cast(values[pos]);
-    }
-
-    @Override
-    public <T> void set(int pos, T value) {
-      values[pos] = value;
-    }
-  }
-
-  /** Serializable delete file metadata returned from executors. */
-  private static class DeleteFileInfo implements Serializable {
-    private final String path;
-    private final String format;
-    private final long fileSizeInBytes;
-    private final long recordCount;
-    private final int specId;
-    private final Object[] partitionValues;
-    // Bounds are stored as Map<Integer, byte[]> for serialization (ByteBuffer is not serializable)
-    private final Map<Integer, byte[]> lowerBounds;
-    private final Map<Integer, byte[]> upperBounds;
-
-    DeleteFileInfo(
-        String path,
-        String format,
-        long fileSizeInBytes,
-        long recordCount,
-        int specId,
-        Object[] partitionValues,
-        Map<Integer, byte[]> lowerBounds,
-        Map<Integer, byte[]> upperBounds) {
-      this.path = path;
-      this.format = format;
-      this.fileSizeInBytes = fileSizeInBytes;
-      this.recordCount = recordCount;
-      this.specId = specId;
-      this.partitionValues = partitionValues;
-      this.lowerBounds = lowerBounds;
-      this.upperBounds = upperBounds;
-    }
-
-    static DeleteFileInfo from(DeleteFile deleteFile, Object[] partitionValues) {
-      // Convert ByteBuffer maps to byte[] maps for serialization
-      Map<Integer, byte[]> lowerBounds = null;
-      Map<Integer, byte[]> upperBounds = null;
-
-      if (deleteFile.lowerBounds() != null) {
-        lowerBounds = Maps.newHashMap();
-        for (Map.Entry<Integer, java.nio.ByteBuffer> entry : deleteFile.lowerBounds().entrySet()) {
-          java.nio.ByteBuffer buffer = entry.getValue().duplicate();
-          byte[] bytes = new byte[buffer.remaining()];
-          buffer.get(bytes);
-          lowerBounds.put(entry.getKey(), bytes);
-        }
-      }
-
-      if (deleteFile.upperBounds() != null) {
-        upperBounds = Maps.newHashMap();
-        for (Map.Entry<Integer, java.nio.ByteBuffer> entry : deleteFile.upperBounds().entrySet()) {
-          java.nio.ByteBuffer buffer = entry.getValue().duplicate();
-          byte[] bytes = new byte[buffer.remaining()];
-          buffer.get(bytes);
-          upperBounds.put(entry.getKey(), bytes);
-        }
-      }
-
-      return new DeleteFileInfo(
-          deleteFile.path().toString(),
-          deleteFile.format().name(),
-          deleteFile.fileSizeInBytes(),
-          deleteFile.recordCount(),
-          deleteFile.specId(),
-          partitionValues,
-          lowerBounds,
-          upperBounds);
-    }
-
-    String path() {
-      return path;
-    }
-
-    long fileSizeInBytes() {
-      return fileSizeInBytes;
-    }
-
-    long recordCount() {
-      return recordCount;
-    }
-
-    int specId() {
-      return specId;
-    }
-
-    Object[] partitionValues() {
-      return partitionValues;
-    }
-
-    Map<Integer, byte[]> lowerBounds() {
-      return lowerBounds;
-    }
-
-    Map<Integer, byte[]> upperBounds() {
-      return upperBounds;
-    }
-  }
-
   // ==================== Static helper methods for executor-side operations ====================
 
   /** Write position delete file on executor and return metadata. */
@@ -1570,12 +1379,6 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     private static final Logger LOG = LoggerFactory.getLogger(ProcessPartitionFunction.class);
 
-    /** Minimum number of eq delete files to use parallel reading. */
-    private static final int MIN_FILES_FOR_PARALLEL_READ = 3;
-
-    /** Maximum number of threads for parallel eq delete file reading. */
-    private static final int MAX_PARALLEL_READ_THREADS = 16;
-
     private final Broadcast<Table> tableBroadcast;
     private final Broadcast<List<String>> eqDeletePathsBroadcast;
     private final Schema deleteSchema;
@@ -1663,29 +1466,32 @@ public class ConvertEqualityDeleteFilesSparkAction
       Set<BigDecimal> decimalKeys = null;
       Set<List<Object>> deleteKeys = null;
 
+      EqualityDeleteKeyReader keyReader = new EqualityDeleteKeyReader(
+          deleteSchema, cacheMountPath, cacheS3Prefix);
+
       if (isSingleLongColumn) {
-        longKeys = readEqDeleteLongKeysOnExecutor(table, eqDeletePaths);
+        longKeys = keyReader.readLongKeys(table, eqDeletePaths);
         eqDeleteRecordsRead.add(longKeys.size());
         if (longKeys.isEmpty()) {
           eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
           return java.util.Collections.emptyIterator();
         }
       } else if (isSingleStringColumn) {
-        stringKeys = readEqDeleteStringKeysOnExecutor(table, eqDeletePaths);
+        stringKeys = keyReader.readStringKeys(table, eqDeletePaths);
         eqDeleteRecordsRead.add(stringKeys.size());
         if (stringKeys.isEmpty()) {
           eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
           return java.util.Collections.emptyIterator();
         }
       } else if (isSingleDecimalColumn) {
-        decimalKeys = readEqDeleteDecimalKeysOnExecutor(table, eqDeletePaths);
+        decimalKeys = keyReader.readDecimalKeys(table, eqDeletePaths);
         eqDeleteRecordsRead.add(decimalKeys.size());
         if (decimalKeys.isEmpty()) {
           eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
           return java.util.Collections.emptyIterator();
         }
       } else {
-        deleteKeys = readEqDeleteKeysOnExecutor(table, eqDeletePaths);
+        deleteKeys = keyReader.readMultiColumnKeys(table, eqDeletePaths);
         eqDeleteRecordsRead.add(deleteKeys.size());
         if (deleteKeys.isEmpty()) {
           eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
@@ -1737,39 +1543,30 @@ public class ConvertEqualityDeleteFilesSparkAction
 
         InputFile inputFile = getInputFileWithCache(fileInfo.path(), table, cacheMountPath, cacheS3Prefix);
 
-        // Build bloom filter for row group pruning
-        // Note: Expressions.in() cannot handle null values, so we filter them out
-        // and add isNull() predicate separately if needed
+        // Build bloom filter for row group pruning using BloomFilterBuilder
+        // Note: BloomFilterBuilder filters out null values, so we add isNull() predicate separately if needed
         Expression bloomFilter = null;
-        if (isSingleLongColumn && longKeys.size() <= 10000) {
-          Set<Long> nonNullKeys = longKeys.stream().filter(k -> k != null).collect(Collectors.toSet());
-          if (!nonNullKeys.isEmpty()) {
-            bloomFilter = Expressions.in(eqColumnName, nonNullKeys);
-          }
+        int maxBloomFilterKeys = 10000;
+        if (isSingleLongColumn && longKeys.size() <= maxBloomFilterKeys) {
+          bloomFilter = BloomFilterBuilder.buildLongFilter(longKeys, eqColumnName, maxBloomFilterKeys);
           if (longKeys.contains(null)) {
             Expression isNullExpr = Expressions.isNull(eqColumnName);
             bloomFilter = bloomFilter != null ? Expressions.or(bloomFilter, isNullExpr) : isNullExpr;
           }
-        } else if (isSingleStringColumn && stringKeys.size() <= 10000) {
-          Set<String> nonNullKeys = stringKeys.stream().filter(k -> k != null).collect(Collectors.toSet());
-          if (!nonNullKeys.isEmpty()) {
-            bloomFilter = Expressions.in(eqColumnName, nonNullKeys);
-          }
+        } else if (isSingleStringColumn && stringKeys.size() <= maxBloomFilterKeys) {
+          bloomFilter = BloomFilterBuilder.buildStringFilter(stringKeys, eqColumnName, maxBloomFilterKeys);
           if (stringKeys.contains(null)) {
             Expression isNullExpr = Expressions.isNull(eqColumnName);
             bloomFilter = bloomFilter != null ? Expressions.or(bloomFilter, isNullExpr) : isNullExpr;
           }
-        } else if (isSingleDecimalColumn && decimalKeys.size() <= 10000) {
-          Set<BigDecimal> nonNullKeys = decimalKeys.stream().filter(k -> k != null).collect(Collectors.toSet());
-          if (!nonNullKeys.isEmpty()) {
-            bloomFilter = Expressions.in(eqColumnName, nonNullKeys);
-          }
+        } else if (isSingleDecimalColumn && decimalKeys.size() <= maxBloomFilterKeys) {
+          bloomFilter = BloomFilterBuilder.buildDecimalFilter(decimalKeys, eqColumnName, maxBloomFilterKeys);
           if (decimalKeys.contains(null)) {
             Expression isNullExpr = Expressions.isNull(eqColumnName);
             bloomFilter = bloomFilter != null ? Expressions.or(bloomFilter, isNullExpr) : isNullExpr;
           }
         } else if (deleteKeys != null) {
-          bloomFilter = buildMultiColumnBloomFilter(deleteKeys, 10000);
+          bloomFilter = BloomFilterBuilder.buildMultiColumnFilter(deleteKeys, deleteSchema, maxBloomFilterKeys);
         }
 
         // Check if we can use merge join for this file
@@ -1793,7 +1590,7 @@ public class ConvertEqualityDeleteFilesSparkAction
           try {
             LOG.info("Using ROW-GROUP merge join for file={}, sortedLongKeys.size={}",
                 fileInfo.path(), sortedLongKeys.size());
-            MergeJoinResult result = mergeJoinWithRowGroups(
+            ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.execute(
                 inputFile, projectionSchema, sortedLongKeys,
                 eqDeleteFieldId, eqColumnName, fileInfo.path());
             matches.addAll(result.matches);
@@ -1978,321 +1775,6 @@ public class ConvertEqualityDeleteFilesSparkAction
       return results.iterator();
     }
 
-    /** Read equality delete keys as Long directly (no intermediate List allocation). */
-    private Set<Long> readEqDeleteLongKeysOnExecutor(Table table, List<String> eqDeletePaths) {
-      if (eqDeletePaths.size() < MIN_FILES_FOR_PARALLEL_READ) {
-        // Sequential read for small number of files
-        Set<Long> keys = new HashSet<>();
-        for (String path : eqDeletePaths) {
-          readLongKeysFromFile(table, path, keys);
-        }
-        return keys;
-      }
-
-      // Parallel read for multiple files
-      int threads = Math.min(eqDeletePaths.size(), MAX_PARALLEL_READ_THREADS);
-      ExecutorService executor = Executors.newFixedThreadPool(threads);
-      try {
-        List<Future<Set<Long>>> futures = new ArrayList<>(eqDeletePaths.size());
-        for (String path : eqDeletePaths) {
-          futures.add(executor.submit(() -> {
-            Set<Long> localKeys = new HashSet<>();
-            readLongKeysFromFile(table, path, localKeys);
-            return localKeys;
-          }));
-        }
-
-        Set<Long> keys = new HashSet<>();
-        for (Future<Set<Long>> future : futures) {
-          keys.addAll(future.get());
-        }
-        return keys;
-      } catch (ExecutionException e) {
-        throw new RuntimeException("Failed to read eq delete files", e.getCause());
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw new RuntimeException("Interrupted while reading eq delete files", e);
-      } finally {
-        executor.shutdownNow();
-      }
-    }
-
-    private void readLongKeysFromFile(Table table, String path, Set<Long> keys) {
-      InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
-      FileFormat format = FileFormat.fromFileName(path);
-
-      try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
-        for (Record record : reader) {
-          Object val = record.get(0);
-          // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
-          if (val == null) {
-            keys.add(null);
-          } else {
-            keys.add(val instanceof Integer ? ((Integer) val).longValue() : (Long) val);
-          }
-        }
-      } catch (IOException e) {
-        throw new RuntimeException("Failed to read eq delete file: " + path, e);
-      }
-    }
-
-    /** Read equality delete keys as String directly (no intermediate List allocation). */
-    private Set<String> readEqDeleteStringKeysOnExecutor(Table table, List<String> eqDeletePaths) {
-      if (eqDeletePaths.size() < MIN_FILES_FOR_PARALLEL_READ) {
-        Set<String> keys = new HashSet<>();
-        for (String path : eqDeletePaths) {
-          readStringKeysFromFile(table, path, keys);
-        }
-        return keys;
-      }
-
-      int threads = Math.min(eqDeletePaths.size(), MAX_PARALLEL_READ_THREADS);
-      ExecutorService executor = Executors.newFixedThreadPool(threads);
-      try {
-        List<Future<Set<String>>> futures = new ArrayList<>(eqDeletePaths.size());
-        for (String path : eqDeletePaths) {
-          futures.add(executor.submit(() -> {
-            Set<String> localKeys = new HashSet<>();
-            readStringKeysFromFile(table, path, localKeys);
-            return localKeys;
-          }));
-        }
-
-        Set<String> keys = new HashSet<>();
-        for (Future<Set<String>> future : futures) {
-          keys.addAll(future.get());
-        }
-        return keys;
-      } catch (ExecutionException e) {
-        throw new RuntimeException("Failed to read eq delete files", e.getCause());
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw new RuntimeException("Interrupted while reading eq delete files", e);
-      } finally {
-        executor.shutdownNow();
-      }
-    }
-
-    private void readStringKeysFromFile(Table table, String path, Set<String> keys) {
-      InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
-      FileFormat format = FileFormat.fromFileName(path);
-
-      try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
-        for (Record record : reader) {
-          Object val = record.get(0);
-          keys.add(val != null ? val.toString() : null);
-        }
-      } catch (IOException e) {
-        throw new RuntimeException("Failed to read eq delete file: " + path, e);
-      }
-    }
-
-    /** Read equality delete keys as BigDecimal directly (no intermediate List allocation). */
-    private Set<BigDecimal> readEqDeleteDecimalKeysOnExecutor(Table table, List<String> eqDeletePaths) {
-      if (eqDeletePaths.size() < MIN_FILES_FOR_PARALLEL_READ) {
-        Set<BigDecimal> keys = new HashSet<>();
-        for (String path : eqDeletePaths) {
-          readDecimalKeysFromFile(table, path, keys);
-        }
-        return keys;
-      }
-
-      int threads = Math.min(eqDeletePaths.size(), MAX_PARALLEL_READ_THREADS);
-      ExecutorService executor = Executors.newFixedThreadPool(threads);
-      try {
-        List<Future<Set<BigDecimal>>> futures = new ArrayList<>(eqDeletePaths.size());
-        for (String path : eqDeletePaths) {
-          futures.add(executor.submit(() -> {
-            Set<BigDecimal> localKeys = new HashSet<>();
-            readDecimalKeysFromFile(table, path, localKeys);
-            return localKeys;
-          }));
-        }
-
-        Set<BigDecimal> keys = new HashSet<>();
-        for (Future<Set<BigDecimal>> future : futures) {
-          keys.addAll(future.get());
-        }
-        return keys;
-      } catch (ExecutionException e) {
-        throw new RuntimeException("Failed to read eq delete files", e.getCause());
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw new RuntimeException("Interrupted while reading eq delete files", e);
-      } finally {
-        executor.shutdownNow();
-      }
-    }
-
-    private void readDecimalKeysFromFile(Table table, String path, Set<BigDecimal> keys) {
-      InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
-      FileFormat format = FileFormat.fromFileName(path);
-
-      try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
-        for (Record record : reader) {
-          Object val = record.get(0);
-          // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
-          keys.add((BigDecimal) val);  // null is valid and will be added to the set
-        }
-      } catch (IOException e) {
-        throw new RuntimeException("Failed to read eq delete file: " + path, e);
-      }
-    }
-
-    /** Read equality delete keys for multi-column keys. */
-    private Set<List<Object>> readEqDeleteKeysOnExecutor(Table table, List<String> eqDeletePaths) {
-      int keyColumnCount = deleteSchema.columns().size();
-
-      if (eqDeletePaths.size() < MIN_FILES_FOR_PARALLEL_READ) {
-        Set<List<Object>> keys = new HashSet<>();
-        for (String path : eqDeletePaths) {
-          readMultiColumnKeysFromFile(table, path, keys, keyColumnCount);
-        }
-        return keys;
-      }
-
-      int threads = Math.min(eqDeletePaths.size(), MAX_PARALLEL_READ_THREADS);
-      ExecutorService executor = Executors.newFixedThreadPool(threads);
-      try {
-        List<Future<Set<List<Object>>>> futures = new ArrayList<>(eqDeletePaths.size());
-        for (String path : eqDeletePaths) {
-          futures.add(executor.submit(() -> {
-            Set<List<Object>> localKeys = new HashSet<>();
-            readMultiColumnKeysFromFile(table, path, localKeys, keyColumnCount);
-            return localKeys;
-          }));
-        }
-
-        Set<List<Object>> keys = new HashSet<>();
-        for (Future<Set<List<Object>>> future : futures) {
-          keys.addAll(future.get());
-        }
-        return keys;
-      } catch (ExecutionException e) {
-        throw new RuntimeException("Failed to read eq delete files", e.getCause());
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw new RuntimeException("Interrupted while reading eq delete files", e);
-      } finally {
-        executor.shutdownNow();
-      }
-    }
-
-    private void readMultiColumnKeysFromFile(Table table, String path, Set<List<Object>> keys, int keyColumnCount) {
-      InputFile inputFile = getInputFileWithCache(path, table, cacheMountPath, cacheS3Prefix);
-      FileFormat format = FileFormat.fromFileName(path);
-
-      try (CloseableIterable<Record> reader = openDeleteFileForRead(inputFile, deleteSchema, format)) {
-        for (Record record : reader) {
-          List<Object> keyValues = Lists.newArrayListWithCapacity(keyColumnCount);
-          for (int i = 0; i < keyColumnCount; i++) {
-            keyValues.add(record.get(i));
-          }
-          keys.add(keyValues);
-        }
-      } catch (IOException e) {
-        throw new RuntimeException("Failed to read eq delete file: " + path, e);
-      }
-    }
-
-    /** Build bloom filter expression for multi-column keys. */
-    private Expression buildMultiColumnBloomFilter(Set<List<Object>> keys, int maxKeysPerColumn) {
-      if (keys.isEmpty()) {
-        return null;
-      }
-
-      int colCount = deleteSchema.columns().size();
-      List<Expression> columnFilters = Lists.newArrayListWithCapacity(colCount);
-
-      for (int colIdx = 0; colIdx < colCount; colIdx++) {
-        Types.NestedField col = deleteSchema.columns().get(colIdx);
-        org.apache.iceberg.types.Type.TypeID colTypeId = col.type().typeId();
-        String colName = col.name();
-
-        // Extract unique values for this column
-        Set<Object> uniqueValues = Sets.newHashSet();
-        for (List<Object> key : keys) {
-          Object val = key.get(colIdx);
-          if (val != null) {
-            uniqueValues.add(val);
-          }
-        }
-
-        if (uniqueValues.isEmpty() || uniqueValues.size() > maxKeysPerColumn) {
-          continue; // Skip this column - too many values or all nulls
-        }
-
-        // Build IN expression based on column type
-        Expression colFilter = null;
-        switch (colTypeId) {
-          case LONG:
-          case INTEGER:
-            Set<Long> longVals = Sets.newHashSetWithExpectedSize(uniqueValues.size());
-            for (Object v : uniqueValues) {
-              longVals.add(v instanceof Integer ? ((Integer) v).longValue() : (Long) v);
-            }
-            colFilter = Expressions.in(colName, longVals);
-            break;
-          case STRING:
-            Set<String> strVals = Sets.newHashSetWithExpectedSize(uniqueValues.size());
-            for (Object v : uniqueValues) {
-              strVals.add(v.toString());
-            }
-            colFilter = Expressions.in(colName, strVals);
-            break;
-          case DECIMAL:
-            @SuppressWarnings("unchecked")
-            Set<BigDecimal> decVals = (Set<BigDecimal>) (Set<?>) uniqueValues;
-            colFilter = Expressions.in(colName, decVals);
-            break;
-          default:
-            // Unsupported type for bloom filter
-            break;
-        }
-
-        if (colFilter != null) {
-          columnFilters.add(colFilter);
-        }
-      }
-
-      if (columnFilters.isEmpty()) {
-        return null;
-      } else if (columnFilters.size() == 1) {
-        return columnFilters.get(0);
-      } else {
-        // AND all column filters together
-        Expression result = columnFilters.get(0);
-        for (int i = 1; i < columnFilters.size(); i++) {
-          result = Expressions.and(result, columnFilters.get(i));
-        }
-        return result;
-      }
-    }
-
-    /** Open delete file for reading. */
-    private CloseableIterable<Record> openDeleteFileForRead(
-        InputFile inputFile, Schema schema, FileFormat format) {
-      switch (format) {
-        case PARQUET:
-          return Parquet.read(inputFile)
-              .project(schema)
-              .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
-              .build();
-        case ORC:
-          return ORC.read(inputFile)
-              .project(schema)
-              .createReaderFunc(fileSchema -> GenericOrcReader.buildReader(schema, fileSchema))
-              .build();
-        case AVRO:
-          return Avro.read(inputFile)
-              .project(schema)
-              .createReaderFunc(DataReader::create)
-              .build();
-        default:
-          throw new UnsupportedOperationException("Unsupported format: " + format);
-      }
-    }
-
     /**
      * Check if merge join can be used for this data file.
      * Merge join requires:
@@ -2313,315 +1795,7 @@ public class ConvertEqualityDeleteFilesSparkAction
           && firstField.transform().isIdentity();
     }
 
-    /** Result of merge join with row group level processing. */
-    private static class MergeJoinResult {
-      final List<PositionDelete<Record>> matches;
-      final long recordsScanned;
-      final int rowGroupsSkipped;
-      final int rowGroupsProcessed;
-      final boolean earlyTerminationUsed;
-
-      MergeJoinResult(
-          List<PositionDelete<Record>> matches,
-          long recordsScanned,
-          int rowGroupsSkipped,
-          int rowGroupsProcessed,
-          boolean earlyTerminationUsed) {
-        this.matches = matches;
-        this.recordsScanned = recordsScanned;
-        this.rowGroupsSkipped = rowGroupsSkipped;
-        this.rowGroupsProcessed = rowGroupsProcessed;
-        this.earlyTerminationUsed = earlyTerminationUsed;
-      }
-    }
-
-    /**
-     * Perform merge join with row group level control.
-     * This method reads Parquet files at the row group level, allowing:
-     * 1. Skipping row groups with no overlap with delete keys
-     * 2. Early termination when delete keys exceed row group upper bound
-     * 3. Binary search for initial delete pointer position
-     */
-    @SuppressWarnings("unchecked")
-    private static MergeJoinResult mergeJoinWithRowGroups(
-        InputFile inputFile,
-        Schema projectionSchema,
-        List<Long> sortedDeleteKeys,
-        int eqDeleteFieldId,
-        String eqColumnName,
-        String dataFilePath) throws IOException {
-
-      List<PositionDelete<Record>> matches = Lists.newArrayList();
-      long recordsScanned = 0;
-      int rowGroupsSkipped = 0;
-      int rowGroupsProcessed = 0;
-      boolean earlyTerminationUsed = false;
-
-      if (sortedDeleteKeys.isEmpty()) {
-        return new MergeJoinResult(matches, 0, 0, 0, false);
-      }
-
-      long minDeleteKey = sortedDeleteKeys.get(0);
-      long maxDeleteKey = sortedDeleteKeys.get(sortedDeleteKeys.size() - 1);
-
-      // Build schema without ROW_POSITION since we track position manually
-      List<Types.NestedField> readFields = Lists.newArrayList();
-      for (Types.NestedField field : projectionSchema.columns()) {
-        if (field.fieldId() != MetadataColumns.ROW_POSITION.fieldId()) {
-          readFields.add(field);
-        }
-      }
-      Schema readSchema = new Schema(readFields);
-
-      // Open low-level Parquet reader
-      ParquetReadOptions options = ParquetReadOptions.builder().build();
-      org.apache.parquet.io.InputFile parquetInputFile = new org.apache.parquet.io.InputFile() {
-        @Override
-        public long getLength() throws IOException {
-          return inputFile.getLength();
-        }
-        @Override
-        public org.apache.parquet.io.SeekableInputStream newStream() throws IOException {
-          org.apache.iceberg.io.SeekableInputStream stream = inputFile.newStream();
-          return new org.apache.parquet.io.DelegatingSeekableInputStream(stream) {
-            @Override
-            public long getPos() throws IOException {
-              return stream.getPos();
-            }
-            @Override
-            public void seek(long newPos) throws IOException {
-              stream.seek(newPos);
-            }
-          };
-        }
-      };
-
-      try (ParquetFileReader reader = ParquetFileReader.open(parquetInputFile, options)) {
-        MessageType fileSchema = reader.getFileMetaData().getSchema();
-        List<BlockMetaData> rowGroups = reader.getRowGroups();
-
-        // Create Iceberg reader for records (without ROW_POSITION)
-        ParquetValueReader<Record> model = (ParquetValueReader<Record>)
-            GenericParquetReaders.buildReader(readSchema, fileSchema);
-
-        int deletePtr = 0;  // Shared across row groups for efficiency
-        long rowPosition = 0;  // Track row position manually
-
-        for (int rgIdx = 0; rgIdx < rowGroups.size(); rgIdx++) {
-          BlockMetaData rowGroup = rowGroups.get(rgIdx);
-          long rgRowCount = rowGroup.getRowCount();
-
-          // Get row group bounds for eq delete column
-          ColumnChunkMetaData colMeta = null;
-          for (ColumnChunkMetaData col : rowGroup.getColumns()) {
-            if (col.getPath().toDotString().equals(eqColumnName)) {
-              colMeta = col;
-              break;
-            }
-          }
-
-          // Check if we have valid statistics for this row group
-          org.apache.parquet.column.statistics.Statistics<?> stats =
-              (colMeta != null) ? colMeta.getStatistics() : null;
-          boolean hasValidStats = stats != null && stats.hasNonNullValue();
-
-          if (!hasValidStats) {
-            // No stats, must read this row group
-            PageReadStore pages = reader.readNextRowGroup();
-            model.setPageSource(pages);
-            rowGroupsProcessed++;
-
-            for (long i = 0; i < rgRowCount; i++) {
-              Record record = model.read(null);
-              if (record == null) {
-                rowPosition++;
-                continue;
-              }
-              recordsScanned++;
-              Object val = record.get(0);
-              if (val == null) {
-                rowPosition++;
-                continue;
-              }
-
-              long dataKey = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
-
-              while (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < dataKey) {
-                deletePtr++;
-              }
-
-              if (deletePtr >= sortedDeleteKeys.size()) {
-                earlyTerminationUsed = true;
-                rowPosition++;
-                break;
-              }
-
-              if (sortedDeleteKeys.get(deletePtr).equals(dataKey)) {
-                PositionDelete<Record> posDelete = PositionDelete.create();
-                posDelete.set(dataFilePath, rowPosition, null);
-                matches.add(posDelete);
-              }
-              rowPosition++;
-            }
-
-            if (earlyTerminationUsed) break;
-            continue;
-          }
-
-          // Get row group bounds (stats is guaranteed non-null here due to hasValidStats check)
-          // But genericGetMin/Max can still return null even when hasNonNullValue() is true
-          Object minObj = stats.genericGetMin();
-          Object maxObj = stats.genericGetMax();
-          if (minObj == null || maxObj == null || !(minObj instanceof Number) || !(maxObj instanceof Number)) {
-            // Statistics type doesn't match expected numeric type, read row group without optimization
-            PageReadStore pages = reader.readNextRowGroup();
-            model.setPageSource(pages);
-            rowGroupsProcessed++;
-            for (long i = 0; i < rgRowCount; i++) {
-              Record record = model.read(null);
-              if (record == null) {
-                rowPosition++;
-                continue;
-              }
-              recordsScanned++;
-              Object val = record.get(0);
-              if (val == null) {
-                rowPosition++;
-                continue;
-              }
-              long dataKey = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
-              while (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < dataKey) {
-                deletePtr++;
-              }
-              if (deletePtr >= sortedDeleteKeys.size()) {
-                earlyTerminationUsed = true;
-                rowPosition++;
-                break;
-              }
-              if (sortedDeleteKeys.get(deletePtr).equals(dataKey)) {
-                PositionDelete<Record> posDelete = PositionDelete.create();
-                posDelete.set(dataFilePath, rowPosition, null);
-                matches.add(posDelete);
-              }
-              rowPosition++;
-            }
-            if (earlyTerminationUsed) break;
-            continue;
-          }
-          long rgMin = ((Number) minObj).longValue();
-          long rgMax = ((Number) maxObj).longValue();
-
-          // Skip row group if all delete keys < row group min (and we're done)
-          if (maxDeleteKey < rgMin) {
-            reader.skipNextRowGroup();
-            rowGroupsSkipped++;
-            rowPosition += rgRowCount;
-            earlyTerminationUsed = true;
-            break;
-          }
-
-          // Skip row group if all delete keys > row group max
-          if (minDeleteKey > rgMax) {
-            reader.skipNextRowGroup();
-            rowGroupsSkipped++;
-            rowPosition += rgRowCount;
-            continue;
-          }
-
-          // Check if current delete pointer is already past this row group
-          if (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) > rgMax) {
-            reader.skipNextRowGroup();
-            rowGroupsSkipped++;
-            rowPosition += rgRowCount;
-            continue;
-          }
-
-          // Binary search to find starting deletePtr for this row group
-          if (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < rgMin) {
-            int searchResult = Collections.binarySearch(sortedDeleteKeys, rgMin);
-            if (searchResult < 0) {
-              deletePtr = -(searchResult + 1);
-            } else {
-              deletePtr = searchResult;
-            }
-          }
-
-          // Check again after binary search
-          if (deletePtr >= sortedDeleteKeys.size()) {
-            reader.skipNextRowGroup();
-            rowGroupsSkipped++;
-            rowPosition += rgRowCount;
-            earlyTerminationUsed = true;
-            break;
-          }
-
-          if (sortedDeleteKeys.get(deletePtr) > rgMax) {
-            reader.skipNextRowGroup();
-            rowGroupsSkipped++;
-            rowPosition += rgRowCount;
-            continue;
-          }
-
-          // Read row group
-          PageReadStore pages = reader.readNextRowGroup();
-          model.setPageSource(pages);
-          rowGroupsProcessed++;
-
-          for (long i = 0; i < rgRowCount; i++) {
-            Record record = model.read(null);
-            if (record == null) {
-              rowPosition++;
-              continue;
-            }
-            recordsScanned++;
-            Object val = record.get(0);
-            if (val == null) {
-              rowPosition++;
-              continue;
-            }
-
-            long dataKey = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
-
-            // Move delete pointer while deleteKey < dataKey
-            while (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < dataKey) {
-              deletePtr++;
-            }
-
-            // Early termination if all delete keys exhausted
-            if (deletePtr >= sortedDeleteKeys.size()) {
-              earlyTerminationUsed = true;
-              rowPosition++;
-              break;
-            }
-
-            // Early termination if current delete key > row group max
-            if (sortedDeleteKeys.get(deletePtr) > rgMax) {
-              // Skip remaining rows in this row group
-              rowPosition += (rgRowCount - i);
-              // If this is the last row group, mark as file-level early termination
-              if (rgIdx == rowGroups.size() - 1) {
-                earlyTerminationUsed = true;
-              }
-              break;
-            }
-
-            // Match: deleteKey == dataKey
-            if (sortedDeleteKeys.get(deletePtr).equals(dataKey)) {
-              PositionDelete<Record> posDelete = PositionDelete.create();
-              posDelete.set(dataFilePath, rowPosition, null);
-              matches.add(posDelete);
-            }
-            rowPosition++;
-          }
-
-          if (earlyTerminationUsed) break;
-        }
-      }
-
-      return new MergeJoinResult(matches, recordsScanned, rowGroupsSkipped, rowGroupsProcessed, earlyTerminationUsed);
-    }
   }
-
 
   private void commitChanges(
       Set<DeleteFile> eqDeleteFilesToRemove,
@@ -2650,60 +1824,6 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     commitSummary().forEach(rewrite::set);
     rewrite.commit();
-  }
-
-  private static class ConversionResult {
-    final Set<DeleteFile> posDeleteFiles;
-    final long eqDeleteRecordsCount;
-    final long posDeleteRecordsCount;
-
-    ConversionResult(
-        Set<DeleteFile> posDeleteFiles, long eqDeleteRecordsCount, long posDeleteRecordsCount) {
-      this.posDeleteFiles = posDeleteFiles;
-      this.eqDeleteRecordsCount = eqDeleteRecordsCount;
-      this.posDeleteRecordsCount = posDeleteRecordsCount;
-    }
-  }
-
-  private static class DeleteFileGroup {
-    private final List<DeleteFile> deleteFiles;
-    private final PartitionSpec spec;
-
-    DeleteFileGroup(List<DeleteFile> deleteFiles, PartitionSpec spec) {
-      this.deleteFiles = ImmutableList.copyOf(deleteFiles);
-      this.spec = spec;
-    }
-
-    List<DeleteFile> deleteFiles() {
-      return deleteFiles;
-    }
-
-    PartitionSpec spec() {
-      return spec;
-    }
-
-    @Override
-    public boolean equals(Object o) {
-      if (this == o) {
-        return true;
-      }
-      if (o == null || getClass() != o.getClass()) {
-        return false;
-      }
-      DeleteFileGroup that = (DeleteFileGroup) o;
-      Set<String> thisPaths =
-          deleteFiles.stream().map(f -> f.path().toString()).collect(Collectors.toSet());
-      Set<String> thatPaths =
-          that.deleteFiles.stream().map(f -> f.path().toString()).collect(Collectors.toSet());
-      return thisPaths.equals(thatPaths) && spec.specId() == that.spec.specId();
-    }
-
-    @Override
-    public int hashCode() {
-      Set<String> paths =
-          deleteFiles.stream().map(f -> f.path().toString()).collect(Collectors.toSet());
-      return paths.hashCode() * 31 + spec.specId();
-    }
   }
 
   // ==================== Orphan Equality Delete Cleanup ====================
