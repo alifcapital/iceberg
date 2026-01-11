@@ -49,5 +49,14 @@ public interface ConvertEqualityDeleteFiles
 
     /** Returns the count of position delete records written. */
     long addedDeleteRecordsCount();
+
+    /** Returns the count of data records scanned during conversion. */
+    long dataRecordsScanned();
+
+    /** Returns the total count of data records in files that were processed. */
+    long dataRecordsTotal();
+
+    /** Returns the count of files where merge join early termination was used. */
+    long filesWithEarlyTermination();
   }
 }

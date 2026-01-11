@@ -69,6 +69,9 @@ import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
 import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SortDirection;
+import org.apache.iceberg.SortField;
+import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DeleteWriteResult;
 import org.apache.iceberg.io.FileWriter;
@@ -200,6 +203,9 @@ public class ConvertEqualityDeleteFilesSparkAction
           .addedPositionDeleteFilesCount(0)
           .rewrittenDeleteRecordsCount(0L)
           .addedDeleteRecordsCount(0L)
+          .dataRecordsScanned(0L)
+          .dataRecordsTotal(0L)
+          .filesWithEarlyTermination(0L)
           .build();
 
   private final Table table;
@@ -360,6 +366,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     Set<DeleteFile> convertedEqDeleteFiles = Sets.newHashSet();
     Set<DeleteFile> addedPosDeleteFiles = Sets.newHashSet();
     long totalAddedRecords = 0;
+    long totalDataRecordsScanned = 0;
+    long totalDataRecordsTotal = 0;
+    long totalFilesWithEarlyTermination = 0;
 
     LOG.info(
         "{} table={} total_groups={} pipeline_depth={} processing with async pipeline",
@@ -433,6 +442,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       LOG.info(
           "{} table={} group={} total_ms={} eq_read_ms={} data_read_ms={} pos_write_ms={} "
               + "data_files={} data_bytes_total={} data_bytes_read={} files_skipped={} "
+              + "data_records_scanned={} data_records_total={} files_early_term={} "
               + "eq_delete_records={} pos_delete_files={} pos_delete_records={}",
           LOG_PREFIX,
           table.name(),
@@ -445,6 +455,9 @@ public class ConvertEqualityDeleteFilesSparkAction
           job.totalDataFileSize,
           job.dataFileBytesRead.value(),
           job.filesSkipped.value(),
+          job.dataRecordsScanned.value(),
+          job.dataRecordsTotal.value(),
+          job.filesWithEarlyTermination.value(),
           eqDeleteRecordsCount,
           deleteFileInfos.size(),
           posDeleteRecordsCount);
@@ -464,6 +477,9 @@ public class ConvertEqualityDeleteFilesSparkAction
       convertedEqDeleteFiles.addAll(eqDeleteGroup.deleteFiles());
       addedPosDeleteFiles.addAll(posDeleteFiles);
       totalAddedRecords += posDeleteRecordsCount;
+      totalDataRecordsScanned += job.dataRecordsScanned.value();
+      totalDataRecordsTotal += job.dataRecordsTotal.value();
+      totalFilesWithEarlyTermination += job.filesWithEarlyTermination.value();
     }
 
     // Calculate unique rewritten records from converted eq delete files
@@ -526,6 +542,9 @@ public class ConvertEqualityDeleteFilesSparkAction
         .addedPositionDeleteFilesCount(addedPosDeleteFiles.size())
         .rewrittenDeleteRecordsCount(totalRewrittenRecords)
         .addedDeleteRecordsCount(totalAddedRecords)
+        .dataRecordsScanned(totalDataRecordsScanned)
+        .dataRecordsTotal(totalDataRecordsTotal)
+        .filesWithEarlyTermination(totalFilesWithEarlyTermination)
         .build();
   }
 
@@ -545,6 +564,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     final org.apache.spark.util.LongAccumulator posDeleteRecordsWritten;
     final org.apache.spark.util.LongAccumulator filesSkipped;
     final org.apache.spark.util.LongAccumulator dataFileBytesRead;
+    final org.apache.spark.util.LongAccumulator dataRecordsScanned;
+    final org.apache.spark.util.LongAccumulator dataRecordsTotal;
+    final org.apache.spark.util.LongAccumulator filesWithEarlyTermination;
 
     PendingConversionJob(
         int groupIndex,
@@ -559,7 +581,10 @@ public class ConvertEqualityDeleteFilesSparkAction
         org.apache.spark.util.LongAccumulator posDeleteWriteTimeMs,
         org.apache.spark.util.LongAccumulator posDeleteRecordsWritten,
         org.apache.spark.util.LongAccumulator filesSkipped,
-        org.apache.spark.util.LongAccumulator dataFileBytesRead) {
+        org.apache.spark.util.LongAccumulator dataFileBytesRead,
+        org.apache.spark.util.LongAccumulator dataRecordsScanned,
+        org.apache.spark.util.LongAccumulator dataRecordsTotal,
+        org.apache.spark.util.LongAccumulator filesWithEarlyTermination) {
       this.groupIndex = groupIndex;
       this.eqDeleteGroup = eqDeleteGroup;
       this.dataFileTasks = dataFileTasks;
@@ -574,6 +599,9 @@ public class ConvertEqualityDeleteFilesSparkAction
       this.posDeleteRecordsWritten = posDeleteRecordsWritten;
       this.filesSkipped = filesSkipped;
       this.dataFileBytesRead = dataFileBytesRead;
+      this.dataRecordsScanned = dataRecordsScanned;
+      this.dataRecordsTotal = dataRecordsTotal;
+      this.filesWithEarlyTermination = filesWithEarlyTermination;
     }
 
     long dataFilesSize() {
@@ -630,6 +658,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     int totalAddedPosDeleteFiles = 0;
     long totalAddedRecords = 0;
     int commitCount = 0;
+    long totalDataRecordsScanned = 0;
+    long totalDataRecordsTotal = 0;
+    long totalFilesWithEarlyTermination = 0;
 
     // Track bytes read and groups processed since last commit for commit threshold
     long bytesReadSinceLastCommit = 0;
@@ -705,6 +736,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       LOG.info(
           "{} table={} group={} total_ms={} eq_read_ms={} data_read_ms={} pos_write_ms={} "
               + "data_files={} data_bytes_total={} data_bytes_read={} files_skipped={} "
+              + "data_records_scanned={} data_records_total={} files_early_term={} "
               + "eq_delete_records={} pos_delete_files={} pos_delete_records={}",
           LOG_PREFIX,
           table.name(),
@@ -717,6 +749,9 @@ public class ConvertEqualityDeleteFilesSparkAction
           job.totalDataFileSize,
           job.dataFileBytesRead.value(),
           job.filesSkipped.value(),
+          job.dataRecordsScanned.value(),
+          job.dataRecordsTotal.value(),
+          job.filesWithEarlyTermination.value(),
           eqDeleteRecordsCount,
           deleteFileInfos.size(),
           posDeleteRecordsCount);
@@ -745,6 +780,9 @@ public class ConvertEqualityDeleteFilesSparkAction
       }
 
       totalAddedRecords += conversionResult.posDeleteRecordsCount;
+      totalDataRecordsScanned += job.dataRecordsScanned.value();
+      totalDataRecordsTotal += job.dataRecordsTotal.value();
+      totalFilesWithEarlyTermination += job.filesWithEarlyTermination.value();
 
       // Track bytes read and groups processed since last commit
       bytesReadSinceLastCommit += job.dataFilesSize();
@@ -863,6 +901,9 @@ public class ConvertEqualityDeleteFilesSparkAction
               .addedPositionDeleteFilesCount(totalAddedPosDeleteFiles)
               .rewrittenDeleteRecordsCount(rewrittenRecords)
               .addedDeleteRecordsCount(totalAddedRecords)
+              .dataRecordsScanned(totalDataRecordsScanned)
+              .dataRecordsTotal(totalDataRecordsTotal)
+              .filesWithEarlyTermination(totalFilesWithEarlyTermination)
               .build();
         }
       }
@@ -936,6 +977,9 @@ public class ConvertEqualityDeleteFilesSparkAction
             .addedPositionDeleteFilesCount(totalAddedPosDeleteFiles)
             .rewrittenDeleteRecordsCount(rewrittenRecords)
             .addedDeleteRecordsCount(totalAddedRecords)
+            .dataRecordsScanned(totalDataRecordsScanned)
+            .dataRecordsTotal(totalDataRecordsTotal)
+            .filesWithEarlyTermination(totalFilesWithEarlyTermination)
             .build();
       }
     }
@@ -958,6 +1002,9 @@ public class ConvertEqualityDeleteFilesSparkAction
         .addedPositionDeleteFilesCount(totalAddedPosDeleteFiles)
         .rewrittenDeleteRecordsCount(totalRewrittenRecords)
         .addedDeleteRecordsCount(totalAddedRecords)
+        .dataRecordsScanned(totalDataRecordsScanned)
+        .dataRecordsTotal(totalDataRecordsTotal)
+        .filesWithEarlyTermination(totalFilesWithEarlyTermination)
         .build();
   }
 
@@ -1043,9 +1090,11 @@ public class ConvertEqualityDeleteFilesSparkAction
                 t.file().path().toString(),
                 t.file().format().name(),
                 t.file().fileSizeInBytes(),
+                t.file().recordCount(),
                 specId,
                 partition,
-                partitionSize))
+                partitionSize,
+                t.file().sortOrderId()))
             .distinct()
             .collect(Collectors.toList());
 
@@ -1059,7 +1108,8 @@ public class ConvertEqualityDeleteFilesSparkAction
           jsc.parallelize(java.util.Collections.<DeleteFileInfo>emptyList(), 1).collectAsync();
       return new PendingConversionJob(
           groupIndex, eqDeleteGroup, dataFileTasks, 0, 0L, emptyFuture,
-          zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc);
+          zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc,
+          zeroAcc, zeroAcc, zeroAcc);
     }
 
     Table serializableTable = SerializableTableWithSize.copyOf(table);
@@ -1080,6 +1130,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     org.apache.spark.util.LongAccumulator dataFilesReceived = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator filesSkipped = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator dataFileBytesRead = new org.apache.spark.util.LongAccumulator();
+    org.apache.spark.util.LongAccumulator dataRecordsScanned = new org.apache.spark.util.LongAccumulator();
+    org.apache.spark.util.LongAccumulator dataRecordsTotal = new org.apache.spark.util.LongAccumulator();
+    org.apache.spark.util.LongAccumulator filesWithEarlyTermination = new org.apache.spark.util.LongAccumulator();
     spark().sparkContext().register(eqDeleteRecordsRead, "ConvertEqDeletes.eqDeleteRecordsRead.g" + groupIndex);
     spark().sparkContext().register(eqDeleteReadTimeMs, "ConvertEqDeletes.eqDeleteReadTimeMs.g" + groupIndex);
     spark().sparkContext().register(dataFileReadTimeMs, "ConvertEqDeletes.dataFileReadTimeMs.g" + groupIndex);
@@ -1088,6 +1141,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     spark().sparkContext().register(posDeleteRecordsWritten, "ConvertEqDeletes.posDeleteRecordsWritten.g" + groupIndex);
     spark().sparkContext().register(filesSkipped, "ConvertEqDeletes.filesSkipped.g" + groupIndex);
     spark().sparkContext().register(dataFileBytesRead, "ConvertEqDeletes.dataFileBytesRead.g" + groupIndex);
+    spark().sparkContext().register(dataRecordsScanned, "ConvertEqDeletes.dataRecordsScanned.g" + groupIndex);
+    spark().sparkContext().register(dataRecordsTotal, "ConvertEqDeletes.dataRecordsTotal.g" + groupIndex);
+    spark().sparkContext().register(filesWithEarlyTermination, "ConvertEqDeletes.filesWithEarlyTermination.g" + groupIndex);
 
     // Initialize accumulators with 0 so they appear in Spark UI even if not updated
     eqDeleteRecordsRead.add(0);
@@ -1098,6 +1154,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     posDeleteRecordsWritten.add(0);
     filesSkipped.add(0);
     dataFileBytesRead.add(0);
+    dataRecordsScanned.add(0);
+    dataRecordsTotal.add(0);
+    filesWithEarlyTermination.add(0);
 
     // Distribute data files evenly by size (greedy bin packing)
     int numPartitions = Math.max(1, Math.min(dataFileInfos.size(),
@@ -1147,6 +1206,9 @@ public class ConvertEqualityDeleteFilesSparkAction
             dataFilesReceived,
             filesSkipped,
             dataFileBytesRead,
+            dataRecordsScanned,
+            dataRecordsTotal,
+            filesWithEarlyTermination,
             cacheMountPath,
             cacheS3Prefix,
             groupIndex,
@@ -1163,7 +1225,8 @@ public class ConvertEqualityDeleteFilesSparkAction
     return new PendingConversionJob(
         groupIndex, eqDeleteGroup, dataFileTasks, dataFileInfos.size(), totalDataFileSize, future,
         eqDeleteRecordsRead, eqDeleteReadTimeMs, dataFileReadTimeMs, posDeleteWriteTimeMs,
-        posDeleteRecordsWritten, filesSkipped, dataFileBytesRead);
+        posDeleteRecordsWritten, filesSkipped, dataFileBytesRead,
+        dataRecordsScanned, dataRecordsTotal, filesWithEarlyTermination);
   }
 
   /** Convert serializable DeleteFileInfo from executors to DeleteFile for commit. */
@@ -1222,15 +1285,19 @@ public class ConvertEqualityDeleteFilesSparkAction
     private final String path;
     private final String format;
     private final long fileSizeInBytes;
+    private final long recordCount;
     private final int specId;
     private final Object[] partitionValues;
+    private final Integer sortOrderId;
 
-    DataFileInfo(String path, String format, long fileSizeInBytes, int specId,
-        StructLike partition, int partitionSize) {
+    DataFileInfo(String path, String format, long fileSizeInBytes, long recordCount, int specId,
+        StructLike partition, int partitionSize, Integer sortOrderId) {
       this.path = path;
       this.format = format;
       this.fileSizeInBytes = fileSizeInBytes;
+      this.recordCount = recordCount;
       this.specId = specId;
+      this.sortOrderId = sortOrderId;
       if (partition != null && partitionSize > 0) {
         this.partitionValues = new Object[partitionSize];
         for (int i = 0; i < partitionSize; i++) {
@@ -1253,12 +1320,20 @@ public class ConvertEqualityDeleteFilesSparkAction
       return fileSizeInBytes;
     }
 
+    long recordCount() {
+      return recordCount;
+    }
+
     int specId() {
       return specId;
     }
 
     Object[] partitionValues() {
       return partitionValues;
+    }
+
+    Integer sortOrderId() {
+      return sortOrderId;
     }
 
     @Override
@@ -1522,6 +1597,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     private final org.apache.spark.util.LongAccumulator dataFilesReceived;
     private final org.apache.spark.util.LongAccumulator filesSkipped;
     private final org.apache.spark.util.LongAccumulator dataFileBytesRead;
+    private final org.apache.spark.util.LongAccumulator dataRecordsScanned;
+    private final org.apache.spark.util.LongAccumulator dataRecordsTotal;
+    private final org.apache.spark.util.LongAccumulator filesWithEarlyTermination;
     private final String cacheMountPath;
     private final String cacheS3Prefix;
     private final int groupIndex;
@@ -1540,6 +1618,9 @@ public class ConvertEqualityDeleteFilesSparkAction
         org.apache.spark.util.LongAccumulator dataFilesReceived,
         org.apache.spark.util.LongAccumulator filesSkipped,
         org.apache.spark.util.LongAccumulator dataFileBytesRead,
+        org.apache.spark.util.LongAccumulator dataRecordsScanned,
+        org.apache.spark.util.LongAccumulator dataRecordsTotal,
+        org.apache.spark.util.LongAccumulator filesWithEarlyTermination,
         String cacheMountPath,
         String cacheS3Prefix,
         int groupIndex,
@@ -1556,6 +1637,9 @@ public class ConvertEqualityDeleteFilesSparkAction
       this.dataFilesReceived = dataFilesReceived;
       this.filesSkipped = filesSkipped;
       this.dataFileBytesRead = dataFileBytesRead;
+      this.dataRecordsScanned = dataRecordsScanned;
+      this.dataRecordsTotal = dataRecordsTotal;
+      this.filesWithEarlyTermination = filesWithEarlyTermination;
       this.cacheMountPath = cacheMountPath;
       this.cacheS3Prefix = cacheS3Prefix;
       this.groupIndex = groupIndex;
@@ -1622,6 +1706,35 @@ public class ConvertEqualityDeleteFilesSparkAction
       }
       eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
 
+      // Create sorted lists for merge join (only for single column, excluding nulls)
+      // Nulls are handled separately via hash join fallback
+      List<Long> sortedLongKeys = null;
+      List<String> sortedStringKeys = null;
+      List<BigDecimal> sortedDecimalKeys = null;
+      int eqDeleteFieldId = firstCol.fieldId();
+
+      if (isSingleLongColumn && longKeys != null) {
+        sortedLongKeys = longKeys.stream()
+            .filter(k -> k != null)
+            .sorted()
+            .collect(Collectors.toList());
+      } else if (isSingleStringColumn && stringKeys != null) {
+        sortedStringKeys = stringKeys.stream()
+            .filter(k -> k != null)
+            .sorted()
+            .collect(Collectors.toList());
+      } else if (isSingleDecimalColumn && decimalKeys != null) {
+        sortedDecimalKeys = decimalKeys.stream()
+            .filter(k -> k != null)
+            .sorted()
+            .collect(Collectors.toList());
+      }
+
+      // Check if any delete keys contain null (need hash join for null matching)
+      boolean hasNullDeleteKey = (isSingleLongColumn && longKeys != null && longKeys.contains(null))
+          || (isSingleStringColumn && stringKeys != null && stringKeys.contains(null))
+          || (isSingleDecimalColumn && decimalKeys != null && decimalKeys.contains(null));
+
       // Step 2: Process all data files in this partition
       List<DeleteFileInfo> results = Lists.newArrayList();
       String eqColumnName = firstCol.name();
@@ -1671,54 +1784,163 @@ public class ConvertEqualityDeleteFilesSparkAction
           bloomFilter = buildMultiColumnBloomFilter(deleteKeys, 10000);
         }
 
+        // Check if we can use merge join for this file
+        boolean useMergeJoin = isSingleColumn
+            && !hasNullDeleteKey
+            && canUseMergeJoin(table, fileInfo.sortOrderId(), eqDeleteFieldId);
+
         boolean anyRowsRead = false;
+        long recordsScannedInFile = 0;
+        boolean earlyTerminationUsed = false;
         long dataReadStart = System.currentTimeMillis();
         try (CloseableIterable<Record> reader =
             openDataFileForRead(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
-          for (Record record : reader) {
-            if (!anyRowsRead) {
-              anyRowsRead = true;
-            }
-            boolean match = false;
 
-            if (isSingleLongColumn) {
-              Object val = record.get(0);
-              // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
-              if (val == null) {
-                match = longKeys.contains(null);
-              } else {
-                long key = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
-                match = longKeys.contains(key);
-              }
-            } else if (isSingleStringColumn) {
-              Object val = record.get(0);
-              String key = val != null ? val.toString() : null;
-              match = stringKeys.contains(key);
-            } else if (isSingleDecimalColumn) {
-              Object val = record.get(0);
-              // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
-              if (val == null) {
-                match = decimalKeys.contains(null);
-              } else {
-                match = decimalKeys.contains((BigDecimal) val);
-              }
-            } else {
-              List<Object> recordKey = Lists.newArrayListWithCapacity(keyColumnCount);
-              for (int i = 0; i < keyColumnCount; i++) {
-                recordKey.add(record.get(i));
-              }
-              match = deleteKeys.contains(recordKey);
-            }
+          if (useMergeJoin) {
+            // Merge join: data file is sorted by eq delete column ASC
+            // Use sorted list and early termination
+            if (isSingleLongColumn && sortedLongKeys != null) {
+              int deletePtr = 0;
+              for (Record record : reader) {
+                anyRowsRead = true;
+                recordsScannedInFile++;
+                Object val = record.get(0);
+                if (val == null) {
+                  continue; // nulls handled by hasNullDeleteKey check above
+                }
+                long dataKey = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
 
-            if (match) {
-              Long pos = (Long) record.get(posColumnIndex);
-              PositionDelete<Record> posDelete = PositionDelete.create();
-              posDelete.set(fileInfo.path(), pos, null);
-              matches.add(posDelete);
+                // Move delete pointer while deleteKey < dataKey
+                while (deletePtr < sortedLongKeys.size() && sortedLongKeys.get(deletePtr) < dataKey) {
+                  deletePtr++;
+                }
+
+                // Early termination: delete keys exhausted
+                if (deletePtr >= sortedLongKeys.size()) {
+                  earlyTerminationUsed = true;
+                  break;
+                }
+
+                // Match: deleteKey == dataKey
+                if (sortedLongKeys.get(deletePtr).equals(dataKey)) {
+                  Long pos = (Long) record.get(posColumnIndex);
+                  PositionDelete<Record> posDelete = PositionDelete.create();
+                  posDelete.set(fileInfo.path(), pos, null);
+                  matches.add(posDelete);
+                }
+              }
+            } else if (isSingleStringColumn && sortedStringKeys != null) {
+              int deletePtr = 0;
+              for (Record record : reader) {
+                anyRowsRead = true;
+                recordsScannedInFile++;
+                Object val = record.get(0);
+                if (val == null) {
+                  continue;
+                }
+                String dataKey = val.toString();
+
+                while (deletePtr < sortedStringKeys.size()
+                    && sortedStringKeys.get(deletePtr).compareTo(dataKey) < 0) {
+                  deletePtr++;
+                }
+
+                if (deletePtr >= sortedStringKeys.size()) {
+                  earlyTerminationUsed = true;
+                  break;
+                }
+
+                if (sortedStringKeys.get(deletePtr).equals(dataKey)) {
+                  Long pos = (Long) record.get(posColumnIndex);
+                  PositionDelete<Record> posDelete = PositionDelete.create();
+                  posDelete.set(fileInfo.path(), pos, null);
+                  matches.add(posDelete);
+                }
+              }
+            } else if (isSingleDecimalColumn && sortedDecimalKeys != null) {
+              int deletePtr = 0;
+              for (Record record : reader) {
+                anyRowsRead = true;
+                recordsScannedInFile++;
+                Object val = record.get(0);
+                if (val == null) {
+                  continue;
+                }
+                BigDecimal dataKey = (BigDecimal) val;
+
+                while (deletePtr < sortedDecimalKeys.size()
+                    && sortedDecimalKeys.get(deletePtr).compareTo(dataKey) < 0) {
+                  deletePtr++;
+                }
+
+                if (deletePtr >= sortedDecimalKeys.size()) {
+                  earlyTerminationUsed = true;
+                  break;
+                }
+
+                if (sortedDecimalKeys.get(deletePtr).compareTo(dataKey) == 0) {
+                  Long pos = (Long) record.get(posColumnIndex);
+                  PositionDelete<Record> posDelete = PositionDelete.create();
+                  posDelete.set(fileInfo.path(), pos, null);
+                  matches.add(posDelete);
+                }
+              }
+            }
+          } else {
+            // Hash join: original logic
+            for (Record record : reader) {
+              if (!anyRowsRead) {
+                anyRowsRead = true;
+              }
+              recordsScannedInFile++;
+              boolean match = false;
+
+              if (isSingleLongColumn) {
+                Object val = record.get(0);
+                // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+                if (val == null) {
+                  match = longKeys.contains(null);
+                } else {
+                  long key = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+                  match = longKeys.contains(key);
+                }
+              } else if (isSingleStringColumn) {
+                Object val = record.get(0);
+                String key = val != null ? val.toString() : null;
+                match = stringKeys.contains(key);
+              } else if (isSingleDecimalColumn) {
+                Object val = record.get(0);
+                // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+                if (val == null) {
+                  match = decimalKeys.contains(null);
+                } else {
+                  match = decimalKeys.contains((BigDecimal) val);
+                }
+              } else {
+                List<Object> recordKey = Lists.newArrayListWithCapacity(keyColumnCount);
+                for (int i = 0; i < keyColumnCount; i++) {
+                  recordKey.add(record.get(i));
+                }
+                match = deleteKeys.contains(recordKey);
+              }
+
+              if (match) {
+                Long pos = (Long) record.get(posColumnIndex);
+                PositionDelete<Record> posDelete = PositionDelete.create();
+                posDelete.set(fileInfo.path(), pos, null);
+                matches.add(posDelete);
+              }
             }
           }
         }
         dataFileReadTimeMs.add(System.currentTimeMillis() - dataReadStart);
+
+        // Update data records metrics
+        dataRecordsTotal.add(fileInfo.recordCount());
+        dataRecordsScanned.add(recordsScannedInFile);
+        if (earlyTerminationUsed) {
+          filesWithEarlyTermination.add(1);
+        }
 
         if (!anyRowsRead) {
           // File was skipped by bloom filter (no rows read at all)
@@ -2054,6 +2276,26 @@ public class ConvertEqualityDeleteFilesSparkAction
         default:
           throw new UnsupportedOperationException("Unsupported format: " + format);
       }
+    }
+
+    /**
+     * Check if merge join can be used for this data file.
+     * Merge join requires:
+     * 1. Data file has a non-zero sort order
+     * 2. Sort order starts with the eq delete field (identity transform, ASC direction)
+     */
+    private boolean canUseMergeJoin(Table table, Integer sortOrderId, int eqDeleteFieldId) {
+      if (sortOrderId == null || sortOrderId == 0) {
+        return false;
+      }
+      SortOrder sortOrder = table.sortOrders().get(sortOrderId);
+      if (sortOrder == null || sortOrder.fields().isEmpty()) {
+        return false;
+      }
+      SortField firstField = sortOrder.fields().get(0);
+      return firstField.sourceId() == eqDeleteFieldId
+          && firstField.direction() == SortDirection.ASC
+          && firstField.transform().isIdentity();
     }
   }
 

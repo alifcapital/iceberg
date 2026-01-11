@@ -35,6 +35,7 @@ import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Parameters;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.actions.ConvertEqualityDeleteFiles;
@@ -371,6 +372,295 @@ public class TestConvertEqualityDeleteFilesAction extends TestBase {
     // Verify all other IDs are still present
     assertThat(idsAfter).containsAll(
         idsBefore.stream().filter(id -> id != 100 && id != 500 && id != 900).collect(Collectors.toList()));
+  }
+
+  @TestTemplate
+  public void testMergeJoinWithSortedDataFile() {
+    // Test that merge join is used when data file is sorted by the equality delete column
+    // Create table WITH sort order on id column ASC
+    SortOrder sortOrder = SortOrder.builderFor(SCHEMA).asc("id").build();
+    Table table =
+        TABLES.create(
+            SCHEMA,
+            PartitionSpec.unpartitioned(),
+            sortOrder,
+            ImmutableMap.of(
+                TableProperties.FORMAT_VERSION, String.valueOf(formatVersion),
+                TableProperties.DEFAULT_FILE_FORMAT, "parquet"),
+            tableLocation);
+
+    // Insert sorted data: ids 1-100
+    spark
+        .range(1, 101)
+        .selectExpr("cast(id as int) as id", "'value' as data")
+        .write()
+        .format("iceberg")
+        .mode("append")
+        .save(tableLocation);
+
+    table.refresh();
+
+    // Verify data file has sort_order_id set
+    List<DataFile> dataFilesBefore = TestHelpers.dataFiles(table);
+    assertThat(dataFilesBefore).isNotEmpty();
+    // The file should have a non-zero sort_order_id since table has sort order
+    assertThat(dataFilesBefore.get(0).sortOrderId()).isNotNull();
+
+    // Write equality delete for some ids (spread across the sorted range)
+    writeEqualityDelete(table, Lists.newArrayList(10, 25, 50, 75, 90));
+
+    table.refresh();
+
+    // Read data BEFORE conversion
+    List<Row> dataBefore = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataBefore).hasSize(95); // 100 - 5 deleted
+
+    // Convert - should use merge join for sorted file
+    ConvertEqualityDeleteFiles.Result result =
+        SparkActions.get().convertEqualityDeletes(table).execute();
+
+    assertThat(result.convertedEqualityDeleteFilesCount()).isEqualTo(1);
+    assertThat(result.addedPositionDeleteFilesCount()).isGreaterThan(0);
+
+    table.refresh();
+
+    // Verify data correctness AFTER conversion
+    List<Row> dataAfter = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataAfter).hasSize(dataBefore.size());
+
+    List<Integer> idsAfter =
+        dataAfter.stream().map(r -> r.getInt(0)).sorted().collect(Collectors.toList());
+    assertThat(idsAfter).doesNotContain(10, 25, 50, 75, 90);
+  }
+
+  @TestTemplate
+  public void testFallbackToHashJoinForUnsortedFile() {
+    // Test that hash join is used when data file is NOT sorted (sort_order_id = 0)
+    // Create table WITHOUT sort order
+    Table table =
+        TABLES.create(
+            SCHEMA,
+            PartitionSpec.unpartitioned(),
+            ImmutableMap.of(
+                TableProperties.FORMAT_VERSION, String.valueOf(formatVersion),
+                TableProperties.DEFAULT_FILE_FORMAT, "parquet"),
+            tableLocation);
+
+    // Insert data without any sort order
+    spark
+        .range(1, 101)
+        .selectExpr("cast(id as int) as id", "'value' as data")
+        .write()
+        .format("iceberg")
+        .mode("append")
+        .save(tableLocation);
+
+    table.refresh();
+
+    // Verify data file has sort_order_id = 0 (unsorted)
+    List<DataFile> dataFilesBefore = TestHelpers.dataFiles(table);
+    assertThat(dataFilesBefore).isNotEmpty();
+    // Without sort order, sort_order_id should be 0
+    assertThat(dataFilesBefore.get(0).sortOrderId()).isEqualTo(0);
+
+    // Write equality delete
+    writeEqualityDelete(table, Lists.newArrayList(10, 50, 90));
+
+    table.refresh();
+
+    // Read data BEFORE conversion
+    List<Row> dataBefore = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataBefore).hasSize(97); // 100 - 3 deleted
+
+    // Convert - should fallback to hash join for unsorted file
+    ConvertEqualityDeleteFiles.Result result =
+        SparkActions.get().convertEqualityDeletes(table).execute();
+
+    assertThat(result.convertedEqualityDeleteFilesCount()).isEqualTo(1);
+
+    table.refresh();
+
+    // Verify data correctness
+    List<Row> dataAfter = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataAfter).hasSize(dataBefore.size());
+
+    List<Integer> idsAfter =
+        dataAfter.stream().map(r -> r.getInt(0)).sorted().collect(Collectors.toList());
+    assertThat(idsAfter).doesNotContain(10, 50, 90);
+  }
+
+  @TestTemplate
+  public void testMergeJoinEarlyTermination() {
+    // Test that merge join with early termination works correctly
+    // When delete keys are exhausted, the scan should stop early
+    SortOrder sortOrder = SortOrder.builderFor(SCHEMA).asc("id").build();
+    Table table =
+        TABLES.create(
+            SCHEMA,
+            PartitionSpec.unpartitioned(),
+            sortOrder,
+            ImmutableMap.of(
+                TableProperties.FORMAT_VERSION, String.valueOf(formatVersion),
+                TableProperties.DEFAULT_FILE_FORMAT, "parquet"),
+            tableLocation);
+
+    // Insert sorted data: ids 1-1000 (large file to benefit from early termination)
+    spark
+        .range(1, 1001)
+        .selectExpr("cast(id as int) as id", "'value' as data")
+        .write()
+        .format("iceberg")
+        .mode("append")
+        .save(tableLocation);
+
+    table.refresh();
+
+    // Write equality delete for LOW ids only (1, 5, 10)
+    // Merge join should terminate early after id=10, not scanning ids 11-1000
+    writeEqualityDelete(table, Lists.newArrayList(1, 5, 10));
+
+    table.refresh();
+
+    // Read data BEFORE conversion
+    List<Row> dataBefore = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataBefore).hasSize(997); // 1000 - 3 deleted
+
+    // Convert - merge join should use early termination
+    ConvertEqualityDeleteFiles.Result result =
+        SparkActions.get().convertEqualityDeletes(table).execute();
+
+    assertThat(result.convertedEqualityDeleteFilesCount()).isEqualTo(1);
+    assertThat(result.addedDeleteRecordsCount()).isEqualTo(3);
+
+    // Verify early termination was used
+    assertThat(result.filesWithEarlyTermination()).isEqualTo(1);
+
+    // Verify that we scanned significantly fewer records than total due to early termination
+    // With delete keys 1, 5, 10 on sorted file, we should stop around id=10
+    // dataRecordsScanned should be much less than dataRecordsTotal (1000)
+    assertThat(result.dataRecordsTotal()).isEqualTo(1000);
+    assertThat(result.dataRecordsScanned()).isLessThan(100); // Should stop early, around 10-15 records
+
+    table.refresh();
+
+    // Verify data correctness
+    List<Row> dataAfter = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataAfter).hasSize(dataBefore.size());
+
+    List<Integer> idsAfter =
+        dataAfter.stream().map(r -> r.getInt(0)).sorted().collect(Collectors.toList());
+    assertThat(idsAfter).doesNotContain(1, 5, 10);
+
+    // Verify high ids are NOT deleted (they should be present)
+    assertThat(idsAfter).contains(500, 750, 999, 1000);
+  }
+
+  @TestTemplate
+  public void testFallbackToHashJoinForMultiColumnKey() {
+    // Test that hash join is used for multi-column equality delete keys
+    // (merge join only supports single column)
+    Schema multiColSchema =
+        new Schema(
+            optional(1, "id", Types.IntegerType.get()),
+            optional(2, "category", Types.IntegerType.get()),
+            optional(3, "data", Types.StringType.get()));
+
+    // Create table with sort order on id (but eq delete will be on id AND category)
+    SortOrder sortOrder = SortOrder.builderFor(multiColSchema).asc("id").build();
+    Table table =
+        TABLES.create(
+            multiColSchema,
+            PartitionSpec.unpartitioned(),
+            sortOrder,
+            ImmutableMap.of(
+                TableProperties.FORMAT_VERSION, String.valueOf(formatVersion),
+                TableProperties.DEFAULT_FILE_FORMAT, "parquet"),
+            tableLocation);
+
+    // Insert data with id and category
+    spark
+        .range(1, 51)
+        .selectExpr(
+            "cast(id as int) as id",
+            "cast(id % 5 as int) as category",
+            "'value' as data")
+        .write()
+        .format("iceberg")
+        .mode("append")
+        .save(tableLocation);
+
+    table.refresh();
+
+    // Write multi-column equality delete (id=10, category=0)
+    // Should delete only rows where BOTH id=10 AND category=0 (which is id=10 since 10%5=0)
+    writeMultiColumnEqualityDelete(table, 10, 0);
+
+    table.refresh();
+
+    // Read data BEFORE conversion
+    List<Row> dataBefore = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataBefore).hasSize(49); // 50 - 1 deleted
+
+    // Convert - should fallback to hash join for multi-column key
+    ConvertEqualityDeleteFiles.Result result =
+        SparkActions.get().convertEqualityDeletes(table).execute();
+
+    assertThat(result.convertedEqualityDeleteFilesCount()).isEqualTo(1);
+
+    table.refresh();
+
+    // Verify data correctness
+    List<Row> dataAfter = spark.read().format("iceberg").load(tableLocation).collectAsList();
+    assertThat(dataAfter).hasSize(dataBefore.size());
+
+    // Verify id=10 is deleted
+    List<Integer> idsAfter =
+        dataAfter.stream().map(r -> r.getInt(0)).sorted().collect(Collectors.toList());
+    assertThat(idsAfter).doesNotContain(10);
+
+    // Verify other ids with category=0 (5, 15, 20, etc.) are NOT deleted
+    assertThat(idsAfter).contains(5, 15, 20, 25, 30, 35, 40, 45, 50);
+  }
+
+  private void writeMultiColumnEqualityDelete(Table table, int idValue, int categoryValue) {
+    table.refresh();
+    List<Integer> equalityFieldIds =
+        Lists.newArrayList(
+            table.schema().findField("id").fieldId(),
+            table.schema().findField("category").fieldId());
+    Schema eqDeleteRowSchema = table.schema().select("id", "category");
+
+    OutputFileFactory fileFactory =
+        OutputFileFactory.builderFor(table, 1, System.nanoTime())
+            .format(FileFormat.PARQUET)
+            .build();
+
+    GenericAppenderFactory appenderFactory =
+        new GenericAppenderFactory(
+            table.schema(),
+            table.spec(),
+            ArrayUtil.toIntArray(equalityFieldIds),
+            eqDeleteRowSchema,
+            null);
+
+    OutputFile outputFile = fileFactory.newOutputFile().encryptingOutputFile();
+
+    EqualityDeleteWriter<Record> eqDeleteWriter =
+        appenderFactory.newEqDeleteWriter(
+            EncryptedFiles.encryptedOutput(outputFile, EncryptionKeyMetadata.EMPTY),
+            FileFormat.PARQUET,
+            null);
+
+    try (EqualityDeleteWriter<Record> writer = eqDeleteWriter) {
+      Record deleteRecord =
+          GenericRecord.create(eqDeleteRowSchema)
+              .copy(ImmutableMap.of("id", idValue, "category", categoryValue));
+      writer.write(deleteRecord);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+
+    table.newRowDelta().addDeletes(eqDeleteWriter.toDeleteFile()).commit();
   }
 
   private void writeEqualityDelete(Table table, List<Integer> idsToDelete) {
