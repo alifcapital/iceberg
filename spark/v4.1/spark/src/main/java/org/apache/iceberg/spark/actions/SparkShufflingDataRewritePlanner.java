@@ -100,14 +100,16 @@ class SparkShufflingDataRewritePlanner extends BinPackRewriteFilePlanner {
         Boolean.parseBoolean(options.getOrDefault(USE_IDENTIFIER_KEYS, "false"));
 
     if (useIdentifierKeys) {
-      Set<String> identifierFieldNames = table().schema().identifierFieldNames();
-      if (identifierFieldNames.isEmpty()) {
+      Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
+      if (identifierFieldIds.isEmpty()) {
         // No identifier keys - will use regular binpack grouping
         this.columnFieldIds = ImmutableList.of();
         this.columnTypes = ImmutableList.of();
       } else {
-        List<String> columns = identifierFieldNames.stream().sorted().collect(Collectors.toList());
-        initColumns(columns);
+        // Sort by field ID for deterministic ordering (same as SparkSortFileRewriteRunner)
+        List<Integer> sortedFieldIds =
+            identifierFieldIds.stream().sorted().collect(Collectors.toList());
+        initColumnsFromFieldIds(sortedFieldIds);
       }
     } else {
       this.columnFieldIds = ImmutableList.of();
@@ -129,6 +131,19 @@ class SparkShufflingDataRewritePlanner extends BinPackRewriteFilePlanner {
     for (String column : columns) {
       Types.NestedField field = table().schema().findField(column);
       Preconditions.checkArgument(field != null, "Column '%s' not found in table schema", column);
+      columnFieldIds.add(field.fieldId());
+      columnTypes.add(field.type());
+    }
+  }
+
+  private void initColumnsFromFieldIds(List<Integer> fieldIds) {
+    this.columnFieldIds = new ArrayList<>();
+    this.columnTypes = new ArrayList<>();
+
+    for (Integer fieldId : fieldIds) {
+      Types.NestedField field = table().schema().findField(fieldId);
+      Preconditions.checkArgument(
+          field != null, "Field with ID '%s' not found in table schema", fieldId);
       columnFieldIds.add(field.fieldId());
       columnTypes.add(field.type());
     }
