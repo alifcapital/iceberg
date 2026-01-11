@@ -254,64 +254,63 @@ public class OverlapRewriteFilePlanner
         CloseableIterable.of(selectedGroups), totalGroupCount, groupsInPartition);
   }
 
+  private static final int MAX_PAIRS_TO_CHECK = 1000;
+
   private List<FileScanTask> findBestGroup(List<FileScanTask> files) {
     if (files.size() < 2) {
       return null;
     }
 
-    // Calculate initial total cost
-    double initialTotalCost = calculateTotalCost(files);
-    LOG.info("OVERLAP: {} files, totalOverlapCost={}", files.size(), (long) initialTotalCost);
+    // Find overlapping pairs efficiently using sweep line algorithm
+    List<int[]> overlappingPairs = findOverlappingPairs(files);
 
-    if (initialTotalCost == 0) {
+    LOG.info("OVERLAP: {} files, {} overlapping pairs", files.size(), overlappingPairs.size());
+
+    if (overlappingPairs.isEmpty()) {
       LOG.info("OVERLAP: no overlapping files, already optimized");
-      return null; // Already optimal
+      return null;
     }
 
-    // Find the best pair to start with (highest improvement after merge+sort+split)
+    // Sort pairs by sum of record counts (descending) - higher record count = higher potential improvement
+    overlappingPairs.sort(
+        (p1, p2) -> {
+          long sum1 = files.get(p1[0]).file().recordCount() + files.get(p1[1]).file().recordCount();
+          long sum2 = files.get(p2[0]).file().recordCount() + files.get(p2[1]).file().recordCount();
+          return Long.compare(sum2, sum1); // descending
+        });
+
+    // Take top N pairs to limit computation time
+    int pairsToCheck = Math.min(overlappingPairs.size(), MAX_PAIRS_TO_CHECK);
+
+    // Find the best pair (highest improvement after merge+sort+split)
     double bestImprovement = 0;
     List<FileScanTask> bestPair = null;
     int pairsChecked = 0;
-    int pairsWithOverlap = 0;
 
-    for (int i = 0; i < files.size(); i++) {
-      for (int j = i + 1; j < files.size(); j++) {
-        FileScanTask a = files.get(i);
-        FileScanTask b = files.get(j);
+    for (int i = 0; i < pairsToCheck; i++) {
+      int[] pair = overlappingPairs.get(i);
+      FileScanTask a = files.get(pair[0]);
+      FileScanTask b = files.get(pair[1]);
 
-        // Check if pair fits within group size limit
-        long pairSize = a.length() + b.length();
-        if (pairSize > maxGroupSize) {
-          continue; // Pair exceeds max group size
-        }
+      // Check if pair fits within group size limit
+      long pairSize = a.length() + b.length();
+      if (pairSize > maxGroupSize) {
+        continue;
+      }
 
-        pairsChecked++;
-        double pairCost = calculatePairCost(a, b);
+      pairsChecked++;
+      double improvement = calculateMergeImprovement(files, Arrays.asList(a, b));
 
-        LOG.debug("OVERLAP: pair {}: pairCost={} pairSize={}", pairsChecked, pairCost, pairSize);
-
-        if (pairCost <= 0) {
-          continue; // No overlap between this pair
-        }
-
-        pairsWithOverlap++;
-
-        // After merge+sort+split, cost between these two becomes 0
-        double improvement = calculateMergeImprovement(files, Arrays.asList(a, b));
-
-        LOG.debug("OVERLAP: overlapping pair {}: improvement={}", pairsWithOverlap, improvement);
-
-        if (improvement > bestImprovement) {
-          bestImprovement = improvement;
-          bestPair = Arrays.asList(a, b);
-        }
+      if (improvement > bestImprovement) {
+        bestImprovement = improvement;
+        bestPair = Arrays.asList(a, b);
       }
     }
 
     LOG.info(
-        "OVERLAP: checked {} pairs, {} overlapping, bestImprovement={}",
+        "OVERLAP: checked {} of {} pairs, bestImprovement={}",
         pairsChecked,
-        pairsWithOverlap,
+        overlappingPairs.size(),
         (long) bestImprovement);
 
     if (bestPair == null || bestImprovement <= 0) {
@@ -378,14 +377,70 @@ public class OverlapRewriteFilePlanner
     return group;
   }
 
-  private double calculateTotalCost(List<FileScanTask> files) {
-    double totalCost = 0;
+  /**
+   * Find overlapping file pairs using sweep line algorithm. Average case O(n log n + k) where k is
+   * number of overlapping pairs. Worst case O(n²) when all files overlap.
+   */
+  @SuppressWarnings("unchecked")
+  private List<int[]> findOverlappingPairs(List<FileScanTask> files) {
+    if (columnFieldIds.isEmpty()) {
+      return ImmutableList.of();
+    }
+
+    // Use first column for sweep line
+    int fieldId = columnFieldIds.get(0);
+    Type type = columnTypes.get(0);
+
+    // Build list of (index, lower, upper) for sorting
+    List<int[]> fileIndices = new ArrayList<>();
+    List<Comparable<Object>> lowers = new ArrayList<>();
+    List<Comparable<Object>> uppers = new ArrayList<>();
+
     for (int i = 0; i < files.size(); i++) {
-      for (int j = i + 1; j < files.size(); j++) {
-        totalCost += calculatePairCost(files.get(i), files.get(j));
+      FileScanTask task = files.get(i);
+      ByteBuffer lowerBuf = task.file().lowerBounds().get(fieldId);
+      ByteBuffer upperBuf = task.file().upperBounds().get(fieldId);
+
+      if (lowerBuf != null && upperBuf != null) {
+        Comparable<Object> lower = (Comparable<Object>) Conversions.fromByteBuffer(type, lowerBuf);
+        Comparable<Object> upper = (Comparable<Object>) Conversions.fromByteBuffer(type, upperBuf);
+        fileIndices.add(new int[] {i});
+        lowers.add(lower);
+        uppers.add(upper);
       }
     }
-    return totalCost;
+
+    // Sort by lower bound
+    Integer[] sortedIdx = new Integer[fileIndices.size()];
+    for (int i = 0; i < sortedIdx.length; i++) {
+      sortedIdx[i] = i;
+    }
+    Arrays.sort(sortedIdx, (a, b) -> lowers.get(a).compareTo(lowers.get(b)));
+
+    // Sweep line: for each file, find all files that overlap with it
+    List<int[]> overlappingPairs = new ArrayList<>();
+
+    for (int i = 0; i < sortedIdx.length; i++) {
+      int idxI = sortedIdx[i];
+      int fileI = fileIndices.get(idxI)[0];
+      Comparable<Object> upperI = uppers.get(idxI);
+
+      // Check following files until their lower > our upper
+      for (int j = i + 1; j < sortedIdx.length; j++) {
+        int idxJ = sortedIdx[j];
+        Comparable<Object> lowerJ = lowers.get(idxJ);
+
+        // If lowerJ > upperI, no more overlaps possible (sorted by lower)
+        if (lowerJ.compareTo(upperI) > 0) {
+          break;
+        }
+
+        int fileJ = fileIndices.get(idxJ)[0];
+        overlappingPairs.add(new int[] {fileI, fileJ});
+      }
+    }
+
+    return overlappingPairs;
   }
 
   private double calculateMergeImprovement(List<FileScanTask> allFiles, List<FileScanTask> group) {

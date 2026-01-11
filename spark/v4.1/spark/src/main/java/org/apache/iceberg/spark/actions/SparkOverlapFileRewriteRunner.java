@@ -80,11 +80,7 @@ class SparkOverlapFileRewriteRunner extends SparkShufflingFileRewriteRunner {
 
     if (useIdentifierKeys) {
       Set<String> identifierFieldNames = table().schema().identifierFieldNames();
-      Preconditions.checkArgument(
-          !identifierFieldNames.isEmpty(),
-          "Table '%s' has no identifier fields defined, cannot use '%s=true'",
-          table().name(),
-          USE_IDENTIFIER_KEYS);
+      // Empty identifier keys handled by planner (returns empty plan)
       this.columns = identifierFieldNames.stream().sorted().collect(Collectors.toList());
     } else {
       this.columns =
