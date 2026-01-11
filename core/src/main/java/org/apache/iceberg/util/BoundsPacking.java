@@ -127,5 +127,74 @@ public class BoundsPacking {
 
       return groups;
     }
+
+    /**
+     * Packs items into groups based on overlapping bounds.
+     *
+     * <p>Items must be pre-sorted by lower bound. Items are added to the current group only if they
+     * overlap with the group (itemLower < maxUpperInGroup). Consecutive items (no overlap) start a
+     * new group because merging them would expand bounds and potentially create new overlaps with
+     * files in the gap.
+     *
+     * @param items items to pack (must be sorted by lower bound)
+     * @param weightFunc function to get weight of each item
+     * @param lowerFunc function to get lower bound of each item
+     * @param upperFunc function to get upper bound of each item
+     * @return list of groups, each group contains only overlapping items
+     */
+    @SuppressWarnings("unchecked")
+    public List<List<T>> packWithBounds(
+        Iterable<T> items,
+        Function<T, Long> weightFunc,
+        Function<T, Comparable<?>> lowerFunc,
+        Function<T, Comparable<?>> upperFunc) {
+      List<List<T>> groups = new ArrayList<>();
+      List<T> currentGroup = new ArrayList<>();
+      long currentGroupSize = 0;
+      Comparable<Object> maxUpperInGroup = null;
+
+      for (T item : items) {
+        long itemWeight = weightFunc.apply(item);
+        Comparable<Object> itemLower = (Comparable<Object>) lowerFunc.apply(item);
+        Comparable<Object> itemUpper = (Comparable<Object>) upperFunc.apply(item);
+
+        // Check if item overlaps with current group
+        // Overlap: itemLower < maxUpperInGroup (they share some range)
+        // Consecutive: itemLower >= maxUpperInGroup (gap between them - can't merge)
+        boolean isConsecutive = false;
+        if (maxUpperInGroup != null && !currentGroup.isEmpty()) {
+          isConsecutive = itemLower.compareTo(maxUpperInGroup) >= 0;
+        }
+
+        // Start new group if: consecutive (no overlap) OR size exceeded OR count exceeded
+        boolean sizeExceeded =
+            currentGroupSize + itemWeight > maxGroupSize && !currentGroup.isEmpty();
+        boolean countExceeded = currentGroup.size() >= maxGroupCount && !currentGroup.isEmpty();
+
+        if (isConsecutive || sizeExceeded || countExceeded) {
+          if (!currentGroup.isEmpty()) {
+            groups.add(ImmutableList.copyOf(currentGroup));
+          }
+          currentGroup = new ArrayList<>();
+          currentGroupSize = 0;
+          maxUpperInGroup = null;
+        }
+
+        currentGroup.add(item);
+        currentGroupSize += itemWeight;
+
+        // Update max upper bound in group
+        if (maxUpperInGroup == null || itemUpper.compareTo(maxUpperInGroup) > 0) {
+          maxUpperInGroup = itemUpper;
+        }
+      }
+
+      // Don't forget the last group
+      if (!currentGroup.isEmpty()) {
+        groups.add(ImmutableList.copyOf(currentGroup));
+      }
+
+      return groups;
+    }
   }
 }

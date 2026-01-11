@@ -164,8 +164,9 @@ class SparkShufflingDataRewritePlanner extends BinPackRewriteFilePlanner {
   }
 
   /**
-   * Plans file groups preserving bounds order. Files are sorted by lower bound, checked for no
-   * partial overlaps, and grouped sequentially.
+   * Plans file groups based on overlapping bounds. Files are sorted by lower bound and grouped
+   * only with overlapping files. Consecutive files (no overlap) start new groups to avoid
+   * expanding bounds.
    */
   @SuppressWarnings("unchecked")
   private Iterable<List<FileScanTask>> planFileGroupsWithBounds(Iterable<FileScanTask> tasks) {
@@ -184,37 +185,18 @@ class SparkShufflingDataRewritePlanner extends BinPackRewriteFilePlanner {
       return super.planFileGroups(tasks);
     }
 
+    // Filter files using parent's filterFiles (size, delete-file-threshold, delete-ratio)
+    List<FileScanTask> filteredTasks = Lists.newArrayList(filterFiles(tasksWithBounds));
+
+    if (filteredTasks.isEmpty()) {
+      LOG.info("No files to group after filtering");
+      return ImmutableList.of();
+    }
+
     // Sort by lower bound of first column
     int fieldId = columnFieldIds.get(0);
     Type type = columnTypes.get(0);
 
-    tasksWithBounds.sort(
-        Comparator.comparing(
-            task -> {
-              ByteBuffer buf = task.file().lowerBounds().get(fieldId);
-              return (Comparable<Object>) Conversions.fromByteBuffer(type, buf);
-            }));
-
-    // Check if all files have no partial overlaps (consecutive or containment is OK)
-    if (hasPartialOverlaps(tasksWithBounds, fieldId, type)) {
-      LOG.info(
-          "Files have partial overlapping bounds, skipping bounds-aware grouping for {} files",
-          tasksWithBounds.size());
-      return ImmutableList.of();
-    }
-
-    // Filter small files (using parent's filterFiles logic)
-    List<FileScanTask> filteredTasks =
-        tasksWithBounds.stream()
-            .filter(this::outsideDesiredFileSizeRange)
-            .collect(Collectors.toList());
-
-    if (filteredTasks.isEmpty()) {
-      LOG.info("No small files to group after filtering");
-      return ImmutableList.of();
-    }
-
-    // Re-sort filtered tasks by lower bound to maintain order
     filteredTasks.sort(
         Comparator.comparing(
             task -> {
@@ -222,21 +204,24 @@ class SparkShufflingDataRewritePlanner extends BinPackRewriteFilePlanner {
               return (Comparable<Object>) Conversions.fromByteBuffer(type, buf);
             }));
 
-    // Group sequentially using BoundsPacking
+    // Group by overlapping bounds - consecutive files start new groups
     BoundsPacking.ListPacker<FileScanTask> packer =
         new BoundsPacking.ListPacker<>(maxGroupSize, maxGroupCount);
-    List<List<FileScanTask>> groups = packer.pack(filteredTasks, ContentScanTask::length);
+    List<List<FileScanTask>> groups =
+        packer.packWithBounds(
+            filteredTasks,
+            ContentScanTask::length,
+            task -> {
+              ByteBuffer buf = task.file().lowerBounds().get(fieldId);
+              return (Comparable<?>) Conversions.fromByteBuffer(type, buf);
+            },
+            task -> {
+              ByteBuffer buf = task.file().upperBounds().get(fieldId);
+              return (Comparable<?>) Conversions.fromByteBuffer(type, buf);
+            });
 
-    // Apply filter for minimum input files and content requirements
-    List<List<FileScanTask>> validGroups =
-        groups.stream()
-            .filter(
-                group ->
-                    enoughInputFiles(group)
-                        && (enoughContent(group)
-                            || tooMuchContent(group)
-                            || group.stream().anyMatch(this::hasDeletes)))
-            .collect(Collectors.toList());
+    // Apply parent's filterFileGroups (min-input-files, content size, delete thresholds)
+    List<List<FileScanTask>> validGroups = Lists.newArrayList(filterFileGroups(groups));
 
     LOG.info(
         "Bounds-aware grouping: {} files -> {} groups ({} valid)",
@@ -245,46 +230,6 @@ class SparkShufflingDataRewritePlanner extends BinPackRewriteFilePlanner {
         validGroups.size());
 
     return validGroups;
-  }
-
-  /**
-   * Check if files have partial overlaps. Consecutive bounds and full containment are OK.
-   */
-  @SuppressWarnings("unchecked")
-  private boolean hasPartialOverlaps(List<FileScanTask> sortedTasks, int fieldId, Type type) {
-    // Track the maximum upper bound seen so far
-    Comparable<Object> maxUpperSoFar = null;
-
-    for (FileScanTask task : sortedTasks) {
-      ByteBuffer lowerBuf = task.file().lowerBounds().get(fieldId);
-      ByteBuffer upperBuf = task.file().upperBounds().get(fieldId);
-
-      if (lowerBuf == null || upperBuf == null) {
-        return true; // Missing bounds, can't verify
-      }
-
-      Comparable<Object> lower = (Comparable<Object>) Conversions.fromByteBuffer(type, lowerBuf);
-      Comparable<Object> upper = (Comparable<Object>) Conversions.fromByteBuffer(type, upperBuf);
-
-      if (maxUpperSoFar != null) {
-        // Check for partial overlap using BoundsPacking helper
-        if (BoundsPacking.hasPartialOverlap(maxUpperSoFar, lower, upper)) {
-          LOG.debug(
-              "Partial overlap detected: maxUpperSoFar={} vs file {} lower={} upper={}",
-              maxUpperSoFar,
-              task.file().path(),
-              lower,
-              upper);
-          return true;
-        }
-      }
-
-      // Update max upper bound
-      if (maxUpperSoFar == null || upper.compareTo(maxUpperSoFar) > 0) {
-        maxUpperSoFar = upper;
-      }
-    }
-    return false;
   }
 
   private boolean hasAllBounds(FileScanTask task) {
@@ -303,7 +248,4 @@ class SparkShufflingDataRewritePlanner extends BinPackRewriteFilePlanner {
     return true;
   }
 
-  private boolean hasDeletes(FileScanTask task) {
-    return task.deletes() != null && !task.deletes().isEmpty();
-  }
 }
