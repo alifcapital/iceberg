@@ -254,7 +254,7 @@ public class OverlapRewriteFilePlanner
         CloseableIterable.of(selectedGroups), totalGroupCount, groupsInPartition);
   }
 
-  private static final int MAX_PAIRS_TO_CHECK = 1000;
+  private static final int PAIRS_BATCH_SIZE = 1000;
 
   private List<FileScanTask> findBestGroup(List<FileScanTask> files) {
     if (files.size() < 2) {
@@ -279,60 +279,159 @@ public class OverlapRewriteFilePlanner
           return Long.compare(sum2, sum1); // descending
         });
 
-    // Take top N pairs to limit computation time
-    int pairsToCheck = Math.min(overlappingPairs.size(), MAX_PAIRS_TO_CHECK);
+    // Stage 1: Try to find pair with positive improvement, checking in batches
+    List<FileScanTask> bestPair = findBestPairIncremental(files, overlappingPairs);
 
-    // Find the best pair (highest improvement after merge+sort+split)
-    double bestImprovement = 0;
-    List<FileScanTask> bestPair = null;
-    int pairsChecked = 0;
-
-    for (int i = 0; i < pairsToCheck; i++) {
-      int[] pair = overlappingPairs.get(i);
-      FileScanTask a = files.get(pair[0]);
-      FileScanTask b = files.get(pair[1]);
-
-      // Check if pair fits within group size limit
-      long pairSize = a.length() + b.length();
-      if (pairSize > maxGroupSize) {
-        continue;
-      }
-
-      pairsChecked++;
-      double improvement = calculateMergeImprovement(files, Arrays.asList(a, b));
-
-      if (improvement > bestImprovement) {
-        bestImprovement = improvement;
-        bestPair = Arrays.asList(a, b);
-      }
+    if (bestPair != null) {
+      return expandGroup(files, bestPair);
     }
 
-    LOG.info(
-        "OVERLAP: checked {} of {} pairs, bestImprovement={}",
-        pairsChecked,
-        overlappingPairs.size(),
-        (long) bestImprovement);
+    // Stage 2: No positive improvement possible, but overlaps exist
+    // Do a full sort starting from min lower bound among overlapping files
+    LOG.info("OVERLAP: stage 2 - full sort fallback");
+    return buildFallbackGroup(files, overlappingPairs);
+  }
 
-    if (bestPair == null || bestImprovement <= 0) {
-      LOG.info("OVERLAP: no improvement possible");
+  /**
+   * Stage 1: Find best pair with positive improvement, checking batches of pairs.
+   */
+  private List<FileScanTask> findBestPairIncremental(
+      List<FileScanTask> files, List<int[]> overlappingPairs) {
+    int totalPairs = overlappingPairs.size();
+    int batchStart = 0;
+
+    while (batchStart < totalPairs) {
+      int batchEnd = Math.min(batchStart + PAIRS_BATCH_SIZE, totalPairs);
+
+      double bestImprovement = 0;
+      List<FileScanTask> bestPair = null;
+      int pairsChecked = 0;
+
+      for (int i = batchStart; i < batchEnd; i++) {
+        int[] pair = overlappingPairs.get(i);
+        FileScanTask a = files.get(pair[0]);
+        FileScanTask b = files.get(pair[1]);
+
+        pairsChecked++;
+        double improvement = calculateMergeImprovement(files, Arrays.asList(a, b));
+
+        if (improvement > bestImprovement) {
+          bestImprovement = improvement;
+          bestPair = Arrays.asList(a, b);
+        }
+      }
+
+      LOG.info(
+          "OVERLAP: batch {}-{} of {}, checked {}, bestImprovement={}",
+          batchStart,
+          batchEnd,
+          totalPairs,
+          pairsChecked,
+          (long) bestImprovement);
+
+      if (bestPair != null && bestImprovement > 0) {
+        LOG.info(
+            "OVERLAP: best pair {} + {} records, improvement={}",
+            bestPair.get(0).file().recordCount(),
+            bestPair.get(1).file().recordCount(),
+            (long) bestImprovement);
+        return bestPair;
+      }
+
+      batchStart = batchEnd;
+    }
+
+    LOG.info("OVERLAP: no positive improvement found in any batch");
+    return null;
+  }
+
+  /**
+   * Stage 2: Build a fallback group starting from min lower bound among overlapping files.
+   * This forces a full sort of a region with overlaps.
+   */
+  @SuppressWarnings("unchecked")
+  private List<FileScanTask> buildFallbackGroup(
+      List<FileScanTask> files, List<int[]> overlappingPairs) {
+    if (columnFieldIds.isEmpty()) {
       return null;
     }
 
-    LOG.info(
-        "OVERLAP: best pair {} + {} records, improvement={}",
-        bestPair.get(0).file().recordCount(),
-        bestPair.get(1).file().recordCount(),
-        (long) bestImprovement);
+    // Collect indices of files that have overlaps
+    Set<Integer> overlappingFileIndices = new java.util.HashSet<>();
+    for (int[] pair : overlappingPairs) {
+      overlappingFileIndices.add(pair[0]);
+      overlappingFileIndices.add(pair[1]);
+    }
 
-    // Try to expand the group by adding more files
-    List<FileScanTask> group = new ArrayList<>(bestPair);
+    int fieldId = columnFieldIds.get(0);
+    Type type = columnTypes.get(0);
+
+    // Get overlapping files and sort by lower bound
+    List<FileScanTask> overlappingFiles = new ArrayList<>();
+    for (int idx : overlappingFileIndices) {
+      overlappingFiles.add(files.get(idx));
+    }
+
+    if (overlappingFiles.isEmpty()) {
+      return null;
+    }
+
+    overlappingFiles.sort(
+        (f1, f2) -> {
+          ByteBuffer buf1 = f1.file().lowerBounds().get(fieldId);
+          ByteBuffer buf2 = f2.file().lowerBounds().get(fieldId);
+          if (buf1 == null && buf2 == null) return 0;
+          if (buf1 == null) return 1;
+          if (buf2 == null) return -1;
+          Comparable<Object> v1 = (Comparable<Object>) Conversions.fromByteBuffer(type, buf1);
+          Comparable<Object> v2 = (Comparable<Object>) Conversions.fromByteBuffer(type, buf2);
+          return v1.compareTo(v2);
+        });
+
+    // Build group: add overlapping files in order until we hit limits
+    List<FileScanTask> group = new ArrayList<>();
+    long groupSize = 0;
+
+    for (FileScanTask task : overlappingFiles) {
+      if (group.size() >= maxGroupInputFiles) {
+        break;
+      }
+      if (groupSize + task.length() > maxGroupSize && !group.isEmpty()) {
+        break;
+      }
+      group.add(task);
+      groupSize += task.length();
+    }
+
+    if (group.size() < 2) {
+      return null;
+    }
+
+    // Get lower bound from first file for logging
+    ByteBuffer firstLowerBuf = group.get(0).file().lowerBounds().get(fieldId);
+    Object firstLower = firstLowerBuf != null ? Conversions.fromByteBuffer(type, firstLowerBuf) : null;
+
+    LOG.info(
+        "OVERLAP: fallback group starting at lower={}, {} files, {} bytes",
+        firstLower,
+        group.size(),
+        groupSize);
+
+    return group;
+  }
+
+  /**
+   * Expand a group by adding more files while it improves the cost.
+   */
+  private List<FileScanTask> expandGroup(List<FileScanTask> files, List<FileScanTask> initialPair) {
+    List<FileScanTask> group = new ArrayList<>(initialPair);
     List<FileScanTask> remaining =
         files.stream().filter(f -> !group.contains(f)).collect(Collectors.toList());
 
-    // Keep adding files while it improves the cost and within limits
+    double bestImprovement = calculateMergeImprovement(files, group);
+
     boolean improved = true;
     while (improved && !remaining.isEmpty()) {
-      // Check if we've reached the file count limit
       if (group.size() >= maxGroupInputFiles) {
         break;
       }
@@ -344,9 +443,8 @@ public class OverlapRewriteFilePlanner
       double bestAdditionImprovement = 0;
 
       for (FileScanTask candidate : remaining) {
-        // Check if adding this file would exceed size limit
         if (currentGroupSize + candidate.length() > maxGroupSize) {
-          continue; // Would exceed max group size
+          continue;
         }
 
         List<FileScanTask> testGroup = new ArrayList<>(group);
@@ -430,8 +528,8 @@ public class OverlapRewriteFilePlanner
         int idxJ = sortedIdx[j];
         Comparable<Object> lowerJ = lowers.get(idxJ);
 
-        // If lowerJ > upperI, no more overlaps possible (sorted by lower)
-        if (lowerJ.compareTo(upperI) > 0) {
+        // If lowerJ >= upperI, no overlap (files just touch at boundary)
+        if (lowerJ.compareTo(upperI) >= 0) {
           break;
         }
 
