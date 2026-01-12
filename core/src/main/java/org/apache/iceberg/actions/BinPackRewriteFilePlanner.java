@@ -236,14 +236,7 @@ public class BinPackRewriteFilePlanner
                   && (group.stream().anyMatch(this::tooManyDeletes)
                       || group.stream().anyMatch(this::tooHighDeleteRatio)));
     }
-    return Iterables.filter(
-        groups,
-        group ->
-            enoughInputFiles(group)
-                && (enoughContent(group)
-                    || tooMuchContent(group)
-                    || group.stream().anyMatch(this::tooManyDeletes)
-                    || group.stream().anyMatch(this::tooHighDeleteRatio)));
+    return Iterables.filter(groups, this::enoughInputFiles);
   }
 
   @Override
