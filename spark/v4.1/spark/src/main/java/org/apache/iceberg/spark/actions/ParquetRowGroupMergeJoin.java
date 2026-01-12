@@ -56,21 +56,10 @@ class ParquetRowGroupMergeJoin {
   static class Result {
     final List<PositionDelete<Record>> matches;
     final long recordsScanned;
-    final int rowGroupsSkipped;
-    final int rowGroupsProcessed;
-    final boolean earlyTerminationUsed;
 
-    Result(
-        List<PositionDelete<Record>> matches,
-        long recordsScanned,
-        int rowGroupsSkipped,
-        int rowGroupsProcessed,
-        boolean earlyTerminationUsed) {
+    Result(List<PositionDelete<Record>> matches, long recordsScanned) {
       this.matches = matches;
       this.recordsScanned = recordsScanned;
-      this.rowGroupsSkipped = rowGroupsSkipped;
-      this.rowGroupsProcessed = rowGroupsProcessed;
-      this.earlyTerminationUsed = earlyTerminationUsed;
     }
   }
 
@@ -97,12 +86,9 @@ class ParquetRowGroupMergeJoin {
 
     List<PositionDelete<Record>> matches = Lists.newArrayList();
     long recordsScanned = 0;
-    int rowGroupsSkipped = 0;
-    int rowGroupsProcessed = 0;
-    boolean earlyTerminationUsed = false;
 
     if (sortedDeleteKeys.isEmpty()) {
-      return new Result(matches, 0, 0, 0, false);
+      return new Result(matches, 0);
     }
 
     long minDeleteKey = sortedDeleteKeys.get(0);
@@ -178,12 +164,10 @@ class ParquetRowGroupMergeJoin {
               processRowGroupNoStats(
                   reader, model, rgRowCount, sortedDeleteKeys, deletePtr, rowPosition, dataFilePath);
           recordsScanned += result.recordsScanned;
-          rowGroupsProcessed++;
           matches.addAll(result.matches);
           deletePtr = result.deletePtr;
           rowPosition = result.rowPosition;
-          earlyTerminationUsed = result.earlyTermination;
-          if (earlyTerminationUsed) break;
+          if (result.earlyTermination) break;
           continue;
         }
 
@@ -199,12 +183,10 @@ class ParquetRowGroupMergeJoin {
               processRowGroupNoStats(
                   reader, model, rgRowCount, sortedDeleteKeys, deletePtr, rowPosition, dataFilePath);
           recordsScanned += result.recordsScanned;
-          rowGroupsProcessed++;
           matches.addAll(result.matches);
           deletePtr = result.deletePtr;
           rowPosition = result.rowPosition;
-          earlyTerminationUsed = result.earlyTermination;
-          if (earlyTerminationUsed) break;
+          if (result.earlyTermination) break;
           continue;
         }
         long rgMin = ((Number) minObj).longValue();
@@ -213,16 +195,13 @@ class ParquetRowGroupMergeJoin {
         // Skip row group if all delete keys < row group min (and we're done)
         if (maxDeleteKey < rgMin) {
           reader.skipNextRowGroup();
-          rowGroupsSkipped++;
           rowPosition += rgRowCount;
-          earlyTerminationUsed = true;
           break;
         }
 
         // Skip row group if all delete keys > row group max
         if (minDeleteKey > rgMax) {
           reader.skipNextRowGroup();
-          rowGroupsSkipped++;
           rowPosition += rgRowCount;
           continue;
         }
@@ -230,7 +209,6 @@ class ParquetRowGroupMergeJoin {
         // Check if current delete pointer is already past this row group
         if (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) > rgMax) {
           reader.skipNextRowGroup();
-          rowGroupsSkipped++;
           rowPosition += rgRowCount;
           continue;
         }
@@ -248,15 +226,12 @@ class ParquetRowGroupMergeJoin {
         // Check again after binary search
         if (deletePtr >= sortedDeleteKeys.size()) {
           reader.skipNextRowGroup();
-          rowGroupsSkipped++;
           rowPosition += rgRowCount;
-          earlyTerminationUsed = true;
           break;
         }
 
         if (sortedDeleteKeys.get(deletePtr) > rgMax) {
           reader.skipNextRowGroup();
-          rowGroupsSkipped++;
           rowPosition += rgRowCount;
           continue;
         }
@@ -274,18 +249,14 @@ class ParquetRowGroupMergeJoin {
                 rgMax,
                 rgIdx == rowGroups.size() - 1);
         recordsScanned += result.recordsScanned;
-        rowGroupsProcessed++;
         matches.addAll(result.matches);
         deletePtr = result.deletePtr;
         rowPosition = result.rowPosition;
-        earlyTerminationUsed = result.earlyTermination;
-
-        if (earlyTerminationUsed) break;
+        if (result.earlyTermination) break;
       }
     }
 
-    return new Result(
-        matches, recordsScanned, rowGroupsSkipped, rowGroupsProcessed, earlyTerminationUsed);
+    return new Result(matches, recordsScanned);
   }
 
   private static class ProcessRowGroupResult {

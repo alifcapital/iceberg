@@ -1576,7 +1576,6 @@ public class ConvertEqualityDeleteFilesSparkAction
 
         boolean anyRowsRead = false;
         long recordsScannedInFile = 0;
-        boolean earlyTerminationUsed = false;
         long dataReadStart = System.currentTimeMillis();
 
         // Use row-group level merge join for Parquet files with Long column
@@ -1588,25 +1587,19 @@ public class ConvertEqualityDeleteFilesSparkAction
 
         if (useRowGroupMergeJoin) {
           try {
-            LOG.info("Using ROW-GROUP merge join for file={}, sortedLongKeys.size={}",
-                fileInfo.path(), sortedLongKeys.size());
             ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.execute(
                 inputFile, projectionSchema, sortedLongKeys,
                 eqDeleteFieldId, eqColumnName, fileInfo.path());
             matches.addAll(result.matches);
             recordsScannedInFile = result.recordsScanned;
-            earlyTerminationUsed = result.earlyTerminationUsed;
-            anyRowsRead = result.recordsScanned > 0 || result.rowGroupsProcessed > 0;
-            LOG.info("Row-group merge join DONE: file={}, rgProcessed={}, rgSkipped={}, recordsScanned={}, matches={}, earlyTerm={}",
-                fileInfo.path(), result.rowGroupsProcessed, result.rowGroupsSkipped,
-                result.recordsScanned, result.matches.size(), result.earlyTerminationUsed);
+            anyRowsRead = result.recordsScanned > 0 || !result.matches.isEmpty();
           } catch (IOException e) {
             throw new RuntimeException("Failed to perform row-group merge join on " + fileInfo.path(), e);
           }
         } else {
           // Standard reader path
-          LOG.info("Using STANDARD path for file={}, useMergeJoin={}, isSingleLongColumn={}, sortedLongKeys!=null={}, format={}",
-              fileInfo.path(), useMergeJoin, isSingleLongColumn, sortedLongKeys != null, fileInfo.format());
+          LOG.info("Using STANDARD path for file={}, useMergeJoin={}, isSingleLongColumn={}, isSingleStringColumn={}, format={}",
+              fileInfo.path(), useMergeJoin, isSingleLongColumn, isSingleStringColumn, fileInfo.format());
           try (CloseableIterable<Record> reader =
               openDataFileForRead(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
 
@@ -1631,7 +1624,6 @@ public class ConvertEqualityDeleteFilesSparkAction
 
                 // Early termination: delete keys exhausted
                 if (deletePtr >= sortedLongKeys.size()) {
-                  earlyTerminationUsed = true;
                   break;
                 }
 
@@ -1660,7 +1652,6 @@ public class ConvertEqualityDeleteFilesSparkAction
                 }
 
                 if (deletePtr >= sortedStringKeys.size()) {
-                  earlyTerminationUsed = true;
                   break;
                 }
 
@@ -1688,7 +1679,6 @@ public class ConvertEqualityDeleteFilesSparkAction
                 }
 
                 if (deletePtr >= sortedDecimalKeys.size()) {
-                  earlyTerminationUsed = true;
                   break;
                 }
 
