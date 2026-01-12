@@ -19,7 +19,9 @@
 package org.apache.iceberg.actions;
 
 import java.io.IOException;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -906,32 +908,29 @@ public class OverlapRewriteFilePlanner
   }
 
   /**
-   * Calculate range for strings based on first differing code point.
+   * Calculate range for strings using byte representation.
+   *
+   * <p>UTF-8 preserves lexicographic ordering when compared byte-by-byte, so we convert strings to
+   * bytes and compute the numeric difference. This correctly handles position weight - a difference
+   * at position 0 has more weight than at position 1.
    */
   private double calculateStringRange(CharSequence lower, CharSequence upper) {
-    String lowerStr = lower.toString();
-    String upperStr = upper.toString();
+    byte[] lowerBytes = lower.toString().getBytes(StandardCharsets.UTF_8);
+    byte[] upperBytes = upper.toString().getBytes(StandardCharsets.UTF_8);
 
-    int i = 0;
-    int minLen = Math.min(lowerStr.length(), upperStr.length());
+    // Limit to 16 bytes and pad to same length
+    int maxLen = Math.min(Math.max(lowerBytes.length, upperBytes.length), 16);
 
-    while (i < minLen) {
-      int lowerCp = lowerStr.codePointAt(i);
-      int upperCp = upperStr.codePointAt(i);
+    byte[] lowerPadded = new byte[maxLen];
+    byte[] upperPadded = new byte[maxLen];
+    System.arraycopy(lowerBytes, 0, lowerPadded, 0, Math.min(lowerBytes.length, maxLen));
+    System.arraycopy(upperBytes, 0, upperPadded, 0, Math.min(upperBytes.length, maxLen));
 
-      if (lowerCp != upperCp) {
-        return upperCp - lowerCp;
-      }
+    // Use BigInteger for correct arithmetic with large numbers
+    BigInteger lowerBig = new BigInteger(1, lowerPadded);
+    BigInteger upperBig = new BigInteger(1, upperPadded);
 
-      i += Character.charCount(lowerCp);
-    }
-
-    // One string is prefix of another
-    if (lowerStr.length() != upperStr.length()) {
-      return 1; // Minimal range
-    }
-
-    return 0; // Identical strings
+    return upperBig.subtract(lowerBig).doubleValue();
   }
 
   /**
