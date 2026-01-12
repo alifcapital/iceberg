@@ -49,6 +49,8 @@ final class ConvertEqualityDeleteModels {
     private final int specId;
     private final Object[] partitionValues;
     private final Integer sortOrderId;
+    private final Map<Integer, byte[]> lowerBounds;
+    private final Map<Integer, byte[]> upperBounds;
 
     DataFileInfo(
         String path,
@@ -58,13 +60,17 @@ final class ConvertEqualityDeleteModels {
         int specId,
         StructLike partition,
         int partitionSize,
-        Integer sortOrderId) {
+        Integer sortOrderId,
+        Map<Integer, byte[]> lowerBounds,
+        Map<Integer, byte[]> upperBounds) {
       this.path = path;
       this.format = format;
       this.fileSizeInBytes = fileSizeInBytes;
       this.recordCount = recordCount;
       this.specId = specId;
       this.sortOrderId = sortOrderId;
+      this.lowerBounds = lowerBounds;
+      this.upperBounds = upperBounds;
       if (partition != null && partitionSize > 0) {
         this.partitionValues = new Object[partitionSize];
         for (int i = 0; i < partitionSize; i++) {
@@ -101,6 +107,14 @@ final class ConvertEqualityDeleteModels {
 
     Integer sortOrderId() {
       return sortOrderId;
+    }
+
+    Map<Integer, byte[]> lowerBounds() {
+      return lowerBounds;
+    }
+
+    Map<Integer, byte[]> upperBounds() {
+      return upperBounds;
     }
 
     @Override

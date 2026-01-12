@@ -26,12 +26,17 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
 import org.apache.iceberg.deletes.PositionDelete;
+import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.parquet.ParquetBloomRowGroupFilter;
+import org.apache.iceberg.parquet.ParquetDictionaryRowGroupFilter;
 import org.apache.iceberg.parquet.ParquetValueReader;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
 import org.apache.parquet.ParquetReadOptions;
+import org.apache.parquet.column.page.DictionaryPageReadStore;
 import org.apache.parquet.column.page.PageReadStore;
+import org.apache.parquet.hadoop.BloomFilterReader;
 import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
@@ -72,6 +77,7 @@ class ParquetRowGroupMergeJoin {
    * @param eqDeleteFieldId field ID of the equality delete column
    * @param eqColumnName name of the equality delete column
    * @param dataFilePath path of the data file (for position delete output)
+   * @param filter optional expression filter for bloom/dictionary pruning (can be null)
    * @return merge join result with matches and statistics
    */
   @SuppressWarnings("unchecked")
@@ -81,7 +87,8 @@ class ParquetRowGroupMergeJoin {
       List<Long> sortedDeleteKeys,
       int eqDeleteFieldId,
       String eqColumnName,
-      String dataFilePath)
+      String dataFilePath,
+      Expression filter)
       throws IOException {
 
     List<PositionDelete<Record>> matches = Lists.newArrayList();
@@ -102,6 +109,12 @@ class ParquetRowGroupMergeJoin {
       }
     }
     Schema readSchema = new Schema(readFields);
+
+    // Create bloom and dictionary filters if filter expression is provided
+    ParquetBloomRowGroupFilter bloomFilter =
+        filter != null ? new ParquetBloomRowGroupFilter(readSchema, filter, true) : null;
+    ParquetDictionaryRowGroupFilter dictFilter =
+        filter != null ? new ParquetDictionaryRowGroupFilter(readSchema, filter, true) : null;
 
     // Open low-level Parquet reader
     ParquetReadOptions options = ParquetReadOptions.builder().build();
@@ -143,6 +156,26 @@ class ParquetRowGroupMergeJoin {
       for (int rgIdx = 0; rgIdx < rowGroups.size(); rgIdx++) {
         BlockMetaData rowGroup = rowGroups.get(rgIdx);
         long rgRowCount = rowGroup.getRowCount();
+
+        // Check bloom filter - skip row group if no values can match
+        if (bloomFilter != null) {
+          BloomFilterReader bloomReader = reader.getBloomFilterDataReader(rowGroup);
+          if (bloomReader != null && !bloomFilter.shouldRead(fileSchema, rowGroup, bloomReader)) {
+            reader.skipNextRowGroup();
+            rowPosition += rgRowCount;
+            continue;
+          }
+        }
+
+        // Check dictionary filter - skip row group if dictionary doesn't contain matching values
+        if (dictFilter != null) {
+          DictionaryPageReadStore dictReader = reader.getDictionaryReader(rowGroup);
+          if (dictReader != null && !dictFilter.shouldRead(fileSchema, rowGroup, dictReader)) {
+            reader.skipNextRowGroup();
+            rowPosition += rgRowCount;
+            continue;
+          }
+        }
 
         // Get row group bounds for eq delete column
         ColumnChunkMetaData colMeta = null;

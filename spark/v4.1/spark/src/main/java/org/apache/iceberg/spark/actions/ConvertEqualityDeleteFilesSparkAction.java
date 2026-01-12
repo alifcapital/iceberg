@@ -29,6 +29,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.math.BigDecimal;
+import java.nio.ByteBuffer;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
@@ -1088,7 +1089,9 @@ public class ConvertEqualityDeleteFilesSparkAction
                 specId,
                 partition,
                 partitionSize,
-                t.file().sortOrderId()))
+                t.file().sortOrderId(),
+                convertBounds(t.file().lowerBounds()),
+                convertBounds(t.file().upperBounds())))
             .distinct()
             .collect(Collectors.toList());
 
@@ -1328,6 +1331,40 @@ public class ConvertEqualityDeleteFilesSparkAction
     return result;
   }
 
+  /** Extract Long bound for a field from serialized bounds map. */
+  private static Long extractLongBound(Map<Integer, byte[]> bounds, int fieldId) {
+    if (bounds == null) {
+      return null;
+    }
+    byte[] bytes = bounds.get(fieldId);
+    if (bytes == null) {
+      return null;
+    }
+    // Iceberg stores bounds in Little-Endian format
+    ByteBuffer bb = ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+    if (bytes.length == 4) {
+      return (long) bb.getInt();  // Integer field
+    } else if (bytes.length == 8) {
+      return bb.getLong();  // Long field
+    }
+    return null;
+  }
+
+  /** Convert ByteBuffer bounds map to byte[] for serialization. */
+  private static Map<Integer, byte[]> convertBounds(Map<Integer, ByteBuffer> bounds) {
+    if (bounds == null) {
+      return null;
+    }
+    Map<Integer, byte[]> result = Maps.newHashMapWithExpectedSize(bounds.size());
+    for (Map.Entry<Integer, ByteBuffer> entry : bounds.entrySet()) {
+      ByteBuffer buffer = entry.getValue().duplicate();
+      byte[] bytes = new byte[buffer.remaining()];
+      buffer.get(bytes);
+      result.put(entry.getKey(), bytes);
+    }
+    return result;
+  }
+
   /** Get InputFile, using local FUSE mount path if configured. */
   private static InputFile getInputFileWithCache(
       String s3Path, Table table, String cacheMountPath, String cacheS3Prefix) {
@@ -1543,12 +1580,37 @@ public class ConvertEqualityDeleteFilesSparkAction
 
         InputFile inputFile = getInputFileWithCache(fileInfo.path(), table, cacheMountPath, cacheS3Prefix);
 
+        // Filter delete keys by file bounds for more precise bloom filter
+        List<Long> filteredLongKeys = sortedLongKeys;
+        Set<Long> filteredLongKeysSet = longKeys;
+        if (isSingleLongColumn && sortedLongKeys != null && !sortedLongKeys.isEmpty()) {
+          Long fileLower = extractLongBound(fileInfo.lowerBounds(), eqDeleteFieldId);
+          Long fileUpper = extractLongBound(fileInfo.upperBounds(), eqDeleteFieldId);
+          if (fileLower != null && fileUpper != null) {
+            // Binary search to find range of keys within file bounds
+            int fromIndex = Collections.binarySearch(sortedLongKeys, fileLower);
+            if (fromIndex < 0) {
+              fromIndex = -(fromIndex + 1);
+            }
+            int toIndex = Collections.binarySearch(sortedLongKeys, fileUpper);
+            if (toIndex < 0) {
+              toIndex = -(toIndex + 1);
+            } else {
+              toIndex++; // include the matching key
+            }
+            if (fromIndex < toIndex && fromIndex < sortedLongKeys.size()) {
+              filteredLongKeys = sortedLongKeys.subList(fromIndex, Math.min(toIndex, sortedLongKeys.size()));
+              filteredLongKeysSet = new HashSet<>(filteredLongKeys);
+            }
+          }
+        }
+
         // Build bloom filter for row group pruning using BloomFilterBuilder
         // Note: BloomFilterBuilder filters out null values, so we add isNull() predicate separately if needed
         Expression bloomFilter = null;
         int maxBloomFilterKeys = 10000;
-        if (isSingleLongColumn && longKeys.size() <= maxBloomFilterKeys) {
-          bloomFilter = BloomFilterBuilder.buildLongFilter(longKeys, eqColumnName, maxBloomFilterKeys);
+        if (isSingleLongColumn && filteredLongKeysSet.size() <= maxBloomFilterKeys) {
+          bloomFilter = BloomFilterBuilder.buildLongFilter(filteredLongKeysSet, eqColumnName, maxBloomFilterKeys);
           if (longKeys.contains(null)) {
             Expression isNullExpr = Expressions.isNull(eqColumnName);
             bloomFilter = bloomFilter != null ? Expressions.or(bloomFilter, isNullExpr) : isNullExpr;
@@ -1588,8 +1650,8 @@ public class ConvertEqualityDeleteFilesSparkAction
         if (useRowGroupMergeJoin) {
           try {
             ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.execute(
-                inputFile, projectionSchema, sortedLongKeys,
-                eqDeleteFieldId, eqColumnName, fileInfo.path());
+                inputFile, projectionSchema, filteredLongKeys,
+                eqDeleteFieldId, eqColumnName, fileInfo.path(), bloomFilter);
             matches.addAll(result.matches);
             recordsScannedInFile = result.recordsScanned;
             anyRowsRead = result.recordsScanned > 0 || !result.matches.isEmpty();
