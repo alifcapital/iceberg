@@ -99,6 +99,17 @@ public class BinPackRewriteFilePlanner
 
   public static final boolean SKIP_IF_HAS_IDENTIFIER_KEYS_DEFAULT = false;
 
+  /**
+   * If set to true, only consider files with delete files for rewriting. File size thresholds
+   * ({@link #MIN_FILE_SIZE_BYTES} and {@link #MAX_FILE_SIZE_BYTES}) are ignored. Only files
+   * matching {@link #DELETE_FILE_THRESHOLD} or {@link #DELETE_RATIO_THRESHOLD} are selected.
+   *
+   * <p>Defaults to false.
+   */
+  public static final String DELETE_FILES_ONLY = "delete-files-only";
+
+  public static final boolean DELETE_FILES_ONLY_DEFAULT = false;
+
   private static final Logger LOG = LoggerFactory.getLogger(BinPackRewriteFilePlanner.class);
 
   private final Expression filter;
@@ -110,6 +121,7 @@ public class BinPackRewriteFilePlanner
   private RewriteJobOrder rewriteJobOrder;
   private Integer maxFilesToRewrite;
   private boolean skipIfHasIdentifierKeys;
+  private boolean deleteFilesOnly;
 
   public BinPackRewriteFilePlanner(Table table) {
     this(table, Expressions.alwaysTrue());
@@ -149,6 +161,7 @@ public class BinPackRewriteFilePlanner
         .add(RewriteDataFiles.REWRITE_JOB_ORDER)
         .add(MAX_FILES_TO_REWRITE)
         .add(SKIP_IF_HAS_IDENTIFIER_KEYS)
+        .add(DELETE_FILES_ONLY)
         .build();
   }
 
@@ -167,6 +180,8 @@ public class BinPackRewriteFilePlanner
     this.skipIfHasIdentifierKeys =
         PropertyUtil.propertyAsBoolean(
             options, SKIP_IF_HAS_IDENTIFIER_KEYS, SKIP_IF_HAS_IDENTIFIER_KEYS_DEFAULT);
+    this.deleteFilesOnly =
+        PropertyUtil.propertyAsBoolean(options, DELETE_FILES_ONLY, DELETE_FILES_ONLY_DEFAULT);
   }
 
   private int deleteFileThreshold(Map<String, String> options) {
@@ -200,6 +215,10 @@ public class BinPackRewriteFilePlanner
 
   @Override
   protected Iterable<FileScanTask> filterFiles(Iterable<FileScanTask> tasks) {
+    if (deleteFilesOnly) {
+      // Only select files with deletes, ignore file size thresholds
+      return Iterables.filter(tasks, task -> tooManyDeletes(task) || tooHighDeleteRatio(task));
+    }
     return Iterables.filter(
         tasks,
         task ->
@@ -208,6 +227,15 @@ public class BinPackRewriteFilePlanner
 
   @Override
   protected Iterable<List<FileScanTask>> filterFileGroups(List<List<FileScanTask>> groups) {
+    if (deleteFilesOnly) {
+      // Group is valid only if it contains files with deletes
+      return Iterables.filter(
+          groups,
+          group ->
+              enoughInputFiles(group)
+                  && (group.stream().anyMatch(this::tooManyDeletes)
+                      || group.stream().anyMatch(this::tooHighDeleteRatio)));
+    }
     return Iterables.filter(
         groups,
         group ->
