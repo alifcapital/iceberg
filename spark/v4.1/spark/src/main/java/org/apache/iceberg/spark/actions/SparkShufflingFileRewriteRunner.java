@@ -155,6 +155,12 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   }
 
   private LogicalPlan sortPlan(LogicalPlan plan, SortOrder[] ordering, int numShufflePartitions) {
+    // If ordering is empty (unsorted), skip shuffle/sort to avoid Spark 4.x error:
+    // "The number of partitions can't be specified with unspecified distribution"
+    if (ordering.length == 0) {
+      return plan;
+    }
+
     SparkFunctionCatalog catalog = SparkFunctionCatalog.get();
     OrderedWrite write = new OrderedWrite(ordering, numShufflePartitions);
     LogicalPlan sortPlan =
