@@ -257,6 +257,7 @@ public class OverlapRewriteFilePlanner
   }
 
   private static final int PAIRS_BATCH_SIZE = 1000;
+  private static final int MIN_IMPROVEMENT = 1000;
 
   private List<FileScanTask> findBestGroup(List<FileScanTask> files) {
     if (files.size() < 2) {
@@ -331,7 +332,7 @@ public class OverlapRewriteFilePlanner
           pairsChecked,
           (long) bestImprovement);
 
-      if (bestPair != null && bestImprovement > 0) {
+      if (bestPair != null && bestImprovement >= MIN_IMPROVEMENT) {
         LOG.info(
             "OVERLAP: best pair {} + {} records, improvement={}",
             bestPair.get(0).file().recordCount(),
