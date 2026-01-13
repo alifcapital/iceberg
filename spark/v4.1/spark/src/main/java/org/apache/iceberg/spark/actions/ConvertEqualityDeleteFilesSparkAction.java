@@ -1631,8 +1631,8 @@ public class ConvertEqualityDeleteFilesSparkAction
           bloomFilter = BloomFilterBuilder.buildMultiColumnFilter(deleteKeys, deleteSchema, maxBloomFilterKeys);
         }
 
-        // Check if we can use merge join for this file
-        boolean useMergeJoin = isSingleColumn
+        // Check if file is sorted by eq delete column
+        boolean isSorted = isSingleColumn
             && !hasNullDeleteKey
             && canUseMergeJoin(table, fileInfo.sortOrderId(), eqDeleteFieldId);
 
@@ -1642,12 +1642,14 @@ public class ConvertEqualityDeleteFilesSparkAction
 
         // Use row-group level merge join for Parquet files with Long column
         // This allows skipping row groups where delete keys don't overlap
-        boolean useRowGroupMergeJoin = useMergeJoin
+        boolean useRowGroupMergeJoin = isSorted
             && isSingleLongColumn
             && sortedLongKeys != null
             && fileInfo.format() == FileFormat.PARQUET;
 
         if (useRowGroupMergeJoin) {
+          LOG.info("Using ROW_GROUP_MERGE_JOIN path for file={}, sorted={}, longColumn={}, deleteKeysCount={}",
+              fileInfo.path(), isSorted, isSingleLongColumn, filteredLongKeys.size());
           try {
             ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.execute(
                 inputFile, projectionSchema, filteredLongKeys,
@@ -1659,101 +1661,15 @@ public class ConvertEqualityDeleteFilesSparkAction
             throw new RuntimeException("Failed to perform row-group merge join on " + fileInfo.path(), e);
           }
         } else {
-          // Standard reader path
-          LOG.info("Using STANDARD path for file={}, useMergeJoin={}, isSingleLongColumn={}, isSingleStringColumn={}, format={}",
-              fileInfo.path(), useMergeJoin, isSingleLongColumn, isSingleStringColumn, fileInfo.format());
+          // Standard reader path with hash join
+          int deleteKeysCount = isSingleLongColumn ? longKeys.size() :
+              isSingleStringColumn ? stringKeys.size() :
+              isSingleDecimalColumn ? decimalKeys.size() : deleteKeys.size();
+          LOG.info("Using STANDARD path for file={}, sorted={}, singleColumn={}, longColumn={}, deleteKeysCount={}",
+              fileInfo.path(), isSorted, isSingleColumn, isSingleLongColumn, deleteKeysCount);
           try (CloseableIterable<Record> reader =
               openDataFileForRead(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
 
-          if (useMergeJoin) {
-            // Merge join: data file is sorted by eq delete column ASC
-            // Use sorted list and early termination
-            if (isSingleLongColumn && sortedLongKeys != null) {
-              int deletePtr = 0;
-              for (Record record : reader) {
-                anyRowsRead = true;
-                recordsScannedInFile++;
-                Object val = record.get(0);
-                if (val == null) {
-                  continue; // nulls handled by hasNullDeleteKey check above
-                }
-                long dataKey = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
-
-                // Move delete pointer while deleteKey < dataKey
-                while (deletePtr < sortedLongKeys.size() && sortedLongKeys.get(deletePtr) < dataKey) {
-                  deletePtr++;
-                }
-
-                // Early termination: delete keys exhausted
-                if (deletePtr >= sortedLongKeys.size()) {
-                  break;
-                }
-
-                // Match: deleteKey == dataKey
-                if (sortedLongKeys.get(deletePtr).equals(dataKey)) {
-                  Long pos = (Long) record.get(posColumnIndex);
-                  PositionDelete<Record> posDelete = PositionDelete.create();
-                  posDelete.set(fileInfo.path(), pos, null);
-                  matches.add(posDelete);
-                }
-              }
-            } else if (isSingleStringColumn && sortedStringKeys != null) {
-              int deletePtr = 0;
-              for (Record record : reader) {
-                anyRowsRead = true;
-                recordsScannedInFile++;
-                Object val = record.get(0);
-                if (val == null) {
-                  continue;
-                }
-                String dataKey = val.toString();
-
-                while (deletePtr < sortedStringKeys.size()
-                    && sortedStringKeys.get(deletePtr).compareTo(dataKey) < 0) {
-                  deletePtr++;
-                }
-
-                if (deletePtr >= sortedStringKeys.size()) {
-                  break;
-                }
-
-                if (sortedStringKeys.get(deletePtr).equals(dataKey)) {
-                  Long pos = (Long) record.get(posColumnIndex);
-                  PositionDelete<Record> posDelete = PositionDelete.create();
-                  posDelete.set(fileInfo.path(), pos, null);
-                  matches.add(posDelete);
-                }
-              }
-            } else if (isSingleDecimalColumn && sortedDecimalKeys != null) {
-              int deletePtr = 0;
-              for (Record record : reader) {
-                anyRowsRead = true;
-                recordsScannedInFile++;
-                Object val = record.get(0);
-                if (val == null) {
-                  continue;
-                }
-                BigDecimal dataKey = (BigDecimal) val;
-
-                while (deletePtr < sortedDecimalKeys.size()
-                    && sortedDecimalKeys.get(deletePtr).compareTo(dataKey) < 0) {
-                  deletePtr++;
-                }
-
-                if (deletePtr >= sortedDecimalKeys.size()) {
-                  break;
-                }
-
-                if (sortedDecimalKeys.get(deletePtr).compareTo(dataKey) == 0) {
-                  Long pos = (Long) record.get(posColumnIndex);
-                  PositionDelete<Record> posDelete = PositionDelete.create();
-                  posDelete.set(fileInfo.path(), pos, null);
-                  matches.add(posDelete);
-                }
-              }
-            }
-          } else {
-            // Hash join: original logic
             for (Record record : reader) {
               if (!anyRowsRead) {
                 anyRowsRead = true;
@@ -1798,7 +1714,6 @@ public class ConvertEqualityDeleteFilesSparkAction
               }
             }
           }
-        }
         } // end else (standard reader path)
         dataFileReadTimeMs.add(System.currentTimeMillis() - dataReadStart);
 
