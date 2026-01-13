@@ -435,8 +435,12 @@ public class ConvertEqualityDeleteFilesSparkAction
       try {
         deleteFileInfos = job.future.get();
       } catch (Exception e) {
+        job.cleanup();  // cleanup broadcasts even on failure
         throw new RuntimeException("Failed to get conversion result for group " + groupIndex, e);
       }
+
+      // Cleanup broadcast variables to free memory
+      job.cleanup();
 
       long totalMs = System.currentTimeMillis() - job.submitTimeMs;
 
@@ -570,6 +574,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     final org.apache.spark.util.LongAccumulator dataFileBytesRead;
     final org.apache.spark.util.LongAccumulator dataRecordsScanned;
     final org.apache.spark.util.LongAccumulator dataRecordsTotal;
+    // Broadcast variables to unpersist after job completes
+    final Broadcast<Table> tableBroadcast;
+    final Broadcast<List<String>> eqDeletePathsBroadcast;
 
     PendingConversionJob(
         int groupIndex,
@@ -586,7 +593,9 @@ public class ConvertEqualityDeleteFilesSparkAction
         org.apache.spark.util.LongAccumulator filesSkipped,
         org.apache.spark.util.LongAccumulator dataFileBytesRead,
         org.apache.spark.util.LongAccumulator dataRecordsScanned,
-        org.apache.spark.util.LongAccumulator dataRecordsTotal) {
+        org.apache.spark.util.LongAccumulator dataRecordsTotal,
+        Broadcast<Table> tableBroadcast,
+        Broadcast<List<String>> eqDeletePathsBroadcast) {
       this.groupIndex = groupIndex;
       this.eqDeleteGroup = eqDeleteGroup;
       this.dataFileTasks = dataFileTasks;
@@ -603,6 +612,18 @@ public class ConvertEqualityDeleteFilesSparkAction
       this.dataFileBytesRead = dataFileBytesRead;
       this.dataRecordsScanned = dataRecordsScanned;
       this.dataRecordsTotal = dataRecordsTotal;
+      this.tableBroadcast = tableBroadcast;
+      this.eqDeletePathsBroadcast = eqDeletePathsBroadcast;
+    }
+
+    /** Cleanup broadcast variables to free memory. Call after job result is collected. */
+    void cleanup() {
+      if (tableBroadcast != null) {
+        tableBroadcast.unpersist();
+      }
+      if (eqDeletePathsBroadcast != null) {
+        eqDeletePathsBroadcast.unpersist();
+      }
     }
 
     long dataFilesSize() {
@@ -719,8 +740,12 @@ public class ConvertEqualityDeleteFilesSparkAction
       try {
         deleteFileInfos = job.future.get();
       } catch (Exception e) {
+        job.cleanup();  // cleanup broadcasts even on failure
         throw new RuntimeException("Failed to get conversion result for group " + groupIndex, e);
       }
+
+      // Cleanup broadcast variables to free memory
+      job.cleanup();
 
       long totalMs = System.currentTimeMillis() - job.submitTimeMs;
 
@@ -870,9 +895,10 @@ public class ConvertEqualityDeleteFilesSparkAction
               uncommittedPosDeletes.size(),
               e);
 
-          // Cancel pending jobs
+          // Cancel pending jobs and cleanup their broadcasts
           for (PendingConversionJob pending : pendingJobs) {
             pending.future.cancel(true);
+            pending.cleanup();
           }
 
           // Return partial results
@@ -1106,7 +1132,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       return new PendingConversionJob(
           groupIndex, eqDeleteGroup, dataFileTasks, 0, 0L, emptyFuture,
           zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc, zeroAcc,
-          zeroAcc, zeroAcc);
+          zeroAcc, zeroAcc, null, null);  // no broadcasts for empty result
     }
 
     Table serializableTable = SerializableTableWithSize.copyOf(table);
@@ -1219,7 +1245,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         groupIndex, eqDeleteGroup, dataFileTasks, dataFileInfos.size(), totalDataFileSize, future,
         eqDeleteRecordsRead, eqDeleteReadTimeMs, dataFileReadTimeMs, posDeleteWriteTimeMs,
         posDeleteRecordsWritten, filesSkipped, dataFileBytesRead,
-        dataRecordsScanned, dataRecordsTotal);
+        dataRecordsScanned, dataRecordsTotal, tableBroadcast, eqDeletePathsBroadcast);
   }
 
   /** Convert serializable DeleteFileInfo from executors to DeleteFile for commit. */
