@@ -65,12 +65,23 @@ public class BoundsPacking {
   }
 
   /**
-   * Calculate distance for strings using UTF-8 byte representation.
+   * Calculate distance for strings.
    *
-   * <p>UTF-8 preserves lexicographic ordering when compared byte-by-byte, so we convert strings to
-   * bytes and compute the numeric difference.
+   * <p>For UUID v7 (time-based, detected by version char '7' at position 14), returns 0 to allow
+   * consecutive files to be grouped together. UUID v7 files are naturally sequential and should be
+   * compacted even without overlap.
+   *
+   * <p>For other strings, uses UTF-8 byte representation difference which works well for UUID v1/v4
+   * where files typically have overlapping bounds.
    */
   private static double calculateStringDistance(CharSequence lower, CharSequence upper) {
+    // Detect UUID v7 by checking version character at position 14
+    // UUID format: xxxxxxxx-xxxx-Vxxx-xxxx-xxxxxxxxxxxx (V = version at index 14)
+    if (isUuidV7(lower) && isUuidV7(upper)) {
+      // UUID v7 is time-based, consecutive files should be grouped together
+      return 0;
+    }
+
     byte[] lowerBytes = lower.toString().getBytes(StandardCharsets.UTF_8);
     byte[] upperBytes = upper.toString().getBytes(StandardCharsets.UTF_8);
 
@@ -86,6 +97,21 @@ public class BoundsPacking {
     BigInteger upperBig = new BigInteger(1, upperPadded);
 
     return upperBig.subtract(lowerBig).doubleValue();
+  }
+
+  /**
+   * Checks if a string looks like UUID v7.
+   *
+   * <p>UUID v7 format: xxxxxxxx-xxxx-7xxx-xxxx-xxxxxxxxxxxx Version '7' is at position 14 in the
+   * string representation.
+   */
+  private static boolean isUuidV7(CharSequence value) {
+    // UUID with dashes is at least 15 chars to have version at position 14
+    // Truncated bounds are 16 chars: xxxxxxxx-xxxx-7x
+    if (value.length() < 15) {
+      return false;
+    }
+    return value.charAt(14) == '7';
   }
 
   /** Calculate distance for binary types. */
