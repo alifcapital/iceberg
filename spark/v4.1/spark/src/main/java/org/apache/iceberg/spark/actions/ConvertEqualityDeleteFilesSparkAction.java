@@ -1648,7 +1648,7 @@ public class ConvertEqualityDeleteFilesSparkAction
             && fileInfo.format() == FileFormat.PARQUET;
 
         if (useRowGroupMergeJoin) {
-          LOG.info("Using ROW_GROUP_MERGE_JOIN path for file={}, sorted={}, longColumn={}, deleteKeysCount={}",
+          LOG.debug("Using ROW_GROUP_MERGE_JOIN path for file={}, sorted={}, longColumn={}, deleteKeysCount={}",
               fileInfo.path(), isSorted, isSingleLongColumn, filteredLongKeys.size());
           try {
             ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.execute(
@@ -1665,7 +1665,7 @@ public class ConvertEqualityDeleteFilesSparkAction
           int deleteKeysCount = isSingleLongColumn ? longKeys.size() :
               isSingleStringColumn ? stringKeys.size() :
               isSingleDecimalColumn ? decimalKeys.size() : deleteKeys.size();
-          LOG.info("Using STANDARD path for file={}, sorted={}, singleColumn={}, longColumn={}, deleteKeysCount={}",
+          LOG.debug("Using STANDARD path for file={}, sorted={}, singleColumn={}, longColumn={}, deleteKeysCount={}",
               fileInfo.path(), isSorted, isSingleColumn, isSingleLongColumn, deleteKeysCount);
           try (CloseableIterable<Record> reader =
               openDataFileForRead(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
