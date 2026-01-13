@@ -38,7 +38,6 @@ import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.SparkWriteOptions;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.SortOrderUtil;
-import org.apache.iceberg.util.StructLikeMap;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -90,9 +89,12 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
   public static final String TARGET_ROW_GROUP_SIZE_BYTES = "target-row-group-size-bytes";
 
+  private static final int MIN_BUCKETS = 2;
+  private static final int MAX_BUCKETS = 1024;
+
   private int numShufflePartitionsPerFile;
   private String rowGroupSizeBytes;
-  private StructLikeMap<PartitionBoundaries> globalBoundaries;
+  private int uuidBuckets;
 
   protected SparkShufflingFileRewriteRunner(SparkSession spark, Table table) {
     super(spark, table);
@@ -127,11 +129,48 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     super.init(options);
     this.numShufflePartitionsPerFile = numShufflePartitionsPerFile(options);
     this.rowGroupSizeBytes = options.get(TARGET_ROW_GROUP_SIZE_BYTES);
+    this.uuidBuckets = computeUuidBuckets(options);
   }
 
-  /** Sets per-partition boundaries for global range partitioning. */
-  void setGlobalBoundaries(StructLikeMap<PartitionBoundaries> boundaries) {
-    this.globalBoundaries = boundaries;
+  /**
+   * Computes number of buckets for UUID prefix bucketing based on table size.
+   * Uses total-files-size from snapshot summary.
+   */
+  private int computeUuidBuckets(Map<String, String> options) {
+    if (table().currentSnapshot() == null) {
+      return 0;
+    }
+
+    String totalSizeStr = table().currentSnapshot().summary().get("total-files-size");
+    if (totalSizeStr == null) {
+      LOG.debug("Cannot compute UUID buckets: total-files-size not in snapshot summary");
+      return 0;
+    }
+
+    long totalSize;
+    try {
+      totalSize = Long.parseLong(totalSizeStr);
+    } catch (NumberFormatException e) {
+      LOG.warn("Cannot parse total-files-size from snapshot summary: {}", totalSizeStr);
+      return 0;
+    }
+
+    long targetFileSize =
+        PropertyUtil.propertyAsLong(
+            options,
+            org.apache.iceberg.actions.RewriteDataFiles.TARGET_FILE_SIZE_BYTES,
+            PropertyUtil.propertyAsLong(
+                table().properties(),
+                org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
+                org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT));
+
+    if (targetFileSize <= 0) {
+      return 0;
+    }
+
+    long optimalFileCount = Math.max(1, totalSize / targetFileSize);
+    int power = Math.max(0, (int) Math.ceil(Math.log(optimalFileCount) / Math.log(2)));
+    return Math.max(MIN_BUCKETS, Math.min(MAX_BUCKETS, 1 << power));
   }
 
   @Override
@@ -183,22 +222,46 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     SortOrder[] ordering = Spark3Util.toOrdering(outputSortOrder(group, outputSpec));
     int numShufflePartitions = Math.max(1, expectedOutputFiles * numShufflePartitionsPerFile);
 
-    // Check if we have global boundaries for this partition
-    PartitionBoundaries bounds =
-        globalBoundaries != null ? globalBoundaries.get(partition) : null;
-
-    if (bounds != null && bounds.isValid()) {
-      LOG.debug("Using global range partitioning for partition {} with {} buckets",
-          partition, bounds.numBuckets());
+    // Check if UUID prefix bucketing is enabled and applicable
+    if (useUuidPrefixBucketing() && uuidBuckets > 0 && isFirstSortColumnUuid(group)) {
+      LOG.info("Using UUID prefix bucketing with {} buckets", uuidBuckets);
       return df ->
           transformPlan(
-              df, plan -> globalRangeSortPlan(plan, ordering, bounds, numShufflePartitions));
+              df, plan -> uuidPrefixSortPlan(plan, ordering, uuidBuckets, numShufflePartitions));
     } else {
-      if (globalBoundaries != null) {
-        LOG.debug("Falling back to standard sort for partition {}: bounds not valid", partition);
-      }
       return df -> transformPlan(df, plan -> sortPlan(plan, ordering, numShufflePartitions));
     }
+  }
+
+  /** Override in subclass to enable UUID prefix bucketing. */
+  protected boolean useUuidPrefixBucketing() {
+    return false;
+  }
+
+  /**
+   * Checks if the first sort column looks like UUID by examining file bounds.
+   */
+  private boolean isFirstSortColumnUuid(List<FileScanTask> group) {
+    if (sortOrder() == null || sortOrder().fields().isEmpty()) {
+      return false;
+    }
+
+    int firstSortFieldId = sortOrder().fields().get(0).sourceId();
+
+    for (FileScanTask task : group) {
+      java.nio.ByteBuffer lowerBuf =
+          task.file().lowerBounds() != null ? task.file().lowerBounds().get(firstSortFieldId) : null;
+      if (lowerBuf != null) {
+        org.apache.iceberg.types.Type fieldType = table().schema().findType(firstSortFieldId);
+        if (fieldType != null) {
+          Object lower = org.apache.iceberg.types.Conversions.fromByteBuffer(fieldType, lowerBuf);
+          if (lower instanceof CharSequence) {
+            return UuidUtil.looksLikeUuid(lower.toString());
+          }
+        }
+      }
+    }
+    return false;
   }
 
   private LogicalPlan sortPlan(LogicalPlan plan, SortOrder[] ordering, int numShufflePartitions) {
@@ -223,24 +286,16 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   }
 
   /**
-   * Creates a logical plan for global range partitioning using pre-computed boundaries.
+   * Creates a logical plan for UUID prefix bucketing.
    *
-   * <p>Uses DirectShufflePartitionID to partition data by computed bucket IDs based on global
-   * min/max bounds, avoiding Spark's sampling-based range partitioner.
-   *
-   * <p>For UUID columns (auto-detected), uses hex prefix bucketing instead of range partitioning.
+   * <p>Uses DirectShufflePartitionID to partition data by computed bucket IDs based on UUID hex
+   * prefix, avoiding Spark's sampling-based range partitioner.
    */
-  private LogicalPlan globalRangeSortPlan(
-      LogicalPlan plan, SortOrder[] ordering, PartitionBoundaries bounds, int numShufflePartitions) {
+  private LogicalPlan uuidPrefixSortPlan(
+      LogicalPlan plan, SortOrder[] ordering, int numBuckets, int numShufflePartitions) {
     // If ordering is empty (unsorted), skip shuffle/sort
     if (ordering.length == 0) {
       return plan;
-    }
-
-    // Check that sort order has fields
-    if (sortOrder() == null || sortOrder().fields().isEmpty()) {
-      LOG.warn("Cannot use global range partitioning: sort order has no fields");
-      return sortPlan(plan, ordering, numShufflePartitions);
     }
 
     // Get the first sort column from the plan's output
@@ -248,20 +303,13 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     Expression firstSortCol = findColumnExpression(plan, firstSortColumnName);
 
     if (firstSortCol == null) {
-      LOG.warn("Cannot use global range partitioning: column '{}' not found in plan output",
+      LOG.warn("Cannot use UUID prefix bucketing: column '{}' not found in plan output",
           firstSortColumnName);
       return sortPlan(plan, ordering, numShufflePartitions);
     }
 
-    // V1 only supports UUID - non-UUID falls back to standard sort
-    if (!bounds.isUuidType()) {
-      LOG.debug("Non-UUID type detected, falling back to standard sort");
-      return sortPlan(plan, ordering, numShufflePartitions);
-    }
-
     // Build bucket expression for UUID hex prefix bucketing
-    Expression bucketExpr = buildUuidBucketExpression(firstSortCol, bounds);
-    LOG.debug("Using UUID prefix bucketing with {} buckets", bounds.numBuckets());
+    Expression bucketExpr = buildUuidBucketExpression(firstSortCol, numBuckets);
 
     // Wrap in DirectShufflePartitionID for direct partition assignment
     Expression partitionExpr = new DirectShufflePartitionID(bucketExpr);
@@ -274,7 +322,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
     LogicalPlan repartitionPlan =
         new RepartitionByExpression(
-            partitionExprs, plan, new Some<>(bounds.numBuckets()), Option.empty());
+            partitionExprs, plan, new Some<>(numBuckets), Option.empty());
 
     // Build sort expressions for within-partition sorting
     SparkFunctionCatalog catalog = SparkFunctionCatalog.get();
@@ -314,8 +362,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
    * <p>This extracts first 2 hex characters (00-ff = 0-255), then maps to bucket range. For
    * numBuckets=16, this groups by first hex char: 00-0f→0, 10-1f→1, ..., f0-ff→15.
    */
-  private Expression buildUuidBucketExpression(Expression col, PartitionBoundaries bounds) {
-    int numBuckets = bounds.numBuckets();
+  private Expression buildUuidBucketExpression(Expression col, int numBuckets) {
 
     // substring(col, 1, 2) - get first 2 characters (1-based indexing in SQL)
     Expression prefix = new org.apache.spark.sql.catalyst.expressions.Substring(

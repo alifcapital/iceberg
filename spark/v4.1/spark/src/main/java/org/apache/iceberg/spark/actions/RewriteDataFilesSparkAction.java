@@ -37,10 +37,6 @@ import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.TableScan;
-import org.apache.iceberg.io.CloseableIterable;
-import org.apache.iceberg.types.Type;
-import org.apache.iceberg.types.Types;
 import org.apache.iceberg.actions.BinPackRewriteFilePlanner;
 import org.apache.iceberg.actions.FileRewritePlan;
 import org.apache.iceberg.actions.FileRewritePlanner;
@@ -68,7 +64,6 @@ import org.apache.iceberg.relocated.com.google.common.util.concurrent.ThreadFact
 import org.apache.iceberg.spark.SparkSQLProperties;
 import org.apache.iceberg.spark.SparkUtil;
 import org.apache.iceberg.util.PropertyUtil;
-import org.apache.iceberg.util.StructLikeMap;
 import org.apache.iceberg.util.Tasks;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.internal.SQLConf;
@@ -435,14 +430,6 @@ public class RewriteDataFilesSparkAction
     planner.init(options());
     runner.init(options());
 
-    // Compute global boundaries if enabled for SparkSortFileRewriteRunner
-    if (runner instanceof SparkSortFileRewriteRunner) {
-      SparkSortFileRewriteRunner sortRunner = (SparkSortFileRewriteRunner) runner;
-      if (sortRunner.useGlobalRangePartitioning()) {
-        computeGlobalBoundaries(sortRunner);
-      }
-    }
-
     maxConcurrentFileGroupRewrites =
         PropertyUtil.propertyAsInt(
             options(),
@@ -518,98 +505,4 @@ public class RewriteDataFilesSparkAction
     }
   }
 
-  /**
-   * Computes global boundaries for range partitioning by scanning all files in the table.
-   *
-   * <p>Collects min/max bounds and total size per partition from file metadata, then computes the
-   * optimal number of buckets for each partition.
-   *
-   * <p>Note: This scans metadata for ALL files in the table (not just files matching the filter)
-   * to ensure global boundaries cover the entire value range.
-   */
-  private void computeGlobalBoundaries(SparkSortFileRewriteRunner sortRunner) {
-    int firstSortFieldId = sortRunner.firstSortFieldId();
-    if (firstSortFieldId < 0) {
-      LOG.warn("Cannot compute global boundaries: no valid sort field found");
-      return;
-    }
-
-    Type firstSortFieldType = table.schema().findType(firstSortFieldId);
-    if (firstSortFieldType == null) {
-      LOG.warn("Cannot compute global boundaries: sort field type not found for field ID {}",
-          firstSortFieldId);
-      return;
-    }
-
-    // Scan ALL files of the table (without filter) to get global bounds
-    TableScan scan = table.newScan().includeColumnStats();
-    Types.StructType partitionType = table.spec().partitionType();
-    StructLikeMap<PartitionBoundaries> boundsByPartition = StructLikeMap.create(partitionType);
-
-    long targetFileSize =
-        PropertyUtil.propertyAsLong(
-            options(),
-            TARGET_FILE_SIZE_BYTES,
-            PropertyUtil.propertyAsLong(
-                table.properties(),
-                org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
-                org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT));
-
-    Preconditions.checkArgument(
-        targetFileSize > 0,
-        "Target file size must be positive, got: %s",
-        targetFileSize);
-
-    LOG.info(
-        "Computing global boundaries for table {} with target file size {}",
-        table.name(),
-        targetFileSize);
-
-    int totalFiles = 0;
-    int filesWithDifferentSpec = 0;
-
-    try (CloseableIterable<FileScanTask> tasks = scan.planFiles()) {
-      for (FileScanTask task : tasks) {
-        DataFile file = task.file();
-        totalFiles++;
-
-        StructLike partition;
-        if (file.specId() == table.spec().specId()) {
-          partition = file.partition();
-        } else {
-          filesWithDifferentSpec++;
-          partition = emptyPartition(partitionType);
-        }
-
-        PartitionBoundaries bounds =
-            boundsByPartition.computeIfAbsent(partition, k -> new PartitionBoundaries());
-        bounds.addFile(file, firstSortFieldId, firstSortFieldType);
-      }
-    } catch (Exception e) {
-      LOG.warn("Failed to compute global boundaries, falling back to default partitioning", e);
-      return;
-    }
-
-    if (filesWithDifferentSpec > 0) {
-      LOG.info("Found {} files with different partition spec (grouped into empty partition)",
-          filesWithDifferentSpec);
-    }
-
-    // Compute numBuckets for each partition
-    boundsByPartition.values().forEach(bounds -> bounds.computeNumBuckets(targetFileSize));
-
-    int validPartitions =
-        (int) boundsByPartition.values().stream().filter(PartitionBoundaries::isValid).count();
-    LOG.info(
-        "Computed global boundaries: {} total files, {} partitions ({} valid)",
-        totalFiles,
-        boundsByPartition.size(),
-        validPartitions);
-
-    sortRunner.setGlobalBoundaries(boundsByPartition);
-  }
-
-  private StructLike emptyPartition(Types.StructType partitionType) {
-    return org.apache.iceberg.data.GenericRecord.create(partitionType);
-  }
 }
