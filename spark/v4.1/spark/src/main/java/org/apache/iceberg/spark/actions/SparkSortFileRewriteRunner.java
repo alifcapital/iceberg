@@ -32,6 +32,8 @@ import org.apache.iceberg.SortDirection;
 import org.apache.iceberg.SortField;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -50,6 +52,7 @@ class SparkSortFileRewriteRunner extends SparkShufflingFileRewriteRunner {
   public static final String COLUMNS = "columns";
   public static final String USE_IDENTIFIER_KEYS = "use-identifier-keys";
   public static final String USE_GLOBAL_RANGE_PARTITIONING = "use-global-range-partitioning";
+  public static final String DELETE_FILES_ONLY = "delete-files-only";
 
   private SortOrder sortOrder;
   private boolean sortOrderFromOptions = false;
@@ -93,6 +96,8 @@ class SparkSortFileRewriteRunner extends SparkShufflingFileRewriteRunner {
     String columnsOption = options.get(COLUMNS);
     boolean useIdentifierKeys =
         Boolean.parseBoolean(options.getOrDefault(USE_IDENTIFIER_KEYS, "false"));
+    boolean deleteFilesOnly =
+        Boolean.parseBoolean(options.getOrDefault(DELETE_FILES_ONLY, "false"));
 
     Preconditions.checkArgument(
         columnsOption == null || !useIdentifierKeys,
@@ -103,10 +108,22 @@ class SparkSortFileRewriteRunner extends SparkShufflingFileRewriteRunner {
     if (useIdentifierKeys) {
       Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
       if (identifierFieldIds.isEmpty()) {
-        // No identifier keys - use unsorted order (effectively binpack)
+        LOG.info("No identifier keys found, using unsorted order");
         this.sortOrder = SortOrder.unsorted();
         return;
       }
+      if (deleteFilesOnly) {
+        // delete-files-only=true: eq delete convert mode
+        // Sorting only helps if single Long/Integer PK (ROW_GROUP_MERGE_JOIN optimization)
+        if (!isSingleLongIdentifierKey(identifierFieldIds)) {
+          LOG.info("delete-files-only=true but PK is not single long column (size={}) - sorting won't help eq delete convert, using unsorted order",
+              identifierFieldIds.size());
+          this.sortOrder = SortOrder.unsorted();
+          return;
+        }
+      }
+      // delete-files-only=false: merge small files mode - sort by all identifier keys for good bounds
+      // delete-files-only=true + single long PK: sort for eq delete convert optimization
       this.sortOrder = buildSortOrderFromIdentifierKeys(identifierFieldIds);
       ensureSortOrderRegistered(this.sortOrder);
       this.sortOrderFromOptions = true;
@@ -148,6 +165,23 @@ class SparkSortFileRewriteRunner extends SparkShufflingFileRewriteRunner {
       builder.asc(column, NullOrder.NULLS_LAST);
     }
     return builder.build();
+  }
+
+  /**
+   * Checks if identifier key is a single Long/Integer column.
+   * Only single long columns benefit from ROW_GROUP_MERGE_JOIN optimization in eq delete convert.
+   */
+  private boolean isSingleLongIdentifierKey(Set<Integer> identifierFieldIds) {
+    if (identifierFieldIds.size() != 1) {
+      return false;
+    }
+    Integer fieldId = identifierFieldIds.iterator().next();
+    Types.NestedField field = table().schema().findField(fieldId);
+    if (field == null) {
+      return false;
+    }
+    Type.TypeID typeId = field.type().typeId();
+    return typeId == Type.TypeID.LONG || typeId == Type.TypeID.INTEGER;
   }
 
   /**
