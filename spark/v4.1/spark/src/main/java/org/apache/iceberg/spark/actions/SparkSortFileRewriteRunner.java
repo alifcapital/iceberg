@@ -49,9 +49,11 @@ class SparkSortFileRewriteRunner extends SparkShufflingFileRewriteRunner {
 
   public static final String COLUMNS = "columns";
   public static final String USE_IDENTIFIER_KEYS = "use-identifier-keys";
+  public static final String USE_GLOBAL_RANGE_PARTITIONING = "use-global-range-partitioning";
 
   private SortOrder sortOrder;
   private boolean sortOrderFromOptions = false;
+  private boolean useGlobalRangePartitioning = false;
 
   SparkSortFileRewriteRunner(SparkSession spark, Table table) {
     super(spark, table);
@@ -72,12 +74,16 @@ class SparkSortFileRewriteRunner extends SparkShufflingFileRewriteRunner {
         .addAll(super.validOptions())
         .add(COLUMNS)
         .add(USE_IDENTIFIER_KEYS)
+        .add(USE_GLOBAL_RANGE_PARTITIONING)
         .build();
   }
 
   @Override
   public void init(Map<String, String> options) {
     super.init(options);
+
+    this.useGlobalRangePartitioning =
+        Boolean.parseBoolean(options.getOrDefault(USE_GLOBAL_RANGE_PARTITIONING, "false"));
 
     // If sort order was set via constructor, skip options parsing
     if (sortOrder != null) {
@@ -216,5 +222,18 @@ class SparkSortFileRewriteRunner extends SparkShufflingFileRewriteRunner {
   @Override
   protected Dataset<Row> sortedDF(Dataset<Row> df, Function<Dataset<Row>, Dataset<Row>> sortFunc) {
     return sortFunc.apply(df);
+  }
+
+  /** Returns true if global range partitioning is enabled and applicable. */
+  boolean useGlobalRangePartitioning() {
+    return useGlobalRangePartitioning && sortOrder != null && sortOrder.isSorted();
+  }
+
+  /** Returns the field ID of the first sort column, or -1 if not applicable. */
+  int firstSortFieldId() {
+    if (sortOrder == null || !sortOrder.isSorted()) {
+      return -1;
+    }
+    return sortOrder.fields().get(0).sourceId();
   }
 }
