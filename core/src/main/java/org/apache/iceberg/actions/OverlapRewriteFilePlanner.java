@@ -289,10 +289,11 @@ public class OverlapRewriteFilePlanner
       return expandGroup(files, bestPair);
     }
 
-    // Stage 2: No positive improvement possible, but overlaps exist
-    // Do a full sort starting from min lower bound among overlapping files
-    LOG.info("OVERLAP: stage 2 - full sort fallback");
-    return buildFallbackGroup(files, overlappingPairs);
+    // Stage 2: No positive improvement found - skip fallback
+    // Fallback was causing inefficient "wave" behavior on consecutive UUID files
+    // where each iteration only merged 1-2 files at a time
+    LOG.info("OVERLAP: no positive improvement found, skipping rewrite");
+    return null;
   }
 
   /**
@@ -351,8 +352,11 @@ public class OverlapRewriteFilePlanner
   /**
    * Stage 2: Build a fallback group starting from min lower bound among overlapping files.
    * This forces a full sort of a region with overlaps.
+   *
+   * <p>NOTE: Currently disabled due to inefficient "wave" behavior on consecutive UUID files.
+   * Kept for potential future use with improved logic.
    */
-  @SuppressWarnings("unchecked")
+  @SuppressWarnings({"unchecked", "UnusedMethod"})
   private List<FileScanTask> buildFallbackGroup(
       List<FileScanTask> files, List<int[]> overlappingPairs) {
     if (columnFieldIds.isEmpty()) {
