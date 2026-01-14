@@ -18,12 +18,21 @@
  */
 package org.apache.iceberg.spark.actions;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.NullOrder;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.ReplaceSortOrder;
+import org.apache.iceberg.SortDirection;
+import org.apache.iceberg.SortField;
+import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
@@ -71,6 +80,11 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
   private static final Logger LOG = LoggerFactory.getLogger(SparkShufflingFileRewriteRunner.class);
 
+  // Common option constants for sorting strategies
+  public static final String COLUMNS = "columns";
+  public static final String USE_IDENTIFIER_KEYS = "use-identifier-keys";
+  public static final String USE_UUID_PREFIX_BUCKETING = "use-uuid-prefix-bucketing";
+
   /**
    * The number of shuffle partitions to use for each output file. By default, this file rewriter
    * assumes each shuffle partition would become a separate output file. Attempting to generate
@@ -95,6 +109,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   private int numShufflePartitionsPerFile;
   private String rowGroupSizeBytes;
   private int uuidBuckets;
+  private boolean useUuidPrefixBucketingOption;
 
   protected SparkShufflingFileRewriteRunner(SparkSession spark, Table table) {
     super(spark, table);
@@ -130,6 +145,9 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
         .addAll(super.validOptions())
         .add(SHUFFLE_PARTITIONS_PER_FILE)
         .add(TARGET_ROW_GROUP_SIZE_BYTES)
+        .add(COLUMNS)
+        .add(USE_IDENTIFIER_KEYS)
+        .add(USE_UUID_PREFIX_BUCKETING)
         .build();
   }
 
@@ -139,6 +157,8 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     this.numShufflePartitionsPerFile = numShufflePartitionsPerFile(options);
     this.rowGroupSizeBytes = options.get(TARGET_ROW_GROUP_SIZE_BYTES);
     this.uuidBuckets = computeUuidBuckets(options);
+    this.useUuidPrefixBucketingOption =
+        Boolean.parseBoolean(options.getOrDefault(USE_UUID_PREFIX_BUCKETING, "false"));
   }
 
   /**
@@ -445,6 +465,91 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
         "Using '%s' requires enabling Iceberg Spark session extensions",
         SHUFFLE_PARTITIONS_PER_FILE);
     return value;
+  }
+
+  // ========== Common utility methods for sorting strategies ==========
+
+  /** Returns true if the use-uuid-prefix-bucketing option is enabled. */
+  protected boolean useUuidPrefixBucketingOption() {
+    return useUuidPrefixBucketingOption;
+  }
+
+  /** Parses a comma-separated columns option into a list of column names. */
+  protected List<String> parseColumnsOption(String columnsOption) {
+    return Arrays.stream(columnsOption.split(","))
+        .map(String::trim)
+        .filter(s -> !s.isEmpty())
+        .collect(Collectors.toList());
+  }
+
+  /** Validates that all columns exist in the table schema. */
+  protected void validateColumnsExist(List<String> columns) {
+    Schema schema = table().schema();
+    for (String column : columns) {
+      Preconditions.checkArgument(
+          schema.findField(column) != null, "Column '%s' not found in table schema", column);
+    }
+  }
+
+  /** Builds a sort order from column names (ASC, NULLS_LAST). */
+  protected org.apache.iceberg.SortOrder buildSortOrderFromColumns(List<String> columns) {
+    Schema schema = table().schema();
+    org.apache.iceberg.SortOrder.Builder builder = org.apache.iceberg.SortOrder.builderFor(schema);
+    for (String column : columns) {
+      builder.asc(column, NullOrder.NULLS_LAST);
+    }
+    return builder.build();
+  }
+
+  /** Builds a sort order from field IDs (ASC, NULLS_LAST). */
+  protected org.apache.iceberg.SortOrder buildSortOrderFromFieldIds(List<Integer> fieldIds) {
+    Schema schema = table().schema();
+    org.apache.iceberg.SortOrder.Builder builder = org.apache.iceberg.SortOrder.builderFor(schema);
+    for (Integer fieldId : fieldIds) {
+      String columnName = schema.findColumnName(fieldId);
+      builder.asc(columnName, NullOrder.NULLS_LAST);
+    }
+    return builder.build();
+  }
+
+  /**
+   * Ensures the sort order is registered in the table so files can reference it by sort_order_id.
+   * If no default sort order exists, this becomes the default. Otherwise, it's added without
+   * changing the default.
+   */
+  protected void ensureSortOrderRegistered(org.apache.iceberg.SortOrder newSortOrder) {
+    org.apache.iceberg.SortOrder existing =
+        SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder);
+    if (existing.isSorted()) {
+      LOG.info("Sort order already registered in table with orderId={}", existing.orderId());
+      return;
+    }
+
+    if (table().sortOrder().isUnsorted()) {
+      LOG.info("Registering sort order as table default");
+      ReplaceSortOrder replace = table().replaceSortOrder();
+      for (SortField field : newSortOrder.fields()) {
+        String columnName = table().schema().findColumnName(field.sourceId());
+        if (field.direction() == SortDirection.ASC) {
+          replace.asc(columnName, field.nullOrder());
+        } else {
+          replace.desc(columnName, field.nullOrder());
+        }
+      }
+      replace.commit();
+    } else {
+      LOG.info("Adding sort order without changing table default");
+      TableOperations ops = ((HasTableOperations) table()).operations();
+      TableMetadata current = ops.current();
+      TableMetadata updated =
+          TableMetadata.buildFrom(current).addSortOrder(newSortOrder).build();
+      ops.commit(current, updated);
+    }
+
+    table().refresh();
+    LOG.info(
+        "Sort order registered with orderId={}",
+        SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder).orderId());
   }
 
   private static class OrderedWrite implements RequiresDistributionAndOrdering {

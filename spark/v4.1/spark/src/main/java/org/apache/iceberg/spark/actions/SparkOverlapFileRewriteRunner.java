@@ -18,25 +18,15 @@
  */
 package org.apache.iceberg.spark.actions;
 
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-import org.apache.iceberg.HasTableOperations;
-import org.apache.iceberg.NullOrder;
-import org.apache.iceberg.ReplaceSortOrder;
-import org.apache.iceberg.Schema;
-import org.apache.iceberg.SortDirection;
-import org.apache.iceberg.SortField;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.TableMetadata;
-import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
-import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
-import org.apache.iceberg.util.SortOrderUtil;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -51,37 +41,20 @@ class SparkOverlapFileRewriteRunner extends SparkShufflingFileRewriteRunner {
 
   private static final Logger LOG = LoggerFactory.getLogger(SparkOverlapFileRewriteRunner.class);
 
-  public static final String COLUMNS = "columns";
-  public static final String USE_IDENTIFIER_KEYS = "use-identifier-keys";
-  public static final String USE_UUID_PREFIX_BUCKETING = "use-uuid-prefix-bucketing";
-
   private SortOrder sortOrder;
   private List<String> columns;
-  private boolean useUuidPrefixBucketing = false;
 
   SparkOverlapFileRewriteRunner(SparkSession spark, Table table) {
     super(spark, table);
   }
 
   @Override
-  public Set<String> validOptions() {
-    return ImmutableSet.<String>builder()
-        .addAll(super.validOptions())
-        .add(COLUMNS)
-        .add(USE_IDENTIFIER_KEYS)
-        .add(USE_UUID_PREFIX_BUCKETING)
-        .build();
-  }
-
-  @Override
   public void init(Map<String, String> options) {
     super.init(options);
 
-    this.useUuidPrefixBucketing =
-        Boolean.parseBoolean(options.getOrDefault(USE_UUID_PREFIX_BUCKETING, "false"));
-
     String columnsOption = options.get(COLUMNS);
-    boolean useIdentifierKeys = Boolean.parseBoolean(options.getOrDefault(USE_IDENTIFIER_KEYS, "false"));
+    boolean useIdentifierKeys =
+        Boolean.parseBoolean(options.getOrDefault(USE_IDENTIFIER_KEYS, "false"));
 
     Preconditions.checkArgument(
         columnsOption != null || useIdentifierKeys,
@@ -95,100 +68,29 @@ class SparkOverlapFileRewriteRunner extends SparkShufflingFileRewriteRunner {
         COLUMNS,
         USE_IDENTIFIER_KEYS);
 
-    Schema schema = table().schema();
-
     if (useIdentifierKeys) {
-      Set<Integer> identifierFieldIds = schema.identifierFieldIds();
-      // Empty identifier keys handled by planner (returns empty plan)
-      // Sort by field ID for deterministic ordering (same as SparkSortFileRewriteRunner)
+      Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
+      if (identifierFieldIds.isEmpty()) {
+        LOG.info("No identifier keys found, using unsorted fallback");
+        this.columns = ImmutableList.of();
+        this.sortOrder = SortOrder.unsorted();
+        return;
+      }
       List<Integer> sortedFieldIds =
           identifierFieldIds.stream().sorted().collect(Collectors.toList());
       this.columns =
           sortedFieldIds.stream()
-              .map(schema::findColumnName)
+              .map(table().schema()::findColumnName)
               .collect(Collectors.toList());
-      this.sortOrder = buildSortOrderFromIdentifierKeys(sortedFieldIds);
+      this.sortOrder = buildSortOrderFromFieldIds(sortedFieldIds);
       ensureSortOrderRegistered(this.sortOrder);
     } else {
-      this.columns =
-          Arrays.stream(columnsOption.split(","))
-              .map(String::trim)
-              .filter(s -> !s.isEmpty())
-              .collect(Collectors.toList());
+      this.columns = parseColumnsOption(columnsOption);
       Preconditions.checkArgument(
           !columns.isEmpty(), "'%s' option must specify at least one column", COLUMNS);
-
-      // Validate columns exist in schema
-      for (String column : columns) {
-        Preconditions.checkArgument(
-            schema.findField(column) != null,
-            "Column '%s' not found in table schema",
-            column);
-      }
-
-      // Build sort order from columns
-      SortOrder.Builder builder = SortOrder.builderFor(schema);
-      for (String column : columns) {
-        builder.asc(column, NullOrder.NULLS_LAST);
-      }
-      this.sortOrder = builder.build();
+      validateColumnsExist(columns);
+      this.sortOrder = buildSortOrderFromColumns(columns);
     }
-  }
-
-  /**
-   * Builds a sort order from identifier field IDs, sorted by field ID for deterministic ordering.
-   */
-  private SortOrder buildSortOrderFromIdentifierKeys(List<Integer> fieldIds) {
-    Schema schema = table().schema();
-    SortOrder.Builder builder = SortOrder.builderFor(schema);
-    for (Integer fieldId : fieldIds) {
-      String columnName = schema.findColumnName(fieldId);
-      builder.asc(columnName, NullOrder.NULLS_LAST);
-    }
-    return builder.build();
-  }
-
-  /**
-   * Ensures the sort order is registered in the table so files can reference it by sort_order_id.
-   * If no default sort order exists, this becomes the default. Otherwise, it's added without
-   * changing the default.
-   */
-  private void ensureSortOrderRegistered(SortOrder newSortOrder) {
-    // Check if matching sort order already exists
-    SortOrder existing = SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder);
-    if (existing.isSorted()) {
-      LOG.info("Sort order already registered in table with orderId={}", existing.orderId());
-      return;
-    }
-
-    // Need to add the sort order
-    if (table().sortOrder().isUnsorted()) {
-      // No default sort order - use replaceSortOrder (becomes default)
-      LOG.info("Registering sort order as table default");
-      ReplaceSortOrder replace = table().replaceSortOrder();
-      for (SortField field : newSortOrder.fields()) {
-        String columnName = table().schema().findColumnName(field.sourceId());
-        if (field.direction() == SortDirection.ASC) {
-          replace.asc(columnName, field.nullOrder());
-        } else {
-          replace.desc(columnName, field.nullOrder());
-        }
-      }
-      replace.commit();
-    } else {
-      // Has different default - use addSortOrder (don't change default)
-      LOG.info("Adding sort order without changing table default");
-      TableOperations ops = ((HasTableOperations) table()).operations();
-      TableMetadata current = ops.current();
-      TableMetadata updated = TableMetadata.buildFrom(current).addSortOrder(newSortOrder).build();
-      ops.commit(current, updated);
-    }
-
-    // Refresh to pick up the new sort order
-    table().refresh();
-    LOG.info(
-        "Sort order registered with orderId={}",
-        SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder).orderId());
   }
 
   @Override
@@ -212,6 +114,6 @@ class SparkOverlapFileRewriteRunner extends SparkShufflingFileRewriteRunner {
 
   @Override
   protected boolean useUuidPrefixBucketing() {
-    return useUuidPrefixBucketing && sortOrder != null && sortOrder.isSorted();
+    return useUuidPrefixBucketingOption() && sortOrder != null && sortOrder.isSorted();
   }
 }
