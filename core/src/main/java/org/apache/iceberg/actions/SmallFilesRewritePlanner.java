@@ -27,13 +27,25 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.NullOrder;
+import org.apache.iceberg.ReplaceSortOrder;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.SortDirection;
+import org.apache.iceberg.SortField;
+import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.actions.RewriteDataFiles.FileGroupInfo;
+import org.apache.iceberg.util.ContentFileUtil;
+import org.apache.iceberg.util.SortOrderUtil;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
@@ -83,6 +95,26 @@ public class SmallFilesRewritePlanner
   public static final String COLUMNS = "columns";
   public static final String USE_IDENTIFIER_KEYS = "use-identifier-keys";
 
+  /** Target file size for loner files (files that don't overlap with other small files). */
+  public static final String LONER_TARGET_FILE_SIZE_BYTES = "loner-target-file-size-bytes";
+
+  public static final long LONER_TARGET_FILE_SIZE_BYTES_DEFAULT = 4 * 1024 * 1024; // 4 MB
+
+  /** When true, only files with delete files are selected for rewrite. */
+  public static final String DELETE_FILES_ONLY = "delete-files-only";
+
+  public static final boolean DELETE_FILES_ONLY_DEFAULT = false;
+
+  /** Minimum number of delete files to consider a file for rewrite. */
+  public static final String DELETE_FILE_THRESHOLD = "delete-file-threshold";
+
+  public static final int DELETE_FILE_THRESHOLD_DEFAULT = Integer.MAX_VALUE;
+
+  /** Minimum delete ratio (deleted records / total records) to consider a file for rewrite. */
+  public static final String DELETE_RATIO_THRESHOLD = "delete-ratio-threshold";
+
+  public static final double DELETE_RATIO_THRESHOLD_DEFAULT = 0.3;
+
   private final Expression filter;
   private final Long snapshotId;
   private final boolean caseSensitive;
@@ -91,6 +123,13 @@ public class SmallFilesRewritePlanner
   private List<Type> columnTypes;
   private long maxGroupSize;
   private long maxGroupInputFiles;
+  private long lonerWriteMaxFileSize;
+  private boolean deleteFilesOnly;
+  private int deleteFileThreshold;
+  private double deleteRatioThreshold;
+  private Integer largeSortOrderId;
+  private Integer smallSortOrderId;
+  private boolean useIdentifierKeys;
 
   public SmallFilesRewritePlanner(Table table) {
     this(table, Expressions.alwaysTrue());
@@ -118,6 +157,10 @@ public class SmallFilesRewritePlanner
         .addAll(super.validOptions())
         .add(COLUMNS)
         .add(USE_IDENTIFIER_KEYS)
+        .add(LONER_TARGET_FILE_SIZE_BYTES)
+        .add(DELETE_FILES_ONLY)
+        .add(DELETE_FILE_THRESHOLD)
+        .add(DELETE_RATIO_THRESHOLD)
         .build();
   }
 
@@ -126,7 +169,7 @@ public class SmallFilesRewritePlanner
     super.init(options);
 
     String columnsOption = options.get(COLUMNS);
-    boolean useIdentifierKeys =
+    this.useIdentifierKeys =
         Boolean.parseBoolean(options.getOrDefault(USE_IDENTIFIER_KEYS, "false"));
 
     Preconditions.checkArgument(
@@ -189,6 +232,147 @@ public class SmallFilesRewritePlanner
     this.maxGroupInputFiles =
         PropertyUtil.propertyAsLong(
             options, MAX_FILE_GROUP_INPUT_FILES, MAX_FILE_GROUP_INPUT_FILES_DEFAULT);
+
+    this.lonerWriteMaxFileSize =
+        PropertyUtil.propertyAsLong(
+            options, LONER_TARGET_FILE_SIZE_BYTES, LONER_TARGET_FILE_SIZE_BYTES_DEFAULT);
+
+    this.deleteFilesOnly =
+        PropertyUtil.propertyAsBoolean(options, DELETE_FILES_ONLY, DELETE_FILES_ONLY_DEFAULT);
+    this.deleteFileThreshold =
+        PropertyUtil.propertyAsInt(options, DELETE_FILE_THRESHOLD, DELETE_FILE_THRESHOLD_DEFAULT);
+    this.deleteRatioThreshold =
+        PropertyUtil.propertyAsDouble(
+            options, DELETE_RATIO_THRESHOLD, DELETE_RATIO_THRESHOLD_DEFAULT);
+
+    // Initialize sort order IDs for delete-files-only mode
+    if (deleteFilesOnly && useIdentifierKeys && !columnFieldIds.isEmpty()) {
+      initSortOrderIds();
+    }
+  }
+
+  /**
+   * Initialize sort order IDs for delete-files-only mode. Large files use single PK sort (if
+   * applicable) for eq delete convert optimization. Small files use full identifier key sort for
+   * good bounds.
+   */
+  private void initSortOrderIds() {
+    Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
+
+    // Sort order for small files: full identifier keys sort
+    SortOrder smallFilesSortOrder = buildSortOrderFromFieldIds(columnFieldIds);
+    this.smallSortOrderId = ensureSortOrderRegistered(smallFilesSortOrder);
+
+    // Sort order for large files: single Long/Integer PK or unsorted
+    if (isSingleLongIdentifierKey(identifierFieldIds)) {
+      // Single Long/Integer PK - sort helps ROW_GROUP_MERGE_JOIN in eq delete convert
+      SortOrder largeSortOrder = buildSortOrderFromFieldIds(columnFieldIds);
+      this.largeSortOrderId = ensureSortOrderRegistered(largeSortOrder);
+      LOG.info(
+          "SMALL_FILES delete-files-only: single Long/Integer PK detected, "
+              + "large files will be sorted (sortOrderId={})",
+          largeSortOrderId);
+    } else {
+      // Composite PK or non-Long type - sorting won't help eq delete convert
+      this.largeSortOrderId = null; // null means unsorted
+      LOG.info(
+          "SMALL_FILES delete-files-only: composite or non-Long PK, large files will be unsorted");
+    }
+  }
+
+  private SortOrder buildSortOrderFromFieldIds(List<Integer> fieldIds) {
+    Schema schema = table().schema();
+    SortOrder.Builder builder = SortOrder.builderFor(schema);
+    for (Integer fieldId : fieldIds) {
+      String columnName = schema.findColumnName(fieldId);
+      builder.asc(columnName, NullOrder.NULLS_LAST);
+    }
+    return builder.build();
+  }
+
+  /**
+   * Checks if identifier key is a single Long/Integer column. Only single long columns benefit from
+   * ROW_GROUP_MERGE_JOIN optimization in eq delete convert.
+   */
+  private boolean isSingleLongIdentifierKey(Set<Integer> identifierFieldIds) {
+    if (identifierFieldIds.size() != 1) {
+      return false;
+    }
+    Integer fieldId = identifierFieldIds.iterator().next();
+    Types.NestedField field = table().schema().findField(fieldId);
+    if (field == null) {
+      return false;
+    }
+    Type.TypeID typeId = field.type().typeId();
+    return typeId == Type.TypeID.LONG || typeId == Type.TypeID.INTEGER;
+  }
+
+  /**
+   * Ensures the sort order is registered in the table and returns its ID. Returns the sort order ID
+   * if found or registered.
+   */
+  private Integer ensureSortOrderRegistered(SortOrder newSortOrder) {
+    // Check if matching sort order already exists
+    SortOrder existing = SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder);
+    if (existing.isSorted()) {
+      return existing.orderId();
+    }
+
+    // Need to add the sort order
+    if (table().sortOrder().isUnsorted()) {
+      // No default sort order - use replaceSortOrder (becomes default)
+      LOG.info("Registering sort order as table default");
+      ReplaceSortOrder replace = table().replaceSortOrder();
+      for (SortField field : newSortOrder.fields()) {
+        String columnName = table().schema().findColumnName(field.sourceId());
+        if (field.direction() == SortDirection.ASC) {
+          replace.asc(columnName, field.nullOrder());
+        } else {
+          replace.desc(columnName, field.nullOrder());
+        }
+      }
+      replace.commit();
+    } else {
+      // Has different default - use addSortOrder (don't change default)
+      LOG.info("Adding sort order without changing table default");
+      TableOperations ops = ((HasTableOperations) table()).operations();
+      TableMetadata current = ops.current();
+      TableMetadata updated = TableMetadata.buildFrom(current).addSortOrder(newSortOrder).build();
+      ops.commit(current, updated);
+    }
+
+    // Refresh to pick up the new sort order
+    table().refresh();
+    SortOrder registered = SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder);
+    LOG.info("Sort order registered with orderId={}", registered.orderId());
+    return registered.orderId();
+  }
+
+  /** Returns true if file has too many delete files (>= threshold). */
+  private boolean tooManyDeletes(FileScanTask task) {
+    return task.deletes() != null && task.deletes().size() >= deleteFileThreshold;
+  }
+
+  /** Returns true if file has too high delete ratio (>= threshold). */
+  private boolean tooHighDeleteRatio(FileScanTask task) {
+    if (task.deletes() == null || task.deletes().isEmpty()) {
+      return false;
+    }
+
+    long knownDeletedRecordCount =
+        task.deletes().stream()
+            .filter(ContentFileUtil::isFileScoped)
+            .mapToLong(ContentFile::recordCount)
+            .sum();
+
+    double deletedRecords = (double) Math.min(knownDeletedRecordCount, task.file().recordCount());
+    double deleteRatio = deletedRecords / task.file().recordCount();
+    return deleteRatio >= deleteRatioThreshold;
+  }
+
+  /** Returns true if file has delete files that need processing. */
+  private boolean hasDeletes(FileScanTask task) {
+    return tooManyDeletes(task) || tooHighDeleteRatio(task);
   }
 
   @Override
@@ -239,59 +423,12 @@ public class SmallFilesRewritePlanner
         continue;
       }
 
-      // Separate into large and small files
-      List<FileScanTask> largeFiles =
-          filesWithBounds.stream()
-              .filter(t -> !isSmallFile(t))
-              .collect(Collectors.toList());
-
-      List<FileScanTask> smallFiles =
-          filesWithBounds.stream()
-              .filter(this::isSmallFile)
-              .collect(Collectors.toList());
-
-      LOG.debug(
-          "SMALL_FILES: partition={} total={} large={} small={}",
-          partition,
-          filesWithBounds.size(),
-          largeFiles.size(),
-          smallFiles.size());
-
-      if (smallFiles.size() < 2) {
-        continue; // Need at least 2 small files to merge
-      }
-
-      List<FileScanTask> filesToGroup;
-      if (unsortedFallback) {
-        // Unsorted fallback: group all small files without clean zone filtering
-        filesToGroup = smallFiles;
+      if (deleteFilesOnly) {
+        // delete-files-only mode: process files with delete files
+        planDeleteFilesOnly(ctx, partition, filesWithBounds, unsortedFallback, selectedGroups);
       } else {
-        // Build covered ranges from large files (merged overlapping ranges)
-        List<CoveredRange> coveredRanges = buildCoveredRanges(largeFiles);
-
-        // Filter small files to only those entirely within clean zones
-        filesToGroup = filterToCleanZones(smallFiles, coveredRanges);
-      }
-
-      if (filesToGroup.size() < 2) {
-        continue;
-      }
-
-      // Group using bin packing (sorted by lower bound if columns specified)
-      List<List<FileScanTask>> groups = groupFiles(filesToGroup);
-
-      for (List<FileScanTask> group : groups) {
-        if (group.size() >= 2) {
-          long inputSize = inputSize(group);
-          RewriteFileGroup rewriteGroup =
-              newRewriteGroup(
-                  ctx,
-                  partition,
-                  group,
-                  inputSplitSize(inputSize),
-                  expectedOutputFiles(inputSize));
-          selectedGroups.add(rewriteGroup);
-        }
+        // Normal mode: merge small files
+        planSmallFiles(ctx, partition, filesWithBounds, unsortedFallback, selectedGroups);
       }
     }
 
@@ -307,6 +444,185 @@ public class SmallFilesRewritePlanner
         CloseableIterable.of(selectedGroups), totalGroupCount, groupsInPartition);
   }
 
+  /** Plan for delete-files-only mode. */
+  private void planDeleteFilesOnly(
+      RewriteExecutionContext ctx,
+      StructLike partition,
+      List<FileScanTask> filesWithBounds,
+      boolean unsortedFallback,
+      List<RewriteFileGroup> selectedGroups) {
+
+    // Filter to files with delete files
+    List<FileScanTask> filesWithDeletes =
+        filesWithBounds.stream().filter(this::hasDeletes).collect(Collectors.toList());
+
+    if (filesWithDeletes.isEmpty()) {
+      return;
+    }
+
+    // Separate into large and small files
+    List<FileScanTask> largeFilesWithDeletes =
+        filesWithDeletes.stream().filter(t -> !isSmallFile(t)).collect(Collectors.toList());
+
+    List<FileScanTask> smallFilesWithDeletes =
+        filesWithDeletes.stream().filter(this::isSmallFile).collect(Collectors.toList());
+
+    LOG.info(
+        "SMALL_FILES delete-files-only: partition={} filesWithDeletes={} (large={}, small={})",
+        partition,
+        filesWithDeletes.size(),
+        largeFilesWithDeletes.size(),
+        smallFilesWithDeletes.size());
+
+    // Large files: each in its own group with largeSortOrderId
+    for (FileScanTask largeFile : largeFilesWithDeletes) {
+      selectedGroups.add(
+          createRewriteGroup(
+              ctx,
+              partition,
+              ImmutableList.of(largeFile),
+              writeMaxFileSize(),
+              largeSortOrderId));
+    }
+
+    // Small files: use normal small files logic with smallSortOrderId
+    if (!smallFilesWithDeletes.isEmpty()) {
+      // Get large files WITHOUT deletes for covered ranges calculation
+      List<FileScanTask> largeFilesForRanges =
+          filesWithBounds.stream()
+              .filter(t -> !isSmallFile(t))
+              .collect(Collectors.toList());
+
+      planSmallFilesWithSortOrderId(
+          ctx,
+          partition,
+          smallFilesWithDeletes,
+          largeFilesForRanges,
+          unsortedFallback,
+          selectedGroups,
+          smallSortOrderId);
+    }
+  }
+
+  /** Plan for normal small files mode. */
+  private void planSmallFiles(
+      RewriteExecutionContext ctx,
+      StructLike partition,
+      List<FileScanTask> filesWithBounds,
+      boolean unsortedFallback,
+      List<RewriteFileGroup> selectedGroups) {
+
+    // Separate into large and small files
+    List<FileScanTask> largeFiles =
+        filesWithBounds.stream().filter(t -> !isSmallFile(t)).collect(Collectors.toList());
+
+    List<FileScanTask> smallFiles =
+        filesWithBounds.stream().filter(this::isSmallFile).collect(Collectors.toList());
+
+    LOG.debug(
+        "SMALL_FILES: partition={} total={} large={} small={}",
+        partition,
+        filesWithBounds.size(),
+        largeFiles.size(),
+        smallFiles.size());
+
+    if (smallFiles.size() < 2) {
+      return; // Need at least 2 small files to merge
+    }
+
+    planSmallFilesWithSortOrderId(
+        ctx, partition, smallFiles, largeFiles, unsortedFallback, selectedGroups, null);
+  }
+
+  /** Plan small files with optional sortOrderId. */
+  private void planSmallFilesWithSortOrderId(
+      RewriteExecutionContext ctx,
+      StructLike partition,
+      List<FileScanTask> smallFiles,
+      List<FileScanTask> largeFiles,
+      boolean unsortedFallback,
+      List<RewriteFileGroup> selectedGroups,
+      Integer sortOrderId) {
+
+    if (unsortedFallback) {
+      // Unsorted fallback: group all small files without overlap analysis
+      for (List<FileScanTask> group : groupFiles(smallFiles)) {
+        if (enoughInputFiles(group)) {
+          selectedGroups.add(
+              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), sortOrderId));
+        }
+      }
+    } else {
+      // Build covered ranges from large files (merged overlapping ranges)
+      List<CoveredRange> coveredRanges = buildCoveredRanges(largeFiles);
+
+      // Categorize small files into 3 groups:
+      // 1. Clean zone files - entirely outside large file bounds
+      // 2. Overlap files - inside large bounds but overlap with other small files
+      // 3. Loners - inside large bounds, no overlap with other small files
+      List<FileScanTask> cleanZoneFiles = new ArrayList<>();
+      List<FileScanTask> insideLargeFiles = new ArrayList<>();
+
+      for (FileScanTask task : smallFiles) {
+        if (isInCleanZone(task, coveredRanges)) {
+          cleanZoneFiles.add(task);
+        } else {
+          insideLargeFiles.add(task);
+        }
+      }
+
+      // Group clean zone files using bin packing
+      List<List<FileScanTask>> cleanZoneGroups = groupFiles(cleanZoneFiles);
+
+      // Group files inside large bounds by overlap clusters
+      // Returns: list of clusters (overlapping files) + list of loners
+      OverlapResult overlapResult = groupByOverlapClusters(insideLargeFiles);
+
+      // Bin pack each overlap cluster
+      List<List<FileScanTask>> overlapGroups = new ArrayList<>();
+      for (List<FileScanTask> cluster : overlapResult.clusters) {
+        overlapGroups.addAll(groupFiles(cluster));
+      }
+
+      // Group loners together
+      List<List<FileScanTask>> lonerGroups = groupFiles(overlapResult.loners);
+
+      int overlapFilesCount = overlapResult.clusters.stream().mapToInt(List::size).sum();
+      LOG.info(
+          "SMALL_FILES: partition={} | cleanZone: {} files -> {} groups | "
+              + "overlap: {} files ({} clusters) -> {} groups | loners: {} files -> {} groups",
+          partition,
+          cleanZoneFiles.size(),
+          cleanZoneGroups.size(),
+          overlapFilesCount,
+          overlapResult.clusters.size(),
+          overlapGroups.size(),
+          overlapResult.loners.size(),
+          lonerGroups.size());
+
+      // Create groups for cleanZone and overlap files (standard writeMaxFileSize)
+      for (List<FileScanTask> group : cleanZoneGroups) {
+        if (enoughInputFiles(group)) {
+          selectedGroups.add(
+              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), sortOrderId));
+        }
+      }
+      for (List<FileScanTask> group : overlapGroups) {
+        if (enoughInputFiles(group)) {
+          selectedGroups.add(
+              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), sortOrderId));
+        }
+      }
+      // Create groups for loners (smaller writeMaxFileSize so they grow gradually)
+      for (List<FileScanTask> group : lonerGroups) {
+        if (enoughInputFiles(group)) {
+          selectedGroups.add(
+              createRewriteGroup(ctx, partition, group, lonerWriteMaxFileSize, sortOrderId));
+        }
+      }
+    }
+  }
+
   /** Check if file is considered "small" based on min file size threshold. */
   private boolean isSmallFile(FileScanTask task) {
     return task.length() < minFileSize();
@@ -320,6 +636,17 @@ public class SmallFilesRewritePlanner
     CoveredRange(Comparable<Object> lower, Comparable<Object> upper) {
       this.lower = lower;
       this.upper = upper;
+    }
+  }
+
+  /** Result of grouping files by overlap - clusters of overlapping files and lone files. */
+  private static class OverlapResult {
+    final List<List<FileScanTask>> clusters;
+    final List<FileScanTask> loners;
+
+    OverlapResult(List<List<FileScanTask>> clusters, List<FileScanTask> loners) {
+      this.clusters = clusters;
+      this.loners = loners;
     }
   }
 
@@ -436,23 +763,82 @@ public class SmallFilesRewritePlanner
     return false; // File overlaps with some large file
   }
 
-  /** Filter small files to only those entirely within clean zones. */
-  private List<FileScanTask> filterToCleanZones(
-      List<FileScanTask> smallFiles, List<CoveredRange> coveredRanges) {
-    List<FileScanTask> cleanFiles =
-        smallFiles.stream()
-            .filter(task -> isInCleanZone(task, coveredRanges))
-            .collect(Collectors.toList());
-
-    int excludedCount = smallFiles.size() - cleanFiles.size();
-    if (excludedCount > 0) {
-      LOG.info(
-          "SMALL_FILES: {} small files excluded (overlap with large files), {} in clean zones",
-          excludedCount,
-          cleanFiles.size());
+  /**
+   * Groups files by overlap clusters. Files that overlap with each other form a cluster. Files that
+   * don't overlap with any other file are considered loners.
+   *
+   * <p>Algorithm: sort by lower bound, then sweep through. If current file overlaps with the
+   * running max upper bound, it joins the current cluster. Otherwise, start a new cluster.
+   */
+  @SuppressWarnings("unchecked")
+  private OverlapResult groupByOverlapClusters(List<FileScanTask> files) {
+    if (files.isEmpty()) {
+      return new OverlapResult(ImmutableList.of(), ImmutableList.of());
     }
 
-    return cleanFiles;
+    if (columnFieldIds.isEmpty()) {
+      // No columns - can't determine overlap, treat all as one cluster
+      return new OverlapResult(ImmutableList.of(files), ImmutableList.of());
+    }
+
+    int fieldId = columnFieldIds.get(0);
+    Type type = columnTypes.get(0);
+
+    // Sort by lower bound
+    List<FileScanTask> sorted = new ArrayList<>(files);
+    sorted.sort(
+        Comparator.comparing(
+            task -> {
+              ByteBuffer buf = task.file().lowerBounds().get(fieldId);
+              return (Comparable<Object>) Conversions.fromByteBuffer(type, buf);
+            }));
+
+    List<List<FileScanTask>> clusters = new ArrayList<>();
+    List<FileScanTask> loners = new ArrayList<>();
+
+    List<FileScanTask> currentCluster = new ArrayList<>();
+    Comparable<Object> maxUpper = null;
+
+    for (FileScanTask task : sorted) {
+      ByteBuffer lowerBuf = task.file().lowerBounds().get(fieldId);
+      ByteBuffer upperBuf = task.file().upperBounds().get(fieldId);
+      Comparable<Object> lower = (Comparable<Object>) Conversions.fromByteBuffer(type, lowerBuf);
+      Comparable<Object> upper = (Comparable<Object>) Conversions.fromByteBuffer(type, upperBuf);
+
+      if (maxUpper == null) {
+        // First file - start new cluster
+        currentCluster.add(task);
+        maxUpper = upper;
+      } else if (lower.compareTo(maxUpper) <= 0) {
+        // Overlaps with current cluster
+        currentCluster.add(task);
+        if (upper.compareTo(maxUpper) > 0) {
+          maxUpper = upper;
+        }
+      } else {
+        // No overlap - finalize current cluster
+        if (currentCluster.size() == 1) {
+          loners.add(currentCluster.get(0));
+        } else {
+          clusters.add(ImmutableList.copyOf(currentCluster));
+        }
+        // Start new cluster
+        currentCluster = new ArrayList<>();
+        currentCluster.add(task);
+        maxUpper = upper;
+      }
+    }
+
+    // Don't forget the last cluster
+    if (!currentCluster.isEmpty()) {
+      if (currentCluster.size() == 1) {
+        loners.add(currentCluster.get(0));
+      } else {
+        clusters.add(ImmutableList.copyOf(currentCluster));
+      }
+    }
+
+    return new OverlapResult(clusters, loners);
   }
 
   /** Group files using bin packing, sorted by lower bound if columns specified. */
@@ -540,12 +926,13 @@ public class SmallFilesRewritePlanner
     return filesByPartition;
   }
 
-  private RewriteFileGroup newRewriteGroup(
+  private RewriteFileGroup createRewriteGroup(
       RewriteExecutionContext ctx,
       StructLike partition,
       List<FileScanTask> tasks,
-      long inputSplitSize,
-      int expectedOutputFiles) {
+      long maxFileSize,
+      Integer sortOrderId) {
+    long inputSize = inputSize(tasks);
     FileGroupInfo info =
         ImmutableRewriteDataFiles.FileGroupInfo.builder()
             .globalIndex(ctx.currentGlobalIndex())
@@ -556,8 +943,9 @@ public class SmallFilesRewritePlanner
         info,
         Lists.newArrayList(tasks),
         outputSpecId(),
-        writeMaxFileSize(),
-        inputSplitSize,
-        expectedOutputFiles);
+        maxFileSize,
+        inputSplitSize(inputSize),
+        expectedOutputFiles(inputSize),
+        sortOrderId);
   }
 }

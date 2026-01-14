@@ -37,6 +37,7 @@ import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
+import org.apache.iceberg.actions.RewriteFileGroup;
 import org.apache.iceberg.util.SortOrderUtil;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
@@ -186,12 +187,28 @@ class SparkSmallFilesRewriteRunner extends SparkShufflingFileRewriteRunner {
 
   @Override
   protected boolean useUuidPrefixBucketing() {
-    return useUuidPrefixBucketing && sortOrder != null && sortOrder.isSorted();
+    // Just return the flag - actual sort order check is done per-group in base class
+    return useUuidPrefixBucketing;
   }
 
   @Override
   protected SortOrder sortOrder() {
     return sortOrder;
+  }
+
+  @Override
+  protected SortOrder effectiveSortOrder(RewriteFileGroup fileGroup) {
+    Integer sortOrderId = fileGroup.sortOrderId();
+    if (sortOrderId != null) {
+      SortOrder groupSortOrder = table().sortOrders().get(sortOrderId);
+      if (groupSortOrder != null) {
+        LOG.debug("Using sort order from group sortOrderId={}", sortOrderId);
+        return groupSortOrder;
+      } else {
+        LOG.warn("Sort order with id {} not found in table, using default", sortOrderId);
+      }
+    }
+    return sortOrder();
   }
 
   @Override

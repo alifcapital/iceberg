@@ -103,6 +103,15 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   protected abstract org.apache.iceberg.SortOrder sortOrder();
 
   /**
+   * Returns the effective sort order for a specific file group. By default returns {@link
+   * #sortOrder()}, but subclasses can override to use per-group sort orders (e.g., from {@link
+   * RewriteFileGroup#sortOrderId()}).
+   */
+  protected org.apache.iceberg.SortOrder effectiveSortOrder(RewriteFileGroup fileGroup) {
+    return sortOrder();
+  }
+
+  /**
    * Retrieves and returns the schema for the rewrite using the current table schema.
    *
    * <p>The schema with all columns required for correctly sorting the table. This may include
@@ -175,6 +184,8 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
   @Override
   public void doRewrite(String groupId, RewriteFileGroup fileGroup) {
+    org.apache.iceberg.SortOrder groupSortOrder = effectiveSortOrder(fileGroup);
+
     Dataset<Row> scanDF =
         spark()
             .read()
@@ -186,6 +197,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
         sortedDF(
             scanDF,
             sortFunction(
+                groupSortOrder,
                 fileGroup.fileScanTasks(),
                 spec(fileGroup.outputSpecId()),
                 fileGroup.expectedOutputFiles(),
@@ -202,7 +214,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
     // Try to find matching sort order in table to set sort_order_id in data files
     org.apache.iceberg.SortOrder matchingTableSortOrder =
-        SortOrderUtil.maybeFindTableSortOrder(table(), sortOrder());
+        SortOrderUtil.maybeFindTableSortOrder(table(), groupSortOrder);
     if (matchingTableSortOrder.isSorted()) {
       writer.option(SparkWriteOptions.OUTPUT_SORT_ORDER_ID, matchingTableSortOrder.orderId());
     }
@@ -215,19 +227,20 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   }
 
   private Function<Dataset<Row>, Dataset<Row>> sortFunction(
+      org.apache.iceberg.SortOrder groupSortOrder,
       List<FileScanTask> group,
       PartitionSpec outputSpec,
       int expectedOutputFiles,
       StructLike partition) {
-    SortOrder[] ordering = Spark3Util.toOrdering(outputSortOrder(group, outputSpec));
+    SortOrder[] ordering = Spark3Util.toOrdering(outputSortOrder(groupSortOrder, group, outputSpec));
     int numShufflePartitions = Math.max(1, expectedOutputFiles * numShufflePartitionsPerFile);
 
     // Check if UUID prefix bucketing is enabled and applicable
-    if (useUuidPrefixBucketing() && uuidBuckets > 0 && isFirstSortColumnUuid(group)) {
+    if (useUuidPrefixBucketing() && uuidBuckets > 0 && isFirstSortColumnUuid(groupSortOrder, group)) {
       LOG.info("Using UUID prefix bucketing with {} buckets", uuidBuckets);
       return df ->
           transformPlan(
-              df, plan -> uuidPrefixSortPlan(plan, ordering, uuidBuckets, numShufflePartitions));
+              df, plan -> uuidPrefixSortPlan(groupSortOrder, plan, ordering, uuidBuckets, numShufflePartitions));
     } else {
       return df -> transformPlan(df, plan -> sortPlan(plan, ordering, numShufflePartitions));
     }
@@ -241,12 +254,12 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   /**
    * Checks if the first sort column looks like UUID by examining file bounds.
    */
-  private boolean isFirstSortColumnUuid(List<FileScanTask> group) {
-    if (sortOrder() == null || sortOrder().fields().isEmpty()) {
+  private boolean isFirstSortColumnUuid(org.apache.iceberg.SortOrder groupSortOrder, List<FileScanTask> group) {
+    if (groupSortOrder == null || groupSortOrder.fields().isEmpty()) {
       return false;
     }
 
-    int firstSortFieldId = sortOrder().fields().get(0).sourceId();
+    int firstSortFieldId = groupSortOrder.fields().get(0).sourceId();
 
     for (FileScanTask task : group) {
       java.nio.ByteBuffer lowerBuf =
@@ -292,6 +305,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
    * prefix, avoiding Spark's sampling-based range partitioner.
    */
   private LogicalPlan uuidPrefixSortPlan(
+      org.apache.iceberg.SortOrder groupSortOrder,
       LogicalPlan plan, SortOrder[] ordering, int numBuckets, int numShufflePartitions) {
     // If ordering is empty (unsorted), skip shuffle/sort
     if (ordering.length == 0) {
@@ -299,7 +313,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     }
 
     // Get the first sort column from the plan's output
-    String firstSortColumnName = table().schema().findColumnName(sortOrder().fields().get(0).sourceId());
+    String firstSortColumnName = table().schema().findColumnName(groupSortOrder.fields().get(0).sourceId());
     Expression firstSortCol = findColumnExpression(plan, firstSortColumnName);
 
     if (firstSortCol == null) {
@@ -408,14 +422,15 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   }
 
   private org.apache.iceberg.SortOrder outputSortOrder(
+      org.apache.iceberg.SortOrder groupSortOrder,
       List<FileScanTask> group, PartitionSpec outputSpec) {
     boolean requiresRepartitioning = !group.get(0).spec().equals(outputSpec);
     if (requiresRepartitioning) {
       // build in the requirement for partition sorting into our sort order
       // as the original spec for this group does not match the output spec
-      return SortOrderUtil.buildSortOrder(sortSchema(), outputSpec, sortOrder());
+      return SortOrderUtil.buildSortOrder(sortSchema(), outputSpec, groupSortOrder);
     } else {
-      return sortOrder();
+      return groupSortOrder;
     }
   }
 

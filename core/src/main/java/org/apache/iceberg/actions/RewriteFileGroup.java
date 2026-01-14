@@ -39,6 +39,7 @@ import org.apache.iceberg.util.DeleteFileSet;
  */
 public class RewriteFileGroup extends RewriteGroupBase<FileGroupInfo, FileScanTask, DataFile> {
   private final int outputSpecId;
+  private final Integer sortOrderId;
   private DataFileSet addedFiles = DataFileSet.create();
 
   public RewriteFileGroup(
@@ -48,8 +49,20 @@ public class RewriteFileGroup extends RewriteGroupBase<FileGroupInfo, FileScanTa
       long writeMaxFileSize,
       long inputSplitSize,
       int expectedOutputFiles) {
+    this(info, fileScanTasks, outputSpecId, writeMaxFileSize, inputSplitSize, expectedOutputFiles, null);
+  }
+
+  public RewriteFileGroup(
+      FileGroupInfo info,
+      List<FileScanTask> fileScanTasks,
+      int outputSpecId,
+      long writeMaxFileSize,
+      long inputSplitSize,
+      int expectedOutputFiles,
+      Integer sortOrderId) {
     super(info, fileScanTasks, writeMaxFileSize, inputSplitSize, expectedOutputFiles);
     this.outputSpecId = outputSpecId;
+    this.sortOrderId = sortOrderId;
   }
 
   public void setOutputFiles(Set<DataFile> files) {
@@ -96,11 +109,20 @@ public class RewriteFileGroup extends RewriteGroupBase<FileGroupInfo, FileScanTa
         .add("inputSplitSize", inputSplitSize())
         .add("expectedOutputFiles", expectedOutputFiles())
         .add("outputSpecId", outputSpecId)
+        .add("sortOrderId", sortOrderId)
         .toString();
   }
 
 public int outputSpecId() {
     return outputSpecId;
+  }
+
+  /**
+   * Returns the sort order ID to use for this group, or null to use the runner's default sort
+   * order.
+   */
+  public Integer sortOrderId() {
+    return sortOrderId;
   }
 
   public int numFilesWithDeletes() {
