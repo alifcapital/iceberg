@@ -53,9 +53,11 @@ class SparkOverlapFileRewriteRunner extends SparkShufflingFileRewriteRunner {
 
   public static final String COLUMNS = "columns";
   public static final String USE_IDENTIFIER_KEYS = "use-identifier-keys";
+  public static final String USE_UUID_PREFIX_BUCKETING = "use-uuid-prefix-bucketing";
 
   private SortOrder sortOrder;
   private List<String> columns;
+  private boolean useUuidPrefixBucketing = false;
 
   SparkOverlapFileRewriteRunner(SparkSession spark, Table table) {
     super(spark, table);
@@ -67,12 +69,16 @@ class SparkOverlapFileRewriteRunner extends SparkShufflingFileRewriteRunner {
         .addAll(super.validOptions())
         .add(COLUMNS)
         .add(USE_IDENTIFIER_KEYS)
+        .add(USE_UUID_PREFIX_BUCKETING)
         .build();
   }
 
   @Override
   public void init(Map<String, String> options) {
     super.init(options);
+
+    this.useUuidPrefixBucketing =
+        Boolean.parseBoolean(options.getOrDefault(USE_UUID_PREFIX_BUCKETING, "false"));
 
     String columnsOption = options.get(COLUMNS);
     boolean useIdentifierKeys = Boolean.parseBoolean(options.getOrDefault(USE_IDENTIFIER_KEYS, "false"));
@@ -202,5 +208,10 @@ class SparkOverlapFileRewriteRunner extends SparkShufflingFileRewriteRunner {
 
   List<String> columns() {
     return columns;
+  }
+
+  @Override
+  protected boolean useUuidPrefixBucketing() {
+    return useUuidPrefixBucketing && sortOrder != null && sortOrder.isSorted();
   }
 }
