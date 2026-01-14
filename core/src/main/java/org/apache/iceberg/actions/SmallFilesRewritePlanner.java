@@ -94,6 +94,7 @@ public class SmallFilesRewritePlanner
 
   public static final String COLUMNS = "columns";
   public static final String USE_IDENTIFIER_KEYS = "use-identifier-keys";
+  public static final String USE_UUID_PREFIX_BUCKETING = "use-uuid-prefix-bucketing";
 
   /** Target file size for loner files (files that don't overlap with other small files). */
   public static final String LONER_TARGET_FILE_SIZE_BYTES = "loner-target-file-size-bytes";
@@ -130,6 +131,7 @@ public class SmallFilesRewritePlanner
   private Integer largeSortOrderId;
   private Integer smallSortOrderId;
   private boolean useIdentifierKeys;
+  private boolean useUuidPrefixBucketing;
 
   public SmallFilesRewritePlanner(Table table) {
     this(table, Expressions.alwaysTrue());
@@ -157,6 +159,7 @@ public class SmallFilesRewritePlanner
         .addAll(super.validOptions())
         .add(COLUMNS)
         .add(USE_IDENTIFIER_KEYS)
+        .add(USE_UUID_PREFIX_BUCKETING)
         .add(LONER_TARGET_FILE_SIZE_BYTES)
         .add(DELETE_FILES_ONLY)
         .add(DELETE_FILE_THRESHOLD)
@@ -244,6 +247,9 @@ public class SmallFilesRewritePlanner
     this.deleteRatioThreshold =
         PropertyUtil.propertyAsDouble(
             options, DELETE_RATIO_THRESHOLD, DELETE_RATIO_THRESHOLD_DEFAULT);
+
+    this.useUuidPrefixBucketing =
+        PropertyUtil.propertyAsBoolean(options, USE_UUID_PREFIX_BUCKETING, false);
 
     // Initialize sort order IDs for delete-files-only mode
     if (deleteFilesOnly && useIdentifierKeys && !columnFieldIds.isEmpty()) {
@@ -614,10 +620,18 @@ public class SmallFilesRewritePlanner
         }
       }
       // Create groups for loners (smaller writeMaxFileSize so they grow gradually)
-      for (List<FileScanTask> group : lonerGroups) {
-        if (enoughInputFiles(group)) {
-          selectedGroups.add(
-              createRewriteGroup(ctx, partition, group, lonerWriteMaxFileSize, sortOrderId));
+      // Skip loners if UUID prefix bucketing is enabled and bounds look like UUID
+      boolean skipLoners = useUuidPrefixBucketing && hasUuidBounds(overlapResult.loners);
+      if (skipLoners) {
+        LOG.info(
+            "SMALL_FILES: skipping {} loner files due to UUID prefix bucketing",
+            overlapResult.loners.size());
+      } else {
+        for (List<FileScanTask> group : lonerGroups) {
+          if (enoughInputFiles(group)) {
+            selectedGroups.add(
+                createRewriteGroup(ctx, partition, group, lonerWriteMaxFileSize, sortOrderId));
+          }
         }
       }
     }
@@ -947,5 +961,50 @@ public class SmallFilesRewritePlanner
         inputSplitSize(inputSize),
         expectedOutputFiles(inputSize),
         sortOrderId);
+  }
+
+  /**
+   * Checks if loner files have UUID-like bounds.
+   * Only checks the first file - if it has UUID bounds, all do.
+   */
+  private boolean hasUuidBounds(List<FileScanTask> loners) {
+    if (loners.isEmpty() || columnFieldIds.isEmpty()) {
+      return false;
+    }
+
+    int fieldId = columnFieldIds.get(0);
+    Type type = columnTypes.get(0);
+
+    FileScanTask firstLoner = loners.get(0);
+    ByteBuffer lowerBuf = firstLoner.file().lowerBounds().get(fieldId);
+    if (lowerBuf == null) {
+      return false;
+    }
+
+    Object lower = Conversions.fromByteBuffer(type, lowerBuf);
+    if (lower instanceof CharSequence) {
+      return looksLikeUuid(lower.toString());
+    }
+    return false;
+  }
+
+  /**
+   * Checks if a string value looks like a UUID.
+   * UUID format: xxxxxxxx-xxxx-... (8 hex chars, dash, ...)
+   */
+  private static boolean looksLikeUuid(String value) {
+    if (value == null || value.length() < 9) {
+      return false;
+    }
+    if (value.charAt(8) != '-') {
+      return false;
+    }
+    for (int i = 0; i < 8; i++) {
+      char c = value.charAt(i);
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+        return false;
+      }
+    }
+    return true;
   }
 }
