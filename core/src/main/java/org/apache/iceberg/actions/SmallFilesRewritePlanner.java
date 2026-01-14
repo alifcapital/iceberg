@@ -91,7 +91,6 @@ public class SmallFilesRewritePlanner
   private List<Type> columnTypes;
   private long maxGroupSize;
   private long maxGroupInputFiles;
-  private boolean skipRewrite;
 
   public SmallFilesRewritePlanner(Table table) {
     this(table, Expressions.alwaysTrue());
@@ -146,8 +145,7 @@ public class SmallFilesRewritePlanner
     if (useIdentifierKeys) {
       Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
       if (identifierFieldIds.isEmpty()) {
-        LOG.info("SMALL_FILES: table has no identifier keys, skipping");
-        this.skipRewrite = true;
+        LOG.info("SMALL_FILES: table has no identifier keys, using unsorted fallback");
         this.columnFieldIds = ImmutableList.of();
         this.columnTypes = ImmutableList.of();
         return;
@@ -215,22 +213,27 @@ public class SmallFilesRewritePlanner
 
   @Override
   public FileRewritePlan<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> plan() {
-    if (skipRewrite) {
-      return new FileRewritePlan<>(CloseableIterable.of(ImmutableList.of()), 0, ImmutableMap.of());
-    }
-
     StructLikeMap<List<FileScanTask>> filesByPartition = scanFiles();
 
     List<RewriteFileGroup> selectedGroups = new ArrayList<>();
     RewriteExecutionContext ctx = new RewriteExecutionContext();
 
+    // When no columns specified (unsorted fallback), skip clean zone filtering
+    boolean unsortedFallback = columnFieldIds.isEmpty();
+
     for (Map.Entry<StructLike, List<FileScanTask>> entry : filesByPartition.entrySet()) {
       StructLike partition = entry.getKey();
       List<FileScanTask> partitionFiles = entry.getValue();
 
-      // Filter files that have bounds for all columns
-      List<FileScanTask> filesWithBounds =
-          partitionFiles.stream().filter(this::hasAllBounds).collect(Collectors.toList());
+      List<FileScanTask> filesWithBounds;
+      if (unsortedFallback) {
+        // Unsorted fallback: use all files
+        filesWithBounds = partitionFiles;
+      } else {
+        // Filter files that have bounds for all columns
+        filesWithBounds =
+            partitionFiles.stream().filter(this::hasAllBounds).collect(Collectors.toList());
+      }
 
       if (filesWithBounds.isEmpty()) {
         continue;
@@ -258,18 +261,24 @@ public class SmallFilesRewritePlanner
         continue; // Need at least 2 small files to merge
       }
 
-      // Build covered ranges from large files (merged overlapping ranges)
-      List<CoveredRange> coveredRanges = buildCoveredRanges(largeFiles);
+      List<FileScanTask> filesToGroup;
+      if (unsortedFallback) {
+        // Unsorted fallback: group all small files without clean zone filtering
+        filesToGroup = smallFiles;
+      } else {
+        // Build covered ranges from large files (merged overlapping ranges)
+        List<CoveredRange> coveredRanges = buildCoveredRanges(largeFiles);
 
-      // Filter small files to only those entirely within clean zones
-      List<FileScanTask> cleanZoneFiles = filterToCleanZones(smallFiles, coveredRanges);
+        // Filter small files to only those entirely within clean zones
+        filesToGroup = filterToCleanZones(smallFiles, coveredRanges);
+      }
 
-      if (cleanZoneFiles.size() < 2) {
+      if (filesToGroup.size() < 2) {
         continue;
       }
 
-      // Sort by lower bound and group using bin packing
-      List<List<FileScanTask>> groups = groupFiles(cleanZoneFiles);
+      // Group using bin packing (sorted by lower bound if columns specified)
+      List<List<FileScanTask>> groups = groupFiles(filesToGroup);
 
       for (List<FileScanTask> group : groups) {
         if (group.size() >= 2) {
@@ -435,38 +444,47 @@ public class SmallFilesRewritePlanner
             .filter(task -> isInCleanZone(task, coveredRanges))
             .collect(Collectors.toList());
 
-    LOG.debug(
-        "SMALL_FILES: {} small files in clean zones (out of {} total)",
-        cleanFiles.size(),
-        smallFiles.size());
+    int excludedCount = smallFiles.size() - cleanFiles.size();
+    if (excludedCount > 0) {
+      LOG.info(
+          "SMALL_FILES: {} small files excluded (overlap with large files), {} in clean zones",
+          excludedCount,
+          cleanFiles.size());
+    }
 
     return cleanFiles;
   }
 
-  /** Group files using bin packing, sorted by lower bound. */
+  /** Group files using bin packing, sorted by lower bound if columns specified. */
   @SuppressWarnings("unchecked")
   private List<List<FileScanTask>> groupFiles(List<FileScanTask> files) {
-    if (columnFieldIds.isEmpty() || files.isEmpty()) {
+    if (files.isEmpty()) {
       return ImmutableList.of();
     }
 
-    int fieldId = columnFieldIds.get(0);
-    Type type = columnTypes.get(0);
+    List<FileScanTask> filesToPack;
+    if (columnFieldIds.isEmpty()) {
+      // Unsorted fallback: use files as-is
+      filesToPack = files;
+    } else {
+      int fieldId = columnFieldIds.get(0);
+      Type type = columnTypes.get(0);
 
-    // Sort by lower bound
-    List<FileScanTask> sorted = new ArrayList<>(files);
-    sorted.sort(
-        Comparator.comparing(
-            task -> {
-              ByteBuffer buf = task.file().lowerBounds().get(fieldId);
-              return (Comparable<Object>) Conversions.fromByteBuffer(type, buf);
-            }));
+      // Sort by lower bound
+      filesToPack = new ArrayList<>(files);
+      filesToPack.sort(
+          Comparator.comparing(
+              task -> {
+                ByteBuffer buf = task.file().lowerBounds().get(fieldId);
+                return (Comparable<Object>) Conversions.fromByteBuffer(type, buf);
+              }));
+    }
 
     // Use bin packing to group files
     BinPacking.ListPacker<FileScanTask> packer =
         new BinPacking.ListPacker<>(maxGroupSize, 1, false, maxGroupInputFiles);
 
-    return packer.pack(sorted, FileScanTask::length);
+    return packer.pack(filesToPack, FileScanTask::length);
   }
 
   private boolean hasAllBounds(FileScanTask task) {

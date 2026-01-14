@@ -35,6 +35,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.util.SortOrderUtil;
 import org.apache.spark.sql.Dataset;
@@ -101,6 +102,12 @@ class SparkSmallFilesRewriteRunner extends SparkShufflingFileRewriteRunner {
 
     if (useIdentifierKeys) {
       Set<Integer> identifierFieldIds = schema.identifierFieldIds();
+      if (identifierFieldIds.isEmpty()) {
+        LOG.info("No identifier keys found, using unsorted fallback");
+        this.columns = ImmutableList.of();
+        this.sortOrder = SortOrder.unsorted();
+        return;
+      }
       List<Integer> sortedFieldIds =
           identifierFieldIds.stream().sorted().collect(Collectors.toList());
       this.columns =
