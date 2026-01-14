@@ -42,6 +42,7 @@ import org.apache.iceberg.actions.FileRewritePlan;
 import org.apache.iceberg.actions.FileRewritePlanner;
 import org.apache.iceberg.actions.FileRewriteRunner;
 import org.apache.iceberg.actions.OverlapRewriteFilePlanner;
+import org.apache.iceberg.actions.SmallFilesRewritePlanner;
 import org.apache.iceberg.actions.ImmutableRewriteDataFiles;
 import org.apache.iceberg.actions.ImmutableRewriteDataFiles.Result.Builder;
 import org.apache.iceberg.actions.RewriteDataFiles;
@@ -157,6 +158,13 @@ public class RewriteDataFilesSparkAction
     return this;
   }
 
+  @Override
+  public RewriteDataFilesSparkAction smallFiles() {
+    ensureRunnerNotSet();
+    this.runner = new SparkSmallFilesRewriteRunner(spark(), table);
+    return this;
+  }
+
   private void ensureRunnerNotSet() {
     Preconditions.checkArgument(
         runner == null,
@@ -223,6 +231,9 @@ public class RewriteDataFilesSparkAction
     if (runner instanceof SparkOverlapFileRewriteRunner) {
       this.planner =
           new OverlapRewriteFilePlanner(table, filter, startingSnapshotId, caseSensitive);
+    } else if (runner instanceof SparkSmallFilesRewriteRunner) {
+      this.planner =
+          new SmallFilesRewritePlanner(table, filter, startingSnapshotId, caseSensitive);
     } else if (runner instanceof SparkShufflingFileRewriteRunner) {
       this.planner =
           new SparkShufflingDataRewritePlanner(table, filter, startingSnapshotId, caseSensitive);

@@ -194,9 +194,17 @@ class RewriteDataFilesProcedure extends BaseProcedure {
             "Cannot specify sort_order with overlap strategy. Use 'columns' option instead.");
       }
       return action.overlap();
+    } else if (strategy.equalsIgnoreCase("small-files") || strategy.equalsIgnoreCase("small_files")) {
+      if (sortOrderString != null) {
+        throw new IllegalArgumentException(
+            "Cannot specify sort_order with small-files strategy. Use 'columns' option instead.");
+      }
+      return action.smallFiles();
     } else {
       throw new IllegalArgumentException(
-          "unsupported strategy: " + strategy + ". Only binpack, sort, or overlap is supported");
+          "unsupported strategy: "
+              + strategy
+              + ". Only binpack, sort, overlap, or small-files is supported");
     }
   }
 

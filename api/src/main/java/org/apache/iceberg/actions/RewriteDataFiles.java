@@ -226,6 +226,25 @@ public interface RewriteDataFiles
   }
 
   /**
+   * Choose SMALL_FILES as a strategy for this rewrite operation. This strategy merges small files
+   * only in "clean zones" where they don't overlap with large files. This prevents creating new
+   * overlaps that would degrade read performance.
+   *
+   * <p>The strategy scans ALL files (not just small ones) to find the maximum upper bound of large
+   * files, then only merges small files whose lower bound is greater than this maximum. Files that
+   * overlap with large files are skipped and can be handled by the OVERLAP strategy separately.
+   *
+   * <p>The columns to check bounds must be specified via options: either 'columns' (comma separated
+   * list) or 'use-identifier-keys' set to true.
+   *
+   * @return this for method chaining
+   */
+  default RewriteDataFiles smallFiles() {
+    throw new UnsupportedOperationException(
+        "SMALL_FILES Rewrite Strategy not implemented for this framework");
+  }
+
+  /**
    * A user provided filter for determining which files will be considered by the rewrite strategy.
    * This will be used in addition to whatever rules the rewrite strategy generates. For example
    * this would be used for providing a restriction to only run rewrite on a specific partition.
