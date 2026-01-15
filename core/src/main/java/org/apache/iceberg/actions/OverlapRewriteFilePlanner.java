@@ -217,9 +217,12 @@ public class OverlapRewriteFilePlanner
       StructLike partition = entry.getKey();
       List<FileScanTask> partitionFiles = entry.getValue();
 
-      // Filter files that have bounds for all columns
+      // Filter files that have bounds for all columns and are above min size
       List<FileScanTask> validFiles =
-          partitionFiles.stream().filter(this::hasAllBounds).collect(Collectors.toList());
+          partitionFiles.stream()
+              .filter(this::hasAllBounds)
+              .filter(task -> task.length() >= minFileSize())
+              .collect(Collectors.toList());
 
       LOG.info("OVERLAP: partition={} totalFiles={}", partition, partitionFiles.size());
 
