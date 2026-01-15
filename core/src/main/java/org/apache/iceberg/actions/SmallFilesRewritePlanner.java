@@ -191,7 +191,7 @@ public class SmallFilesRewritePlanner
     if (useIdentifierKeys) {
       Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
       if (identifierFieldIds.isEmpty()) {
-        LOG.info("SMALL_FILES: table has no identifier keys, using unsorted fallback");
+        LOG.info("SMALL_FILES [{}]: table has no identifier keys, using unsorted fallback", table().name());
         this.columnFieldIds = ImmutableList.of();
         this.columnTypes = ImmutableList.of();
         return;
@@ -223,7 +223,8 @@ public class SmallFilesRewritePlanner
       columnFieldIds.add(field.fieldId());
       columnTypes.add(field.type());
       LOG.info(
-          "SMALL_FILES init: column='{}' fieldId={} type={}",
+          "SMALL_FILES [{}]: init column='{}' fieldId={} type={}",
+          table().name(),
           column,
           field.fieldId(),
           field.type());
@@ -275,14 +276,16 @@ public class SmallFilesRewritePlanner
       SortOrder largeSortOrder = buildSortOrderFromFieldIds(columnFieldIds);
       this.largeSortOrderId = ensureSortOrderRegistered(largeSortOrder);
       LOG.info(
-          "SMALL_FILES delete-files-only: single Long/Integer PK detected, "
+          "SMALL_FILES [{}]: delete-files-only: single Long/Integer PK detected, "
               + "large files will be sorted (sortOrderId={})",
+          table().name(),
           largeSortOrderId);
     } else {
       // Composite PK or non-Long type - sorting won't help eq delete convert
       this.largeSortOrderId = null; // null means unsorted
       LOG.info(
-          "SMALL_FILES delete-files-only: composite or non-Long PK, large files will be unsorted");
+          "SMALL_FILES [{}]: delete-files-only: composite or non-Long PK, large files will be unsorted",
+          table().name());
     }
   }
 
@@ -327,7 +330,7 @@ public class SmallFilesRewritePlanner
     // Need to add the sort order
     if (table().sortOrder().isUnsorted()) {
       // No default sort order - use replaceSortOrder (becomes default)
-      LOG.info("Registering sort order as table default");
+      LOG.info("SMALL_FILES [{}]: registering sort order as table default", table().name());
       ReplaceSortOrder replace = table().replaceSortOrder();
       for (SortField field : newSortOrder.fields()) {
         String columnName = table().schema().findColumnName(field.sourceId());
@@ -340,7 +343,7 @@ public class SmallFilesRewritePlanner
       replace.commit();
     } else {
       // Has different default - use addSortOrder (don't change default)
-      LOG.info("Adding sort order without changing table default");
+      LOG.info("SMALL_FILES [{}]: adding sort order without changing table default", table().name());
       TableOperations ops = ((HasTableOperations) table()).operations();
       TableMetadata current = ops.current();
       TableMetadata updated = TableMetadata.buildFrom(current).addSortOrder(newSortOrder).build();
@@ -350,7 +353,7 @@ public class SmallFilesRewritePlanner
     // Refresh to pick up the new sort order
     table().refresh();
     SortOrder registered = SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder);
-    LOG.info("Sort order registered with orderId={}", registered.orderId());
+    LOG.info("SMALL_FILES [{}]: sort order registered with orderId={}", table().name(), registered.orderId());
     return registered.orderId();
   }
 
@@ -444,7 +447,7 @@ public class SmallFilesRewritePlanner
             .collect(
                 Collectors.groupingBy(g -> g.info().partition(), Collectors.summingInt(g -> 1)));
 
-    LOG.debug("SMALL_FILES: created {} groups for rewrite", totalGroupCount);
+    LOG.debug("SMALL_FILES [{}]: created {} groups for rewrite", table().name(), totalGroupCount);
 
     return new FileRewritePlan<>(
         CloseableIterable.of(selectedGroups), totalGroupCount, groupsInPartition);
@@ -474,7 +477,8 @@ public class SmallFilesRewritePlanner
     }
 
     LOG.info(
-        "SMALL_FILES delete-files-only: partition={} largeWithDeletes={} smallFiles={}",
+        "SMALL_FILES [{}]: delete-files-only: partition={} largeWithDeletes={} smallFiles={}",
+        table().name(),
         partition,
         largeFilesWithDeletes.size(),
         smallFiles.size());
@@ -525,7 +529,8 @@ public class SmallFilesRewritePlanner
         filesWithBounds.stream().filter(this::isSmallFile).collect(Collectors.toList());
 
     LOG.debug(
-        "SMALL_FILES: partition={} total={} large={} small={}",
+        "SMALL_FILES [{}]: partition={} total={} large={} small={}",
+        table().name(),
         partition,
         filesWithBounds.size(),
         largeFiles.size(),
@@ -594,8 +599,9 @@ public class SmallFilesRewritePlanner
 
       int overlapFilesCount = overlapResult.clusters.stream().mapToInt(List::size).sum();
       LOG.info(
-          "SMALL_FILES: partition={} | cleanZone: {} files -> {} groups | "
+          "SMALL_FILES [{}]: partition={} | cleanZone: {} files -> {} groups | "
               + "overlap: {} files ({} clusters) -> {} groups | loners: {} files -> {} groups",
+          table().name(),
           partition,
           cleanZoneFiles.size(),
           cleanZoneGroups.size(),
@@ -623,7 +629,8 @@ public class SmallFilesRewritePlanner
       boolean skipLoners = useUuidPrefixBucketing && hasUuidBounds(overlapResult.loners);
       if (skipLoners) {
         LOG.info(
-            "SMALL_FILES: skipping {} loner files due to UUID prefix bucketing",
+            "SMALL_FILES [{}]: skipping {} loner files due to UUID prefix bucketing",
+            table().name(),
             overlapResult.loners.size());
       } else {
         for (List<FileScanTask> group : lonerGroups) {
@@ -715,7 +722,7 @@ public class SmallFilesRewritePlanner
     }
     merged.add(current);
 
-    LOG.debug("SMALL_FILES: {} large files -> {} covered ranges", largeFiles.size(), merged.size());
+    LOG.debug("SMALL_FILES [{}]: {} large files -> {} covered ranges", table().name(), largeFiles.size(), merged.size());
 
     return merged;
   }

@@ -139,7 +139,7 @@ public class OverlapRewriteFilePlanner
     if (useIdentifierKeys) {
       Set<String> identifierFieldNames = table().schema().identifierFieldNames();
       if (identifierFieldNames.isEmpty()) {
-        LOG.info("OVERLAP: table has no identifier keys, skipping");
+        LOG.info("OVERLAP [{}]: table has no identifier keys, skipping", table().name());
         this.skipRewrite = true;
         this.columnFieldIds = ImmutableList.of();
         this.columnTypes = ImmutableList.of();
@@ -165,7 +165,7 @@ public class OverlapRewriteFilePlanner
       Preconditions.checkArgument(field != null, "Column '%s' not found in table schema", column);
       columnFieldIds.add(field.fieldId());
       columnTypes.add(field.type());
-      LOG.info("OVERLAP init: column='{}' fieldId={} type={}", column, field.fieldId(), field.type());
+      LOG.info("OVERLAP [{}]: init column='{}' fieldId={} type={}", table().name(), column, field.fieldId(), field.type());
     }
 
     // Parse group limits
@@ -224,7 +224,7 @@ public class OverlapRewriteFilePlanner
               .filter(task -> task.length() >= minFileSize())
               .collect(Collectors.toList());
 
-      LOG.info("OVERLAP: partition={} totalFiles={}", partition, partitionFiles.size());
+      LOG.info("OVERLAP [{}]: partition={} totalFiles={}", table().name(), partition, partitionFiles.size());
 
       if (validFiles.size() < 2) {
         continue; // Need at least 2 files to have overlap
@@ -270,10 +270,10 @@ public class OverlapRewriteFilePlanner
     // Find overlapping pairs efficiently using sweep line algorithm
     List<int[]> overlappingPairs = findOverlappingPairs(files);
 
-    LOG.info("OVERLAP: {} files, {} overlapping pairs", files.size(), overlappingPairs.size());
+    LOG.info("OVERLAP [{}]: {} files, {} overlapping pairs", table().name(), files.size(), overlappingPairs.size());
 
     if (overlappingPairs.isEmpty()) {
-      LOG.info("OVERLAP: no overlapping files, already optimized");
+      LOG.info("OVERLAP [{}]: no overlapping files, already optimized", table().name());
       return null;
     }
 
@@ -295,7 +295,7 @@ public class OverlapRewriteFilePlanner
     // Stage 2: No positive improvement found - skip fallback
     // Fallback was causing inefficient "wave" behavior on consecutive UUID files
     // where each iteration only merged 1-2 files at a time
-    LOG.info("OVERLAP: no positive improvement found, skipping rewrite");
+    LOG.info("OVERLAP [{}]: no positive improvement found, skipping rewrite", table().name());
     return null;
   }
 
@@ -329,7 +329,8 @@ public class OverlapRewriteFilePlanner
       }
 
       LOG.info(
-          "OVERLAP: batch {}-{} of {}, checked {}, bestImprovement={}",
+          "OVERLAP [{}]: batch {}-{} of {}, checked {}, bestImprovement={}",
+          table().name(),
           batchStart,
           batchEnd,
           totalPairs,
@@ -338,7 +339,8 @@ public class OverlapRewriteFilePlanner
 
       if (bestPair != null && bestImprovement >= MIN_IMPROVEMENT) {
         LOG.info(
-            "OVERLAP: best pair {} + {} records, improvement={}",
+            "OVERLAP [{}]: best pair {} + {} records, improvement={}",
+            table().name(),
             bestPair.get(0).file().recordCount(),
             bestPair.get(1).file().recordCount(),
             (long) bestImprovement);
@@ -348,7 +350,7 @@ public class OverlapRewriteFilePlanner
       batchStart = batchEnd;
     }
 
-    LOG.info("OVERLAP: no positive improvement found in any batch");
+    LOG.info("OVERLAP [{}]: no positive improvement found in any batch", table().name());
     return null;
   }
 
@@ -422,7 +424,8 @@ public class OverlapRewriteFilePlanner
     Object firstLower = firstLowerBuf != null ? Conversions.fromByteBuffer(type, firstLowerBuf) : null;
 
     LOG.info(
-        "OVERLAP: fallback group starting at lower={}, {} files, {} bytes",
+        "OVERLAP [{}]: fallback group starting at lower={}, {} files, {} bytes",
+        table().name(),
         firstLower,
         group.size(),
         groupSize);
@@ -475,7 +478,8 @@ public class OverlapRewriteFilePlanner
         bestImprovement = bestAdditionImprovement;
         improved = true;
         LOG.info(
-            "OVERLAP: added file, groupSize={} totalBytes={} improvement={}",
+            "OVERLAP [{}]: added file, groupSize={} totalBytes={} improvement={}",
+            table().name(),
             group.size(),
             group.stream().mapToLong(FileScanTask::length).sum(),
             (long) bestImprovement);

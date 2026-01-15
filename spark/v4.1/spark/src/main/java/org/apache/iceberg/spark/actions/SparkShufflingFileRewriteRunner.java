@@ -172,7 +172,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
     String totalSizeStr = table().currentSnapshot().summary().get("total-files-size");
     if (totalSizeStr == null) {
-      LOG.debug("Cannot compute UUID buckets: total-files-size not in snapshot summary");
+      LOG.debug("{} [{}]: Cannot compute UUID buckets: total-files-size not in snapshot summary", description(), table().name());
       return 0;
     }
 
@@ -180,7 +180,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     try {
       totalSize = Long.parseLong(totalSizeStr);
     } catch (NumberFormatException e) {
-      LOG.warn("Cannot parse total-files-size from snapshot summary: {}", totalSizeStr);
+      LOG.warn("{} [{}]: Cannot parse total-files-size from snapshot summary: {}", description(), table().name(), totalSizeStr);
       return 0;
     }
 
@@ -257,7 +257,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
     // Check if UUID prefix bucketing is enabled and applicable
     if (useUuidPrefixBucketing() && uuidBuckets > 0 && isFirstSortColumnUuid(groupSortOrder, group)) {
-      LOG.info("Using UUID prefix bucketing with {} buckets", uuidBuckets);
+      LOG.info("{} [{}]: Using UUID prefix bucketing with {} buckets", description(), table().name(), uuidBuckets);
       return df ->
           transformPlan(
               df, plan -> uuidPrefixSortPlan(groupSortOrder, plan, ordering, uuidBuckets, numShufflePartitions));
@@ -337,8 +337,8 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     Expression firstSortCol = findColumnExpression(plan, firstSortColumnName);
 
     if (firstSortCol == null) {
-      LOG.warn("Cannot use UUID prefix bucketing: column '{}' not found in plan output",
-          firstSortColumnName);
+      LOG.warn("{} [{}]: Cannot use UUID prefix bucketing: column '{}' not found in plan output",
+          description(), table().name(), firstSortColumnName);
       return sortPlan(plan, ordering, numShufflePartitions);
     }
 
@@ -521,12 +521,12 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     org.apache.iceberg.SortOrder existing =
         SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder);
     if (existing.isSorted()) {
-      LOG.info("Sort order already registered in table with orderId={}", existing.orderId());
+      LOG.info("{} [{}]: Sort order already registered in table with orderId={}", description(), table().name(), existing.orderId());
       return;
     }
 
     if (table().sortOrder().isUnsorted()) {
-      LOG.info("Registering sort order as table default");
+      LOG.info("{} [{}]: Registering sort order as table default", description(), table().name());
       ReplaceSortOrder replace = table().replaceSortOrder();
       for (SortField field : newSortOrder.fields()) {
         String columnName = table().schema().findColumnName(field.sourceId());
@@ -538,7 +538,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
       }
       replace.commit();
     } else {
-      LOG.info("Adding sort order without changing table default");
+      LOG.info("{} [{}]: Adding sort order without changing table default", description(), table().name());
       TableOperations ops = ((HasTableOperations) table()).operations();
       TableMetadata current = ops.current();
       TableMetadata updated =
@@ -548,7 +548,9 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
     table().refresh();
     LOG.info(
-        "Sort order registered with orderId={}",
+        "{} [{}]: Sort order registered with orderId={}",
+        description(),
+        table().name(),
         SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder).orderId());
   }
 
