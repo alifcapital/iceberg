@@ -59,6 +59,7 @@ import org.apache.spark.sql.types.MapType;
 import org.apache.spark.sql.types.ShortType;
 import org.apache.spark.sql.types.StringType;
 import org.apache.spark.sql.types.StructType;
+import org.apache.spark.sql.types.TimeType;
 import org.apache.spark.sql.types.TimestampType;
 import org.apache.spark.sql.types.VariantType;
 import org.apache.spark.unsafe.types.CalendarInterval;
@@ -294,6 +295,8 @@ class StructInternalRow extends InternalRow {
       return getShort(ordinal);
     } else if (dataType instanceof DateType) {
       return getInt(ordinal);
+    } else if (dataType instanceof TimeType) {
+      return getLong(ordinal);
     } else if (dataType instanceof TimestampType) {
       return getLong(ordinal);
     } else if (dataType instanceof VariantType) {
