@@ -458,27 +458,26 @@ public class SmallFilesRewritePlanner
       boolean unsortedFallback,
       List<RewriteFileGroup> selectedGroups) {
 
-    // Filter to files with delete files
-    List<FileScanTask> filesWithDeletes =
-        filesWithBounds.stream().filter(this::hasDeletes).collect(Collectors.toList());
+    // Large files: only those with delete files
+    List<FileScanTask> largeFilesWithDeletes =
+        filesWithBounds.stream()
+            .filter(t -> !isSmallFile(t))
+            .filter(this::hasDeletes)
+            .collect(Collectors.toList());
 
-    if (filesWithDeletes.isEmpty()) {
+    // Small files: ALL of them (they need merging regardless of delete files)
+    List<FileScanTask> smallFiles =
+        filesWithBounds.stream().filter(this::isSmallFile).collect(Collectors.toList());
+
+    if (largeFilesWithDeletes.isEmpty() && smallFiles.isEmpty()) {
       return;
     }
 
-    // Separate into large and small files
-    List<FileScanTask> largeFilesWithDeletes =
-        filesWithDeletes.stream().filter(t -> !isSmallFile(t)).collect(Collectors.toList());
-
-    List<FileScanTask> smallFilesWithDeletes =
-        filesWithDeletes.stream().filter(this::isSmallFile).collect(Collectors.toList());
-
     LOG.info(
-        "SMALL_FILES delete-files-only: partition={} filesWithDeletes={} (large={}, small={})",
+        "SMALL_FILES delete-files-only: partition={} largeWithDeletes={} smallFiles={}",
         partition,
-        filesWithDeletes.size(),
         largeFilesWithDeletes.size(),
-        smallFilesWithDeletes.size());
+        smallFiles.size());
 
     // Large files: each in its own group with largeSortOrderId
     for (FileScanTask largeFile : largeFilesWithDeletes) {
@@ -492,8 +491,8 @@ public class SmallFilesRewritePlanner
     }
 
     // Small files: use normal small files logic with smallSortOrderId
-    if (!smallFilesWithDeletes.isEmpty()) {
-      // Get large files WITHOUT deletes for covered ranges calculation
+    if (smallFiles.size() >= 2) {
+      // Get ALL large files for covered ranges calculation
       List<FileScanTask> largeFilesForRanges =
           filesWithBounds.stream()
               .filter(t -> !isSmallFile(t))
@@ -502,7 +501,7 @@ public class SmallFilesRewritePlanner
       planSmallFilesWithSortOrderId(
           ctx,
           partition,
-          smallFilesWithDeletes,
+          smallFiles,
           largeFilesForRanges,
           unsortedFallback,
           selectedGroups,
