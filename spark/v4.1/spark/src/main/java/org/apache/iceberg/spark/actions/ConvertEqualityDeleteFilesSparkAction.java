@@ -168,13 +168,13 @@ public class ConvertEqualityDeleteFilesSparkAction
   public static final int PARTIAL_PROGRESS_MAX_COMMIT_GROUP_NUM_DEFAULT = 64;
 
   /**
-   * Number of async jobs to run in parallel (pipeline depth).
+   * Maximum number of file groups to process concurrently.
    * Higher values may improve throughput but increase memory usage.
    * Default is 8.
    */
-  public static final String ASYNC_PIPELINE_DEPTH = "async-pipeline-depth";
+  public static final String MAX_CONCURRENT_FILE_GROUP_REWRITES = "max-concurrent-file-group-rewrites";
 
-  public static final int ASYNC_PIPELINE_DEPTH_DEFAULT = 8;
+  public static final int MAX_CONCURRENT_FILE_GROUP_REWRITES_DEFAULT = 8;
 
   /**
    * If enabled, the action will remove orphan equality delete files after conversion.
@@ -233,7 +233,7 @@ public class ConvertEqualityDeleteFilesSparkAction
   private boolean partialProgressEnabled = PARTIAL_PROGRESS_ENABLED_DEFAULT;
   private long minCommitSizeBytes = PARTIAL_PROGRESS_MIN_COMMIT_SIZE_BYTES_DEFAULT;
   private int maxCommitGroupNum = PARTIAL_PROGRESS_MAX_COMMIT_GROUP_NUM_DEFAULT;
-  private int asyncPipelineDepth = ASYNC_PIPELINE_DEPTH_DEFAULT;
+  private int maxConcurrentFileGroupRewrites = MAX_CONCURRENT_FILE_GROUP_REWRITES_DEFAULT;
   private boolean cleanupOrphansEnabled = CLEANUP_ORPHANS_ENABLED_DEFAULT;
   private String cacheMountPath = null;
   private String cacheS3Prefix = null;
@@ -271,9 +271,9 @@ public class ConvertEqualityDeleteFilesSparkAction
             options(),
             PARTIAL_PROGRESS_MAX_COMMIT_GROUP_NUM,
             PARTIAL_PROGRESS_MAX_COMMIT_GROUP_NUM_DEFAULT);
-    this.asyncPipelineDepth =
+    this.maxConcurrentFileGroupRewrites =
         PropertyUtil.propertyAsInt(
-            options(), ASYNC_PIPELINE_DEPTH, ASYNC_PIPELINE_DEPTH_DEFAULT);
+            options(), MAX_CONCURRENT_FILE_GROUP_REWRITES, MAX_CONCURRENT_FILE_GROUP_REWRITES_DEFAULT);
     this.cleanupOrphansEnabled =
         PropertyUtil.propertyAsBoolean(
             options(), CLEANUP_ORPHANS_ENABLED, CLEANUP_ORPHANS_ENABLED_DEFAULT);
@@ -396,7 +396,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         LOG_PREFIX,
         table.name(),
         tasksWithEqDeletes.size(),
-        asyncPipelineDepth);
+        maxConcurrentFileGroupRewrites);
 
     // Async pipeline: queue of pending jobs (FIFO order)
     java.util.LinkedList<PendingConversionJob> pendingJobs = new java.util.LinkedList<>();
@@ -407,8 +407,8 @@ public class ConvertEqualityDeleteFilesSparkAction
     int submitIndex = 0;
 
     while (groupIterator.hasNext() || !pendingJobs.isEmpty()) {
-      // Fill pipeline up to asyncPipelineDepth
-      while (pendingJobs.size() < asyncPipelineDepth && groupIterator.hasNext()) {
+      // Fill pipeline up to maxConcurrentFileGroupRewrites
+      while (pendingJobs.size() < maxConcurrentFileGroupRewrites && groupIterator.hasNext()) {
         Map.Entry<DeleteFileGroup, List<FileScanTask>> entry = groupIterator.next();
         submitIndex++;
         DeleteFileGroup eqDeleteGroup = entry.getKey();
@@ -678,7 +678,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         LOG_PREFIX,
         table.name(),
         sortedGroups.size(),
-        asyncPipelineDepth);
+        maxConcurrentFileGroupRewrites);
 
     // Track processed groups and results per group
     Set<DeleteFileGroup> processedGroups = Sets.newHashSet();
@@ -711,8 +711,8 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     // Helper to submit next job
     while (groupIterator.hasNext() || !pendingJobs.isEmpty()) {
-      // Fill pipeline up to asyncPipelineDepth
-      while (pendingJobs.size() < asyncPipelineDepth && groupIterator.hasNext()) {
+      // Fill pipeline up to maxConcurrentFileGroupRewrites
+      while (pendingJobs.size() < maxConcurrentFileGroupRewrites && groupIterator.hasNext()) {
         Map.Entry<DeleteFileGroup, List<FileScanTask>> entry = groupIterator.next();
         submitIndex++;
         DeleteFileGroup eqDeleteGroup = entry.getKey();
