@@ -434,75 +434,13 @@ public class ConvertEqualityDeleteFilesSparkAction
       }
 
       PendingConversionJob job = pendingJobs.removeFirst();
-      groupIndex = job.groupIndex;
-      DeleteFileGroup eqDeleteGroup = job.eqDeleteGroup;
+      JobProcessingResult result = processJobResult(job, tasksWithEqDeletes.size());
 
-      LOG.info(
-          "{} table={} group={}/{} waiting for result",
-          LOG_PREFIX,
-          table.name(),
-          groupIndex,
-          tasksWithEqDeletes.size());
-
-      // Get result (blocking)
-      List<DeleteFileInfo> deleteFileInfos;
-      try {
-        deleteFileInfos = job.future.get();
-      } catch (Exception e) {
-        job.cleanup();  // cleanup broadcasts even on failure
-        throw new RuntimeException("Failed to get conversion result for group " + groupIndex, e);
-      }
-
-      // Cleanup broadcast variables to free memory
-      job.cleanup();
-
-      long totalMs = System.currentTimeMillis() - job.submitTimeMs;
-
-      // Convert to DeleteFiles
-      PartitionSpec spec = eqDeleteGroup.spec();
-      Set<DeleteFile> posDeleteFiles = convertToDeleteFiles(deleteFileInfos, spec);
-      long eqDeleteRecordsCount = job.eqDeleteRecordsRead.value();
-      long posDeleteRecordsCount = job.posDeleteRecordsWritten.value();
-
-      LOG.info(
-          "{} table={} group={} total_ms={} eq_read_ms={} data_read_ms={} pos_write_ms={} "
-              + "data_files={} data_bytes_total={} data_bytes_read={} files_skipped={} "
-              + "data_records_scanned={} data_records_total={} "
-              + "eq_delete_records={} pos_delete_files={} pos_delete_records={}",
-          LOG_PREFIX,
-          table.name(),
-          groupIndex,
-          totalMs,
-          job.eqDeleteReadTimeMs.value(),
-          job.dataFileReadTimeMs.value(),
-          job.posDeleteWriteTimeMs.value(),
-          job.dataFileCount,
-          job.totalDataFileSize,
-          job.dataFileBytesRead.value(),
-          job.filesSkipped.value(),
-          job.dataRecordsScanned.value(),
-          job.dataRecordsTotal.value(),
-          eqDeleteRecordsCount,
-          deleteFileInfos.size(),
-          posDeleteRecordsCount);
-
-      // Log each created pos delete file
-      for (DeleteFileInfo info : deleteFileInfos) {
-        LOG.info(
-            "{} table={} group={} pos_delete_file={} size_bytes={} records={}",
-            LOG_PREFIX,
-            table.name(),
-            groupIndex,
-            info.path(),
-            info.fileSizeInBytes(),
-            info.recordCount());
-      }
-
-      convertedEqDeleteFiles.addAll(eqDeleteGroup.deleteFiles());
-      addedPosDeleteFiles.addAll(posDeleteFiles);
-      totalAddedRecords += posDeleteRecordsCount;
-      totalDataRecordsScanned += job.dataRecordsScanned.value();
-      totalDataRecordsTotal += job.dataRecordsTotal.value();
+      convertedEqDeleteFiles.addAll(job.eqDeleteGroup.deleteFiles());
+      addedPosDeleteFiles.addAll(result.posDeleteFiles);
+      totalAddedRecords += result.posDeleteRecordsCount;
+      totalDataRecordsScanned += result.dataRecordsScanned;
+      totalDataRecordsTotal += result.dataRecordsTotal;
     }
 
     // Calculate unique rewritten records from converted eq delete files
@@ -645,6 +583,106 @@ public class ConvertEqualityDeleteFilesSparkAction
     }
   }
 
+  /** Result of processing a single conversion job. */
+  private static class JobProcessingResult {
+    final Set<DeleteFile> posDeleteFiles;
+    final long eqDeleteRecordsCount;
+    final long posDeleteRecordsCount;
+    final long dataRecordsScanned;
+    final long dataRecordsTotal;
+    final long dataFilesSize;
+
+    JobProcessingResult(
+        Set<DeleteFile> posDeleteFiles,
+        long eqDeleteRecordsCount,
+        long posDeleteRecordsCount,
+        long dataRecordsScanned,
+        long dataRecordsTotal,
+        long dataFilesSize) {
+      this.posDeleteFiles = posDeleteFiles;
+      this.eqDeleteRecordsCount = eqDeleteRecordsCount;
+      this.posDeleteRecordsCount = posDeleteRecordsCount;
+      this.dataRecordsScanned = dataRecordsScanned;
+      this.dataRecordsTotal = dataRecordsTotal;
+      this.dataFilesSize = dataFilesSize;
+    }
+  }
+
+  /** Process a completed job: get result, cleanup, convert, and log metrics. */
+  private JobProcessingResult processJobResult(PendingConversionJob job, int totalGroups) {
+    int groupIndex = job.groupIndex;
+    DeleteFileGroup eqDeleteGroup = job.eqDeleteGroup;
+
+    LOG.info(
+        "{} table={} group={}/{} waiting for result",
+        LOG_PREFIX,
+        table.name(),
+        groupIndex,
+        totalGroups);
+
+    // Get result (blocking)
+    List<DeleteFileInfo> deleteFileInfos;
+    try {
+      deleteFileInfos = job.future.get();
+    } catch (Exception e) {
+      job.cleanup();  // cleanup broadcasts even on failure
+      throw new RuntimeException("Failed to get conversion result for group " + groupIndex, e);
+    }
+
+    // Cleanup broadcast variables to free memory
+    job.cleanup();
+
+    long totalMs = System.currentTimeMillis() - job.submitTimeMs;
+
+    // Convert to DeleteFiles
+    PartitionSpec spec = eqDeleteGroup.spec();
+    Set<DeleteFile> posDeleteFiles = convertToDeleteFiles(deleteFileInfos, spec);
+    long eqDeleteRecordsCount = job.eqDeleteRecordsRead.value();
+    long posDeleteRecordsCount = job.posDeleteRecordsWritten.value();
+
+    LOG.info(
+        "{} table={} group={} total_ms={} eq_read_ms={} data_read_ms={} pos_write_ms={} "
+            + "data_files={} data_bytes_total={} data_bytes_read={} files_skipped={} "
+            + "data_records_scanned={} data_records_total={} "
+            + "eq_delete_records={} pos_delete_files={} pos_delete_records={}",
+        LOG_PREFIX,
+        table.name(),
+        groupIndex,
+        totalMs,
+        job.eqDeleteReadTimeMs.value(),
+        job.dataFileReadTimeMs.value(),
+        job.posDeleteWriteTimeMs.value(),
+        job.dataFileCount,
+        job.totalDataFileSize,
+        job.dataFileBytesRead.value(),
+        job.filesSkipped.value(),
+        job.dataRecordsScanned.value(),
+        job.dataRecordsTotal.value(),
+        eqDeleteRecordsCount,
+        deleteFileInfos.size(),
+        posDeleteRecordsCount);
+
+    // Log each created pos delete file
+    for (DeleteFileInfo info : deleteFileInfos) {
+      LOG.info(
+          "{} table={} group={} pos_delete_file={} size_bytes={} records={}",
+          LOG_PREFIX,
+          table.name(),
+          groupIndex,
+          info.path(),
+          info.fileSizeInBytes(),
+          info.recordCount());
+    }
+
+    return new JobProcessingResult(
+        posDeleteFiles,
+        eqDeleteRecordsCount,
+        posDeleteRecordsCount,
+        job.dataRecordsScanned.value(),
+        job.dataRecordsTotal.value(),
+        job.dataFilesSize());
+  }
+
   private Result doExecuteWithPartialProgress(
       Map<DeleteFileGroup, List<FileScanTask>> tasksWithEqDeletes,
       long startingSnapshotId,
@@ -740,89 +778,29 @@ public class ConvertEqualityDeleteFilesSparkAction
       PendingConversionJob job = pendingJobs.removeFirst();
       groupIndex = job.groupIndex;
       DeleteFileGroup eqDeleteGroup = job.eqDeleteGroup;
-      List<FileScanTask> dataFileTasks = job.dataFileTasks;
 
-      LOG.info(
-          "{} table={} group={}/{} waiting for result",
-          LOG_PREFIX,
-          table.name(),
-          groupIndex,
-          sortedGroups.size());
-
-      // Get result (blocking)
-      List<DeleteFileInfo> deleteFileInfos;
-      try {
-        deleteFileInfos = job.future.get();
-      } catch (Exception e) {
-        job.cleanup();  // cleanup broadcasts even on failure
-        throw new RuntimeException("Failed to get conversion result for group " + groupIndex, e);
-      }
-
-      // Cleanup broadcast variables to free memory
-      job.cleanup();
-
-      long totalMs = System.currentTimeMillis() - job.submitTimeMs;
-
-      // Convert to ConversionResult
-      PartitionSpec spec = eqDeleteGroup.spec();
-      Set<DeleteFile> posDeleteFiles = convertToDeleteFiles(deleteFileInfos, spec);
-      long eqDeleteRecordsCount = job.eqDeleteRecordsRead.value();
-      long posDeleteRecordsCount = job.posDeleteRecordsWritten.value();
+      JobProcessingResult jobResult = processJobResult(job, sortedGroups.size());
 
       ConversionResult conversionResult =
-          new ConversionResult(posDeleteFiles, eqDeleteRecordsCount, posDeleteRecordsCount);
-
-      LOG.info(
-          "{} table={} group={} total_ms={} eq_read_ms={} data_read_ms={} pos_write_ms={} "
-              + "data_files={} data_bytes_total={} data_bytes_read={} files_skipped={} "
-              + "data_records_scanned={} data_records_total={} "
-              + "eq_delete_records={} pos_delete_files={} pos_delete_records={}",
-          LOG_PREFIX,
-          table.name(),
-          groupIndex,
-          totalMs,
-          job.eqDeleteReadTimeMs.value(),
-          job.dataFileReadTimeMs.value(),
-          job.posDeleteWriteTimeMs.value(),
-          job.dataFileCount,
-          job.totalDataFileSize,
-          job.dataFileBytesRead.value(),
-          job.filesSkipped.value(),
-          job.dataRecordsScanned.value(),
-          job.dataRecordsTotal.value(),
-          eqDeleteRecordsCount,
-          deleteFileInfos.size(),
-          posDeleteRecordsCount);
-
-      // Log each created pos delete file
-      for (DeleteFileInfo info : deleteFileInfos) {
-        LOG.info(
-            "{} table={} group={} pos_delete_file={} size_bytes={} records={}",
-            LOG_PREFIX,
-            table.name(),
-            groupIndex,
-            info.path(),
-            info.fileSizeInBytes(),
-            info.recordCount());
-      }
+          new ConversionResult(jobResult.posDeleteFiles, jobResult.eqDeleteRecordsCount, jobResult.posDeleteRecordsCount);
 
       processedGroups.add(eqDeleteGroup);
       groupResults.put(eqDeleteGroup, conversionResult);
-      uncommittedPosDeletes.addAll(conversionResult.posDeleteFiles);
+      uncommittedPosDeletes.addAll(jobResult.posDeleteFiles);
 
       // Track which pos deletes belong to which eq deletes
       for (DeleteFile eqDelete : eqDeleteGroup.deleteFiles()) {
         eqDeleteToPosDeletes
             .computeIfAbsent(eqDelete, k -> Sets.newHashSet())
-            .addAll(conversionResult.posDeleteFiles);
+            .addAll(jobResult.posDeleteFiles);
       }
 
-      totalAddedRecords += conversionResult.posDeleteRecordsCount;
-      totalDataRecordsScanned += job.dataRecordsScanned.value();
-      totalDataRecordsTotal += job.dataRecordsTotal.value();
+      totalAddedRecords += jobResult.posDeleteRecordsCount;
+      totalDataRecordsScanned += jobResult.dataRecordsScanned;
+      totalDataRecordsTotal += jobResult.dataRecordsTotal;
 
       // Track bytes read and groups processed since last commit
-      bytesReadSinceLastCommit += job.dataFilesSize();
+      bytesReadSinceLastCommit += jobResult.dataFilesSize;
       groupsSinceLastCommit++;
 
       // Check which eq deletes are now fully processed (all their groups are done)
@@ -956,7 +934,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       }
     }
 
-    if (!remainingEqDeletes.isEmpty() && !uncommittedPosDeletes.isEmpty()) {
+    if (!remainingEqDeletes.isEmpty()) {
       LOG.info(
           "{} table={} final_commit eq_delete_files={} pos_delete_files={} attempting",
           LOG_PREFIX,
@@ -1097,8 +1075,9 @@ public class ConvertEqualityDeleteFilesSparkAction
         .map(f -> f.path().toString())
         .collect(Collectors.toList());
 
-    EqualityDeleteKeyReader keyReader = new EqualityDeleteKeyReader(
-        deleteSchema, cacheMountPath, cacheS3Prefix);
+    // Read eq delete files using shared delete worker pool (iceberg.worker.delete-num-threads).
+    // Files are read directly from S3 (not from cache) since they are small and read only once.
+    EqualityDeleteKeyReader keyReader = new EqualityDeleteKeyReader(deleteSchema);
 
     int keyColumnCount = deleteSchema.columns().size();
     boolean isSingleColumn = keyColumnCount == 1;
