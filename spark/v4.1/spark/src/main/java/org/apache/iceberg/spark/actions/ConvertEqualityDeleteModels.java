@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.actions;
 
 import java.io.Serializable;
+import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
@@ -302,6 +303,106 @@ final class ConvertEqualityDeleteModels {
       this.posDeleteFiles = posDeleteFiles;
       this.eqDeleteRecordsCount = eqDeleteRecordsCount;
       this.posDeleteRecordsCount = posDeleteRecordsCount;
+    }
+  }
+
+  /**
+   * Container for equality delete keys read on driver and broadcast to executors.
+   *
+   * <p>Supports LONG, DECIMAL, STRING single-column keys and MULTI_COLUMN composite keys.
+   */
+  static class EqDeleteKeys implements Serializable {
+
+    enum KeyType {
+      LONG,
+      DECIMAL,
+      STRING,
+      MULTI_COLUMN
+    }
+
+    private final KeyType keyType;
+    private final Set<Long> longKeys;
+    private final Set<BigDecimal> decimalKeys;
+    private final Set<String> stringKeys;
+    private final Set<List<Object>> multiColumnKeys;
+    // Transient - not serialized, only used on driver for metrics
+    private transient long readTimeMs;
+
+    private EqDeleteKeys(
+        KeyType keyType,
+        Set<Long> longKeys,
+        Set<BigDecimal> decimalKeys,
+        Set<String> stringKeys,
+        Set<List<Object>> multiColumnKeys) {
+      this.keyType = keyType;
+      this.longKeys = longKeys;
+      this.decimalKeys = decimalKeys;
+      this.stringKeys = stringKeys;
+      this.multiColumnKeys = multiColumnKeys;
+      this.readTimeMs = 0;
+    }
+
+    static EqDeleteKeys ofLong(Set<Long> keys) {
+      return new EqDeleteKeys(KeyType.LONG, keys, null, null, null);
+    }
+
+    static EqDeleteKeys ofDecimal(Set<BigDecimal> keys) {
+      return new EqDeleteKeys(KeyType.DECIMAL, null, keys, null, null);
+    }
+
+    static EqDeleteKeys ofString(Set<String> keys) {
+      return new EqDeleteKeys(KeyType.STRING, null, null, keys, null);
+    }
+
+    static EqDeleteKeys ofMultiColumn(Set<List<Object>> keys) {
+      return new EqDeleteKeys(KeyType.MULTI_COLUMN, null, null, null, keys);
+    }
+
+    void setReadTimeMs(long readTimeMs) {
+      this.readTimeMs = readTimeMs;
+    }
+
+    long readTimeMs() {
+      return readTimeMs;
+    }
+
+    KeyType keyType() {
+      return keyType;
+    }
+
+    Set<Long> longKeys() {
+      return longKeys;
+    }
+
+    Set<BigDecimal> decimalKeys() {
+      return decimalKeys;
+    }
+
+    Set<String> stringKeys() {
+      return stringKeys;
+    }
+
+    Set<List<Object>> multiColumnKeys() {
+      return multiColumnKeys;
+    }
+
+    int size() {
+      switch (keyType) {
+        case LONG:
+          return longKeys.size();
+        case DECIMAL:
+          return decimalKeys.size();
+        case STRING:
+          return stringKeys.size();
+        case MULTI_COLUMN:
+          return multiColumnKeys.size();
+        default:
+          return 0;
+      }
+    }
+
+    boolean isEmpty() {
+      return size() == 0;
     }
   }
 }

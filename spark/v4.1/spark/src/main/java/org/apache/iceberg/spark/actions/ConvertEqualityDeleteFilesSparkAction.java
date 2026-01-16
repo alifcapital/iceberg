@@ -108,6 +108,7 @@ import static org.apache.iceberg.spark.actions.ConvertEqualityDeleteModels.Delet
 import static org.apache.iceberg.spark.actions.ConvertEqualityDeleteModels.PartitionWrapper;
 import static org.apache.iceberg.spark.actions.ConvertEqualityDeleteModels.DeleteFileGroup;
 import static org.apache.iceberg.spark.actions.ConvertEqualityDeleteModels.ConversionResult;
+import static org.apache.iceberg.spark.actions.ConvertEqualityDeleteModels.EqDeleteKeys;
 
 /**
  * Spark implementation of {@link ConvertEqualityDeleteFiles}.
@@ -206,6 +207,15 @@ public class ConvertEqualityDeleteFilesSparkAction
    */
   public static final String CACHE_S3_PREFIX = "cache.s3-prefix";
 
+  /**
+   * Maximum number of Spark tasks to create per equality delete group.
+   * Lower values reduce the number of times equality delete files are read (once per task),
+   * but may reduce parallelism. Default is no limit (uses defaultParallelism).
+   */
+  public static final String MAX_TASKS_PER_GROUP = "max-tasks-per-group";
+
+  public static final int MAX_TASKS_PER_GROUP_DEFAULT = Integer.MAX_VALUE;
+
   private static final Result EMPTY_RESULT =
       ImmutableConvertEqualityDeleteFiles.Result.builder()
           .convertedEqualityDeleteFilesCount(0)
@@ -227,6 +237,7 @@ public class ConvertEqualityDeleteFilesSparkAction
   private boolean cleanupOrphansEnabled = CLEANUP_ORPHANS_ENABLED_DEFAULT;
   private String cacheMountPath = null;
   private String cacheS3Prefix = null;
+  private int maxTasksPerGroup = MAX_TASKS_PER_GROUP_DEFAULT;
 
   ConvertEqualityDeleteFilesSparkAction(SparkSession spark, Table table) {
     super(((org.apache.spark.sql.classic.SparkSession) spark).cloneSession());
@@ -266,6 +277,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     this.cleanupOrphansEnabled =
         PropertyUtil.propertyAsBoolean(
             options(), CLEANUP_ORPHANS_ENABLED, CLEANUP_ORPHANS_ENABLED_DEFAULT);
+    this.maxTasksPerGroup =
+        PropertyUtil.propertyAsInt(
+            options(), MAX_TASKS_PER_GROUP, MAX_TASKS_PER_GROUP_DEFAULT);
 
     // Cache options for s3fs/FUSE mount
     this.cacheMountPath = options().get(CACHE_MOUNT_PATH);
@@ -576,7 +590,7 @@ public class ConvertEqualityDeleteFilesSparkAction
     final org.apache.spark.util.LongAccumulator dataRecordsTotal;
     // Broadcast variables to unpersist after job completes
     final Broadcast<Table> tableBroadcast;
-    final Broadcast<List<String>> eqDeletePathsBroadcast;
+    final Broadcast<EqDeleteKeys> eqDeleteKeysBroadcast;
 
     PendingConversionJob(
         int groupIndex,
@@ -595,7 +609,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         org.apache.spark.util.LongAccumulator dataRecordsScanned,
         org.apache.spark.util.LongAccumulator dataRecordsTotal,
         Broadcast<Table> tableBroadcast,
-        Broadcast<List<String>> eqDeletePathsBroadcast) {
+        Broadcast<EqDeleteKeys> eqDeleteKeysBroadcast) {
       this.groupIndex = groupIndex;
       this.eqDeleteGroup = eqDeleteGroup;
       this.dataFileTasks = dataFileTasks;
@@ -613,7 +627,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       this.dataRecordsScanned = dataRecordsScanned;
       this.dataRecordsTotal = dataRecordsTotal;
       this.tableBroadcast = tableBroadcast;
-      this.eqDeletePathsBroadcast = eqDeletePathsBroadcast;
+      this.eqDeleteKeysBroadcast = eqDeleteKeysBroadcast;
     }
 
     /** Cleanup broadcast variables to free memory. Call after job result is collected. */
@@ -621,8 +635,8 @@ public class ConvertEqualityDeleteFilesSparkAction
       if (tableBroadcast != null) {
         tableBroadcast.unpersist();
       }
-      if (eqDeletePathsBroadcast != null) {
-        eqDeletePathsBroadcast.unpersist();
+      if (eqDeleteKeysBroadcast != null) {
+        eqDeleteKeysBroadcast.unpersist();
       }
     }
 
@@ -1075,6 +1089,61 @@ public class ConvertEqualityDeleteFilesSparkAction
     return result;
   }
 
+  /** Read equality delete keys on driver and return container for broadcast. */
+  private EqDeleteKeys readEqDeleteKeysOnDriver(
+      List<DeleteFile> eqDeleteFiles, Schema deleteSchema) {
+
+    List<String> paths = eqDeleteFiles.stream()
+        .map(f -> f.path().toString())
+        .collect(Collectors.toList());
+
+    EqualityDeleteKeyReader keyReader = new EqualityDeleteKeyReader(
+        deleteSchema, cacheMountPath, cacheS3Prefix);
+
+    int keyColumnCount = deleteSchema.columns().size();
+    boolean isSingleColumn = keyColumnCount == 1;
+    Types.NestedField firstCol = deleteSchema.columns().get(0);
+    org.apache.iceberg.types.Type.TypeID typeId = firstCol.type().typeId();
+
+    boolean isSingleLongColumn = isSingleColumn
+        && (typeId == org.apache.iceberg.types.Type.TypeID.LONG
+            || typeId == org.apache.iceberg.types.Type.TypeID.INTEGER);
+    boolean isSingleDecimalColumn = isSingleColumn
+        && typeId == org.apache.iceberg.types.Type.TypeID.DECIMAL;
+    boolean isSingleStringColumn = isSingleColumn
+        && typeId == org.apache.iceberg.types.Type.TypeID.STRING;
+
+    long startTime = System.currentTimeMillis();
+    EqDeleteKeys result;
+
+    if (isSingleLongColumn) {
+      Set<Long> keys = keyReader.readLongKeys(table, paths);
+      result = EqDeleteKeys.ofLong(keys);
+    } else if (isSingleDecimalColumn) {
+      Set<BigDecimal> keys = keyReader.readDecimalKeys(table, paths);
+      result = EqDeleteKeys.ofDecimal(keys);
+    } else if (isSingleStringColumn) {
+      Set<String> keys = keyReader.readStringKeys(table, paths);
+      result = EqDeleteKeys.ofString(keys);
+    } else {
+      Set<List<Object>> keys = keyReader.readMultiColumnKeys(table, paths);
+      result = EqDeleteKeys.ofMultiColumn(keys);
+    }
+
+    long duration = System.currentTimeMillis() - startTime;
+    result.setReadTimeMs(duration);
+
+    LOG.info(
+        "{} table={} read_eq_delete_keys_on_driver files={} keys={} duration_ms={}",
+        LOG_PREFIX,
+        table.name(),
+        paths.size(),
+        result.size(),
+        duration);
+
+    return result;
+  }
+
   /** Submit conversion job asynchronously and return pending job handle. */
   private PendingConversionJob submitConversionJobAsync(
       DeleteFileGroup eqDeleteGroup,
@@ -1098,10 +1167,8 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     JavaSparkContext jsc = JavaSparkContext.fromSparkContext(spark().sparkContext());
 
-    // Prepare eq delete file paths (will be read on executors)
-    List<String> eqDeleteFilePaths = eqDeleteFiles.stream()
-        .map(f -> f.path().toString())
-        .collect(Collectors.toList());
+    // Read eq delete keys on driver (instead of reading on each executor)
+    EqDeleteKeys eqDeleteKeys = readEqDeleteKeysOnDriver(eqDeleteFiles, deleteSchema);
 
     // Build list of data files to process
     int partitionSize = spec.partitionType().fields().size();
@@ -1137,7 +1204,7 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     Table serializableTable = SerializableTableWithSize.copyOf(table);
     Broadcast<Table> tableBroadcast = jsc.broadcast(serializableTable);
-    Broadcast<List<String>> eqDeletePathsBroadcast = jsc.broadcast(eqDeleteFilePaths);
+    Broadcast<EqDeleteKeys> eqDeleteKeysBroadcast = jsc.broadcast(eqDeleteKeys);
 
     // Add _pos column to projection schema
     List<Types.NestedField> projectionFields = Lists.newArrayList(deleteSchema.columns());
@@ -1166,9 +1233,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     spark().sparkContext().register(dataRecordsScanned, "ConvertEqDeletes.dataRecordsScanned.g" + groupIndex);
     spark().sparkContext().register(dataRecordsTotal, "ConvertEqDeletes.dataRecordsTotal.g" + groupIndex);
 
-    // Initialize accumulators with 0 so they appear in Spark UI even if not updated
-    eqDeleteRecordsRead.add(0);
-    eqDeleteReadTimeMs.add(0);
+    // Initialize accumulators - eq delete metrics come from driver read
+    eqDeleteRecordsRead.add(eqDeleteKeys.size());
+    eqDeleteReadTimeMs.add(eqDeleteKeys.readTimeMs());
     dataFileReadTimeMs.add(0);
     posDeleteWriteTimeMs.add(0);
     dataFilesReceived.add(0);
@@ -1180,7 +1247,7 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     // Distribute data files evenly by size (greedy bin packing)
     int numPartitions = Math.max(1, Math.min(dataFileInfos.size(),
-        spark().sparkContext().defaultParallelism()));
+        Math.min(spark().sparkContext().defaultParallelism(), maxTasksPerGroup)));
 
     // Sort files by size descending for better bin packing
     List<DataFileInfo> sortedFiles = dataFileInfos.stream()
@@ -1215,7 +1282,7 @@ public class ConvertEqualityDeleteFilesSparkAction
     JavaRDD<DeleteFileInfo> deleteFileInfosRDD = filesRDD.mapPartitions(
         new ProcessPartitionFunction(
             tableBroadcast,
-            eqDeletePathsBroadcast,
+            eqDeleteKeysBroadcast,
             deleteSchema,
             projectionSchema,
             eqDeleteRecordsRead,
@@ -1234,8 +1301,8 @@ public class ConvertEqualityDeleteFilesSparkAction
             operationId));
 
     // Set job group and description, then submit async
-    String desc = String.format("ConvertEqDeletes: %s group=%d data_files=%d eq_deletes=%d",
-        table.name(), groupIndex, dataFileInfos.size(), eqDeleteFilePaths.size());
+    String desc = String.format("ConvertEqDeletes: %s group=%d data_files=%d eq_delete_keys=%d",
+        table.name(), groupIndex, dataFileInfos.size(), eqDeleteKeys.size());
 
     JavaFutureAction<List<DeleteFileInfo>> future = withJobGroupInfo(
         newJobGroupInfo("CONVERT-EQ-DELETES", desc),
@@ -1245,7 +1312,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         groupIndex, eqDeleteGroup, dataFileTasks, dataFileInfos.size(), totalDataFileSize, future,
         eqDeleteRecordsRead, eqDeleteReadTimeMs, dataFileReadTimeMs, posDeleteWriteTimeMs,
         posDeleteRecordsWritten, filesSkipped, dataFileBytesRead,
-        dataRecordsScanned, dataRecordsTotal, tableBroadcast, eqDeletePathsBroadcast);
+        dataRecordsScanned, dataRecordsTotal, tableBroadcast, eqDeleteKeysBroadcast);
   }
 
   /** Convert serializable DeleteFileInfo from executors to DeleteFile for commit. */
@@ -1443,7 +1510,7 @@ public class ConvertEqualityDeleteFilesSparkAction
     private static final Logger LOG = LoggerFactory.getLogger(ProcessPartitionFunction.class);
 
     private final Broadcast<Table> tableBroadcast;
-    private final Broadcast<List<String>> eqDeletePathsBroadcast;
+    private final Broadcast<EqDeleteKeys> eqDeleteKeysBroadcast;
     private final Schema deleteSchema;
     private final Schema projectionSchema;
     private final org.apache.spark.util.LongAccumulator eqDeleteRecordsRead;
@@ -1463,7 +1530,7 @@ public class ConvertEqualityDeleteFilesSparkAction
 
     ProcessPartitionFunction(
         Broadcast<Table> tableBroadcast,
-        Broadcast<List<String>> eqDeletePathsBroadcast,
+        Broadcast<EqDeleteKeys> eqDeleteKeysBroadcast,
         Schema deleteSchema,
         Schema projectionSchema,
         org.apache.spark.util.LongAccumulator eqDeleteRecordsRead,
@@ -1481,7 +1548,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         int groupIndex,
         String operationId) {
       this.tableBroadcast = tableBroadcast;
-      this.eqDeletePathsBroadcast = eqDeletePathsBroadcast;
+      this.eqDeleteKeysBroadcast = eqDeleteKeysBroadcast;
       this.deleteSchema = deleteSchema;
       this.projectionSchema = projectionSchema;
       this.eqDeleteRecordsRead = eqDeleteRecordsRead;
@@ -1507,68 +1574,53 @@ public class ConvertEqualityDeleteFilesSparkAction
       }
 
       Table table = tableBroadcast.value();
-      List<String> eqDeletePaths = eqDeletePathsBroadcast.value();
+      EqDeleteKeys eqDeleteKeys = eqDeleteKeysBroadcast.value();
 
-      // Determine key type for optimized reading (no intermediate allocations)
-      int keyColumnCount = deleteSchema.columns().size();
-      boolean isSingleColumn = keyColumnCount == 1;
-      Types.NestedField firstCol = deleteSchema.columns().get(0);
-      org.apache.iceberg.types.Type.TypeID typeId = firstCol.type().typeId();
-      boolean isSingleLongColumn = isSingleColumn
-          && (typeId == org.apache.iceberg.types.Type.TypeID.LONG
-              || typeId == org.apache.iceberg.types.Type.TypeID.INTEGER);
-      boolean isSingleStringColumn = isSingleColumn
-          && typeId == org.apache.iceberg.types.Type.TypeID.STRING;
-      boolean isSingleDecimalColumn = isSingleColumn
-          && typeId == org.apache.iceberg.types.Type.TypeID.DECIMAL;
+      // Get keys from broadcast (already read on driver)
+      if (eqDeleteKeys.isEmpty()) {
+        return java.util.Collections.emptyIterator();
+      }
 
-      // Step 1: Read equality delete keys directly into optimized data structure
-      long eqReadStart = System.currentTimeMillis();
       Set<Long> longKeys = null;
       Set<String> stringKeys = null;
       Set<BigDecimal> decimalKeys = null;
       Set<List<Object>> deleteKeys = null;
 
-      EqualityDeleteKeyReader keyReader = new EqualityDeleteKeyReader(
-          deleteSchema, cacheMountPath, cacheS3Prefix);
+      boolean isSingleLongColumn = false;
+      boolean isSingleStringColumn = false;
+      boolean isSingleDecimalColumn = false;
 
-      if (isSingleLongColumn) {
-        longKeys = keyReader.readLongKeys(table, eqDeletePaths);
-        eqDeleteRecordsRead.add(longKeys.size());
-        if (longKeys.isEmpty()) {
-          eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
-          return java.util.Collections.emptyIterator();
-        }
-      } else if (isSingleStringColumn) {
-        stringKeys = keyReader.readStringKeys(table, eqDeletePaths);
-        eqDeleteRecordsRead.add(stringKeys.size());
-        if (stringKeys.isEmpty()) {
-          eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
-          return java.util.Collections.emptyIterator();
-        }
-      } else if (isSingleDecimalColumn) {
-        decimalKeys = keyReader.readDecimalKeys(table, eqDeletePaths);
-        eqDeleteRecordsRead.add(decimalKeys.size());
-        if (decimalKeys.isEmpty()) {
-          eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
-          return java.util.Collections.emptyIterator();
-        }
-      } else {
-        deleteKeys = keyReader.readMultiColumnKeys(table, eqDeletePaths);
-        eqDeleteRecordsRead.add(deleteKeys.size());
-        if (deleteKeys.isEmpty()) {
-          eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
-          return java.util.Collections.emptyIterator();
-        }
+      switch (eqDeleteKeys.keyType()) {
+        case LONG:
+          longKeys = eqDeleteKeys.longKeys();
+          isSingleLongColumn = true;
+          break;
+        case DECIMAL:
+          decimalKeys = eqDeleteKeys.decimalKeys();
+          isSingleDecimalColumn = true;
+          break;
+        case STRING:
+          stringKeys = eqDeleteKeys.stringKeys();
+          isSingleStringColumn = true;
+          break;
+        case MULTI_COLUMN:
+          deleteKeys = eqDeleteKeys.multiColumnKeys();
+          break;
       }
-      eqDeleteReadTimeMs.add(System.currentTimeMillis() - eqReadStart);
+
+      // Note: eqDeleteRecordsRead is updated on driver after reading keys
+
+      // Determine if single column for merge join optimization
+      int keyColumnCount = deleteSchema.columns().size();
+      boolean isSingleColumn = isSingleLongColumn || isSingleStringColumn || isSingleDecimalColumn;
 
       // Create sorted lists for merge join (only for single column, excluding nulls)
       // Nulls are handled separately via hash join fallback
+      Types.NestedField firstCol = deleteSchema.columns().get(0);
+      int eqDeleteFieldId = firstCol.fieldId();
       List<Long> sortedLongKeys = null;
       List<String> sortedStringKeys = null;
       List<BigDecimal> sortedDecimalKeys = null;
-      int eqDeleteFieldId = firstCol.fieldId();
 
       if (isSingleLongColumn && longKeys != null) {
         sortedLongKeys = longKeys.stream()
