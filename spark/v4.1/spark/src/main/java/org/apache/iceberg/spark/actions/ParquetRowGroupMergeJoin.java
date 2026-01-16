@@ -19,8 +19,11 @@
 package org.apache.iceberg.spark.actions;
 
 import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Function;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.data.Record;
@@ -40,7 +43,10 @@ import org.apache.parquet.hadoop.BloomFilterReader;
 import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
+import org.apache.parquet.io.api.Binary;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.PrimitiveType;
 
 /**
  * Row-group level merge join for Parquet files.
@@ -69,16 +75,7 @@ class ParquetRowGroupMergeJoin {
   }
 
   /**
-   * Perform merge join with row group level control.
-   *
-   * @param inputFile the Parquet input file
-   * @param projectionSchema schema for projection (with ROW_POSITION)
-   * @param sortedDeleteKeys sorted list of delete keys
-   * @param eqDeleteFieldId field ID of the equality delete column
-   * @param eqColumnName name of the equality delete column
-   * @param dataFilePath path of the data file (for position delete output)
-   * @param filter optional expression filter for bloom/dictionary pruning (can be null)
-   * @return merge join result with matches and statistics
+   * Perform merge join with row group level control for Long keys.
    */
   @SuppressWarnings("unchecked")
   static Result execute(
@@ -91,6 +88,102 @@ class ParquetRowGroupMergeJoin {
       Expression filter)
       throws IOException {
 
+    return executeGeneric(
+        inputFile,
+        projectionSchema,
+        sortedDeleteKeys,
+        eqColumnName,
+        dataFilePath,
+        filter,
+        val -> val instanceof Integer ? ((Integer) val).longValue() : (Long) val,
+        (stats, pt) -> {
+          Object minObj = stats.genericGetMin();
+          Object maxObj = stats.genericGetMax();
+          if (minObj instanceof Number && maxObj instanceof Number) {
+            return new Long[] {((Number) minObj).longValue(), ((Number) maxObj).longValue()};
+          }
+          return null;
+        });
+  }
+
+  /**
+   * Perform merge join with row group level control for BigDecimal keys.
+   */
+  @SuppressWarnings("unchecked")
+  static Result executeDecimal(
+      InputFile inputFile,
+      Schema projectionSchema,
+      List<BigDecimal> sortedDeleteKeys,
+      int eqDeleteFieldId,
+      String eqColumnName,
+      String dataFilePath,
+      Expression filter)
+      throws IOException {
+
+    return executeGeneric(
+        inputFile,
+        projectionSchema,
+        sortedDeleteKeys,
+        eqColumnName,
+        dataFilePath,
+        filter,
+        val -> (BigDecimal) val,
+        (stats, pt) -> {
+          BigDecimal min = convertDecimalStatistic(stats.genericGetMin(), pt);
+          BigDecimal max = convertDecimalStatistic(stats.genericGetMax(), pt);
+          if (min != null && max != null) {
+            return new BigDecimal[] {min, max};
+          }
+          return null;
+        });
+  }
+
+  /** Convert Parquet statistic value to BigDecimal. */
+  private static BigDecimal convertDecimalStatistic(Object value, PrimitiveType primitiveType) {
+    if (value == null || primitiveType == null) {
+      return null;
+    }
+
+    LogicalTypeAnnotation logicalType = primitiveType.getLogicalTypeAnnotation();
+    if (!(logicalType instanceof LogicalTypeAnnotation.DecimalLogicalTypeAnnotation)) {
+      return null;
+    }
+
+    int scale = ((LogicalTypeAnnotation.DecimalLogicalTypeAnnotation) logicalType).getScale();
+
+    switch (primitiveType.getPrimitiveTypeName()) {
+      case INT32:
+      case INT64:
+        return BigDecimal.valueOf(((Number) value).longValue(), scale);
+      case FIXED_LEN_BYTE_ARRAY:
+      case BINARY:
+        return new BigDecimal(new BigInteger(((Binary) value).getBytes()), scale);
+      default:
+        return null;
+    }
+  }
+
+  /** Functional interface for extracting row group bounds from statistics. */
+  @FunctionalInterface
+  private interface StatsExtractor<T> {
+    T[] extract(org.apache.parquet.column.statistics.Statistics<?> stats, PrimitiveType primitiveType);
+  }
+
+  /**
+   * Generic merge join implementation for any Comparable type.
+   */
+  @SuppressWarnings("unchecked")
+  private static <T extends Comparable<T>> Result executeGeneric(
+      InputFile inputFile,
+      Schema projectionSchema,
+      List<T> sortedDeleteKeys,
+      String eqColumnName,
+      String dataFilePath,
+      Expression filter,
+      Function<Object, T> keyExtractor,
+      StatsExtractor<T> statsExtractor)
+      throws IOException {
+
     List<PositionDelete<Record>> matches = Lists.newArrayList();
     long recordsScanned = 0;
 
@@ -98,8 +191,8 @@ class ParquetRowGroupMergeJoin {
       return new Result(matches, 0);
     }
 
-    long minDeleteKey = sortedDeleteKeys.get(0);
-    long maxDeleteKey = sortedDeleteKeys.get(sortedDeleteKeys.size() - 1);
+    T minDeleteKey = sortedDeleteKeys.get(0);
+    T maxDeleteKey = sortedDeleteKeys.get(sortedDeleteKeys.size() - 1);
 
     // Build schema without ROW_POSITION since we track position manually
     List<Types.NestedField> readFields = Lists.newArrayList();
@@ -179,9 +272,11 @@ class ParquetRowGroupMergeJoin {
 
         // Get row group bounds for eq delete column
         ColumnChunkMetaData colMeta = null;
+        PrimitiveType primitiveType = null;
         for (ColumnChunkMetaData col : rowGroup.getColumns()) {
           if (col.getPath().toDotString().equals(eqColumnName)) {
             colMeta = col;
+            primitiveType = fileSchema.getColumnDescription(col.getPath().toArray()).getPrimitiveType();
             break;
           }
         }
@@ -193,9 +288,9 @@ class ParquetRowGroupMergeJoin {
 
         if (!hasValidStats) {
           // No stats, must read this row group
-          ProcessRowGroupResult result =
+          ProcessRowGroupResult<T> result =
               processRowGroupNoStats(
-                  reader, model, rgRowCount, sortedDeleteKeys, deletePtr, rowPosition, dataFilePath);
+                  reader, model, rgRowCount, sortedDeleteKeys, deletePtr, rowPosition, dataFilePath, keyExtractor);
           recordsScanned += result.recordsScanned;
           matches.addAll(result.matches);
           deletePtr = result.deletePtr;
@@ -204,17 +299,13 @@ class ParquetRowGroupMergeJoin {
           continue;
         }
 
-        // Get row group bounds
-        Object minObj = stats.genericGetMin();
-        Object maxObj = stats.genericGetMax();
-        if (minObj == null
-            || maxObj == null
-            || !(minObj instanceof Number)
-            || !(maxObj instanceof Number)) {
-          // Statistics type doesn't match expected numeric type
-          ProcessRowGroupResult result =
+        // Get row group bounds using type-specific extractor
+        T[] bounds = statsExtractor.extract(stats, primitiveType);
+        if (bounds == null) {
+          // Statistics type doesn't match expected type
+          ProcessRowGroupResult<T> result =
               processRowGroupNoStats(
-                  reader, model, rgRowCount, sortedDeleteKeys, deletePtr, rowPosition, dataFilePath);
+                  reader, model, rgRowCount, sortedDeleteKeys, deletePtr, rowPosition, dataFilePath, keyExtractor);
           recordsScanned += result.recordsScanned;
           matches.addAll(result.matches);
           deletePtr = result.deletePtr;
@@ -222,32 +313,32 @@ class ParquetRowGroupMergeJoin {
           if (result.earlyTermination) break;
           continue;
         }
-        long rgMin = ((Number) minObj).longValue();
-        long rgMax = ((Number) maxObj).longValue();
+        T rgMin = bounds[0];
+        T rgMax = bounds[1];
 
         // Skip row group if all delete keys < row group min (and we're done)
-        if (maxDeleteKey < rgMin) {
+        if (maxDeleteKey.compareTo(rgMin) < 0) {
           reader.skipNextRowGroup();
           rowPosition += rgRowCount;
           break;
         }
 
         // Skip row group if all delete keys > row group max
-        if (minDeleteKey > rgMax) {
+        if (minDeleteKey.compareTo(rgMax) > 0) {
           reader.skipNextRowGroup();
           rowPosition += rgRowCount;
           continue;
         }
 
         // Check if current delete pointer is already past this row group
-        if (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) > rgMax) {
+        if (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr).compareTo(rgMax) > 0) {
           reader.skipNextRowGroup();
           rowPosition += rgRowCount;
           continue;
         }
 
         // Binary search to find starting deletePtr for this row group
-        if (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < rgMin) {
+        if (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr).compareTo(rgMin) < 0) {
           int searchResult = Collections.binarySearch(sortedDeleteKeys, rgMin);
           if (searchResult < 0) {
             deletePtr = -(searchResult + 1);
@@ -263,14 +354,14 @@ class ParquetRowGroupMergeJoin {
           break;
         }
 
-        if (sortedDeleteKeys.get(deletePtr) > rgMax) {
+        if (sortedDeleteKeys.get(deletePtr).compareTo(rgMax) > 0) {
           reader.skipNextRowGroup();
           rowPosition += rgRowCount;
           continue;
         }
 
         // Read row group
-        ProcessRowGroupResult result =
+        ProcessRowGroupResult<T> result =
             processRowGroupWithStats(
                 reader,
                 model,
@@ -280,7 +371,8 @@ class ParquetRowGroupMergeJoin {
                 rowPosition,
                 dataFilePath,
                 rgMax,
-                rgIdx == rowGroups.size() - 1);
+                rgIdx == rowGroups.size() - 1,
+                keyExtractor);
         recordsScanned += result.recordsScanned;
         matches.addAll(result.matches);
         deletePtr = result.deletePtr;
@@ -292,7 +384,7 @@ class ParquetRowGroupMergeJoin {
     return new Result(matches, recordsScanned);
   }
 
-  private static class ProcessRowGroupResult {
+  private static class ProcessRowGroupResult<T> {
     final List<PositionDelete<Record>> matches;
     final long recordsScanned;
     final int deletePtr;
@@ -313,14 +405,15 @@ class ParquetRowGroupMergeJoin {
     }
   }
 
-  private static ProcessRowGroupResult processRowGroupNoStats(
+  private static <T extends Comparable<T>> ProcessRowGroupResult<T> processRowGroupNoStats(
       ParquetFileReader reader,
       ParquetValueReader<Record> model,
       long rgRowCount,
-      List<Long> sortedDeleteKeys,
+      List<T> sortedDeleteKeys,
       int deletePtr,
       long rowPosition,
-      String dataFilePath)
+      String dataFilePath,
+      Function<Object, T> keyExtractor)
       throws IOException {
 
     List<PositionDelete<Record>> matches = Lists.newArrayList();
@@ -343,9 +436,9 @@ class ParquetRowGroupMergeJoin {
         continue;
       }
 
-      long dataKey = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+      T dataKey = keyExtractor.apply(val);
 
-      while (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < dataKey) {
+      while (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr).compareTo(dataKey) < 0) {
         deletePtr++;
       }
 
@@ -355,7 +448,7 @@ class ParquetRowGroupMergeJoin {
         break;
       }
 
-      if (sortedDeleteKeys.get(deletePtr).equals(dataKey)) {
+      if (sortedDeleteKeys.get(deletePtr).compareTo(dataKey) == 0) {
         PositionDelete<Record> posDelete = PositionDelete.create();
         posDelete.set(dataFilePath, rowPosition, null);
         matches.add(posDelete);
@@ -363,20 +456,21 @@ class ParquetRowGroupMergeJoin {
       rowPosition++;
     }
 
-    return new ProcessRowGroupResult(
+    return new ProcessRowGroupResult<>(
         matches, recordsScanned, deletePtr, rowPosition, earlyTermination);
   }
 
-  private static ProcessRowGroupResult processRowGroupWithStats(
+  private static <T extends Comparable<T>> ProcessRowGroupResult<T> processRowGroupWithStats(
       ParquetFileReader reader,
       ParquetValueReader<Record> model,
       long rgRowCount,
-      List<Long> sortedDeleteKeys,
+      List<T> sortedDeleteKeys,
       int deletePtr,
       long rowPosition,
       String dataFilePath,
-      long rgMax,
-      boolean isLastRowGroup)
+      T rgMax,
+      boolean isLastRowGroup,
+      Function<Object, T> keyExtractor)
       throws IOException {
 
     List<PositionDelete<Record>> matches = Lists.newArrayList();
@@ -399,10 +493,10 @@ class ParquetRowGroupMergeJoin {
         continue;
       }
 
-      long dataKey = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+      T dataKey = keyExtractor.apply(val);
 
       // Move delete pointer while deleteKey < dataKey
-      while (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr) < dataKey) {
+      while (deletePtr < sortedDeleteKeys.size() && sortedDeleteKeys.get(deletePtr).compareTo(dataKey) < 0) {
         deletePtr++;
       }
 
@@ -414,7 +508,7 @@ class ParquetRowGroupMergeJoin {
       }
 
       // Early termination if current delete key > row group max
-      if (sortedDeleteKeys.get(deletePtr) > rgMax) {
+      if (sortedDeleteKeys.get(deletePtr).compareTo(rgMax) > 0) {
         // Skip remaining rows in this row group
         rowPosition += (rgRowCount - i);
         // If this is the last row group, mark as file-level early termination
@@ -425,7 +519,7 @@ class ParquetRowGroupMergeJoin {
       }
 
       // Match: deleteKey == dataKey
-      if (sortedDeleteKeys.get(deletePtr).equals(dataKey)) {
+      if (sortedDeleteKeys.get(deletePtr).compareTo(dataKey) == 0) {
         PositionDelete<Record> posDelete = PositionDelete.create();
         posDelete.set(dataFilePath, rowPosition, null);
         matches.add(posDelete);
@@ -433,7 +527,7 @@ class ParquetRowGroupMergeJoin {
       rowPosition++;
     }
 
-    return new ProcessRowGroupResult(
+    return new ProcessRowGroupResult<>(
         matches, recordsScanned, deletePtr, rowPosition, earlyTermination);
   }
 }

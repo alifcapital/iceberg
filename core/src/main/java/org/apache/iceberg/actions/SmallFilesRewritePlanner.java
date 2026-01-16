@@ -270,21 +270,21 @@ public class SmallFilesRewritePlanner
     SortOrder smallFilesSortOrder = buildSortOrderFromFieldIds(columnFieldIds);
     this.smallSortOrderId = ensureSortOrderRegistered(smallFilesSortOrder);
 
-    // Sort order for large files: single Long/Integer PK or unsorted
-    if (isSingleLongIdentifierKey(identifierFieldIds)) {
-      // Single Long/Integer PK - sort helps ROW_GROUP_MERGE_JOIN in eq delete convert
+    // Sort order for large files: single Long/Integer/Decimal PK or unsorted
+    if (isSingleLongOrDecimalIdentifierKey(identifierFieldIds)) {
+      // Single Long/Integer/Decimal PK - sort helps ROW_GROUP_MERGE_JOIN in eq delete convert
       SortOrder largeSortOrder = buildSortOrderFromFieldIds(columnFieldIds);
       this.largeSortOrderId = ensureSortOrderRegistered(largeSortOrder);
       LOG.info(
-          "SMALL_FILES [{}]: delete-files-only: single Long/Integer PK detected, "
+          "SMALL_FILES [{}]: delete-files-only: single Long/Integer/Decimal PK detected, "
               + "large files will be sorted (sortOrderId={})",
           table().name(),
           largeSortOrderId);
     } else {
-      // Composite PK or non-Long type - sorting won't help eq delete convert
+      // Composite PK or non-numeric type - sorting won't help eq delete convert
       this.largeSortOrderId = null; // null means unsorted
       LOG.info(
-          "SMALL_FILES [{}]: delete-files-only: composite or non-Long PK, large files will be unsorted",
+          "SMALL_FILES [{}]: delete-files-only: composite or non-numeric PK, large files will be unsorted",
           table().name());
     }
   }
@@ -300,10 +300,10 @@ public class SmallFilesRewritePlanner
   }
 
   /**
-   * Checks if identifier key is a single Long/Integer column. Only single long columns benefit from
+   * Checks if identifier key is a single Long/Integer/Decimal column. These types benefit from
    * ROW_GROUP_MERGE_JOIN optimization in eq delete convert.
    */
-  private boolean isSingleLongIdentifierKey(Set<Integer> identifierFieldIds) {
+  private boolean isSingleLongOrDecimalIdentifierKey(Set<Integer> identifierFieldIds) {
     if (identifierFieldIds.size() != 1) {
       return false;
     }
@@ -313,7 +313,9 @@ public class SmallFilesRewritePlanner
       return false;
     }
     Type.TypeID typeId = field.type().typeId();
-    return typeId == Type.TypeID.LONG || typeId == Type.TypeID.INTEGER;
+    return typeId == Type.TypeID.LONG
+        || typeId == Type.TypeID.INTEGER
+        || typeId == Type.TypeID.DECIMAL;
   }
 
   /**

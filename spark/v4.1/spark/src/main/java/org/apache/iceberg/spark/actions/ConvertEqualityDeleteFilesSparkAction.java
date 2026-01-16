@@ -1666,19 +1666,37 @@ public class ConvertEqualityDeleteFilesSparkAction
         long recordsScannedInFile = 0;
         long dataReadStart = System.currentTimeMillis();
 
-        // Use row-group level merge join for Parquet files with Long column
+        // Use row-group level merge join for Parquet files with Long or Decimal column
         // This allows skipping row groups where delete keys don't overlap
-        boolean useRowGroupMergeJoin = isSorted
+        boolean useRowGroupMergeJoinLong = isSorted
             && isSingleLongColumn
             && sortedLongKeys != null
             && fileInfo.format() == FileFormat.PARQUET;
 
-        if (useRowGroupMergeJoin) {
+        boolean useRowGroupMergeJoinDecimal = isSorted
+            && isSingleDecimalColumn
+            && sortedDecimalKeys != null
+            && fileInfo.format() == FileFormat.PARQUET;
+
+        if (useRowGroupMergeJoinLong) {
           LOG.debug("Using ROW_GROUP_MERGE_JOIN path for file={}, sorted={}, longColumn={}, deleteKeysCount={}",
               fileInfo.path(), isSorted, isSingleLongColumn, filteredLongKeys.size());
           try {
             ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.execute(
                 inputFile, projectionSchema, filteredLongKeys,
+                eqDeleteFieldId, eqColumnName, fileInfo.path(), bloomFilter);
+            matches.addAll(result.matches);
+            recordsScannedInFile = result.recordsScanned;
+            anyRowsRead = result.recordsScanned > 0 || !result.matches.isEmpty();
+          } catch (IOException e) {
+            throw new RuntimeException("Failed to perform row-group merge join on " + fileInfo.path(), e);
+          }
+        } else if (useRowGroupMergeJoinDecimal) {
+          LOG.debug("Using ROW_GROUP_MERGE_JOIN path for file={}, sorted={}, decimalColumn={}, deleteKeysCount={}",
+              fileInfo.path(), isSorted, isSingleDecimalColumn, sortedDecimalKeys.size());
+          try {
+            ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.executeDecimal(
+                inputFile, projectionSchema, sortedDecimalKeys,
                 eqDeleteFieldId, eqColumnName, fileInfo.path(), bloomFilter);
             matches.addAll(result.matches);
             recordsScannedInFile = result.recordsScanned;
