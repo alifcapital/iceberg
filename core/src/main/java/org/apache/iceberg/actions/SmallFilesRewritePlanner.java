@@ -59,6 +59,7 @@ import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.BinPacking;
+import org.apache.iceberg.util.BoundsPacking;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.StructLikeMap;
 import org.slf4j.Logger;
@@ -838,16 +839,26 @@ public class SmallFilesRewritePlanner
           maxUpper = upper;
         }
       } else {
-        // No overlap - finalize current cluster
-        if (currentCluster.size() == 1) {
-          loners.add(currentCluster.get(0));
+        // No overlap - check if adjacent (small gap)
+        double distance = BoundsPacking.calculateDistance(maxUpper, lower);
+        if (BoundsPacking.isWithinGapThreshold(distance)) {
+          // Adjacent - add to current cluster
+          currentCluster.add(task);
+          if (upper.compareTo(maxUpper) > 0) {
+            maxUpper = upper;
+          }
         } else {
-          clusters.add(ImmutableList.copyOf(currentCluster));
+          // Gap too large - finalize current cluster
+          if (currentCluster.size() == 1) {
+            loners.add(currentCluster.get(0));
+          } else {
+            clusters.add(ImmutableList.copyOf(currentCluster));
+          }
+          // Start new cluster
+          currentCluster = new ArrayList<>();
+          currentCluster.add(task);
+          maxUpper = upper;
         }
-        // Start new cluster
-        currentCluster = new ArrayList<>();
-        currentCluster.add(task);
-        maxUpper = upper;
       }
     }
 

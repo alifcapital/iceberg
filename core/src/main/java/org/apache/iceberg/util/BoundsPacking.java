@@ -37,9 +37,19 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 public class BoundsPacking {
 
   /** Maximum gap between consecutive values to still be considered "adjacent" (no hole). */
-  private static final double GAP_THRESHOLD = 1000;
+  private static final double GAP_THRESHOLD = 10000;
 
   private BoundsPacking() {}
+
+  /**
+   * Checks if the distance is within the gap threshold.
+   *
+   * @param distance the distance between two values
+   * @return true if distance <= GAP_THRESHOLD (values are adjacent), false otherwise (gap exists)
+   */
+  public static boolean isWithinGapThreshold(double distance) {
+    return distance <= GAP_THRESHOLD;
+  }
 
   /**
    * Calculate the distance between two values.
