@@ -571,10 +571,10 @@ public class ConvertEqualityDeleteFilesSparkAction
     /** Cleanup broadcast variables to free memory. Call after job result is collected. */
     void cleanup() {
       if (tableBroadcast != null) {
-        tableBroadcast.unpersist();
+        tableBroadcast.destroy();
       }
       if (eqDeleteKeysBroadcast != null) {
-        eqDeleteKeysBroadcast.unpersist();
+        eqDeleteKeysBroadcast.destroy();
       }
     }
 
@@ -1172,7 +1172,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     if (dataFileInfos.isEmpty()) {
       // Return a completed future with empty result
       org.apache.spark.util.LongAccumulator zeroAcc = new org.apache.spark.util.LongAccumulator();
-      spark().sparkContext().register(zeroAcc, "ConvertEqDeletes.empty.g" + groupIndex);
       JavaFutureAction<List<DeleteFileInfo>> emptyFuture =
           jsc.parallelize(java.util.Collections.<DeleteFileInfo>emptyList(), 1).collectAsync();
       return new PendingConversionJob(
@@ -1190,7 +1189,7 @@ public class ConvertEqualityDeleteFilesSparkAction
     projectionFields.add(MetadataColumns.ROW_POSITION);
     Schema projectionSchema = new Schema(projectionFields);
 
-    // Accumulators - use group index in name to avoid conflicts
+    // Accumulators - not registered to avoid memory leak in long-running sessions
     org.apache.spark.util.LongAccumulator eqDeleteRecordsRead = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator eqDeleteReadTimeMs = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator dataFileReadTimeMs = new org.apache.spark.util.LongAccumulator();
@@ -1201,16 +1200,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     org.apache.spark.util.LongAccumulator dataFileBytesRead = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator dataRecordsScanned = new org.apache.spark.util.LongAccumulator();
     org.apache.spark.util.LongAccumulator dataRecordsTotal = new org.apache.spark.util.LongAccumulator();
-    spark().sparkContext().register(eqDeleteRecordsRead, "ConvertEqDeletes.eqDeleteRecordsRead.g" + groupIndex);
-    spark().sparkContext().register(eqDeleteReadTimeMs, "ConvertEqDeletes.eqDeleteReadTimeMs.g" + groupIndex);
-    spark().sparkContext().register(dataFileReadTimeMs, "ConvertEqDeletes.dataFileReadTimeMs.g" + groupIndex);
-    spark().sparkContext().register(posDeleteWriteTimeMs, "ConvertEqDeletes.posDeleteWriteTimeMs.g" + groupIndex);
-    spark().sparkContext().register(dataFilesReceived, "ConvertEqDeletes.dataFilesReceived.g" + groupIndex);
-    spark().sparkContext().register(posDeleteRecordsWritten, "ConvertEqDeletes.posDeleteRecordsWritten.g" + groupIndex);
-    spark().sparkContext().register(filesSkipped, "ConvertEqDeletes.filesSkipped.g" + groupIndex);
-    spark().sparkContext().register(dataFileBytesRead, "ConvertEqDeletes.dataFileBytesRead.g" + groupIndex);
-    spark().sparkContext().register(dataRecordsScanned, "ConvertEqDeletes.dataRecordsScanned.g" + groupIndex);
-    spark().sparkContext().register(dataRecordsTotal, "ConvertEqDeletes.dataRecordsTotal.g" + groupIndex);
 
     // Initialize accumulators - eq delete metrics come from driver read
     eqDeleteRecordsRead.add(eqDeleteKeys.size());
