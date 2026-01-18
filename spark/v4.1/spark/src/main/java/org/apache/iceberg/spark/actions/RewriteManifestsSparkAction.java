@@ -114,6 +114,7 @@ public class RewriteManifestsSparkAction
   private String outputLocation;
 
   private List<String> partitionFieldClustering = null;
+  private Broadcast<Table> tableBroadcast = null;
 
   RewriteManifestsSparkAction(SparkSession spark, Table table) {
     super(spark);
@@ -201,27 +202,34 @@ public class RewriteManifestsSparkAction
   }
 
   private RewriteManifests.Result doExecute() {
-    List<ManifestFile> rewrittenManifests = Lists.newArrayList();
-    List<ManifestFile> addedManifests = Lists.newArrayList();
+    try {
+      List<ManifestFile> rewrittenManifests = Lists.newArrayList();
+      List<ManifestFile> addedManifests = Lists.newArrayList();
 
-    RewriteManifests.Result dataResult = rewriteManifests(ManifestContent.DATA);
-    Iterables.addAll(rewrittenManifests, dataResult.rewrittenManifests());
-    Iterables.addAll(addedManifests, dataResult.addedManifests());
+      RewriteManifests.Result dataResult = rewriteManifests(ManifestContent.DATA);
+      Iterables.addAll(rewrittenManifests, dataResult.rewrittenManifests());
+      Iterables.addAll(addedManifests, dataResult.addedManifests());
 
-    RewriteManifests.Result deletesResult = rewriteManifests(ManifestContent.DELETES);
-    Iterables.addAll(rewrittenManifests, deletesResult.rewrittenManifests());
-    Iterables.addAll(addedManifests, deletesResult.addedManifests());
+      RewriteManifests.Result deletesResult = rewriteManifests(ManifestContent.DELETES);
+      Iterables.addAll(rewrittenManifests, deletesResult.rewrittenManifests());
+      Iterables.addAll(addedManifests, deletesResult.addedManifests());
 
-    if (rewrittenManifests.isEmpty()) {
-      return EMPTY_RESULT;
+      if (rewrittenManifests.isEmpty()) {
+        return EMPTY_RESULT;
+      }
+
+      replaceManifests(rewrittenManifests, addedManifests);
+
+      return ImmutableRewriteManifests.Result.builder()
+          .rewrittenManifests(rewrittenManifests)
+          .addedManifests(addedManifests)
+          .build();
+    } finally {
+      if (tableBroadcast != null) {
+        tableBroadcast.destroy();
+        tableBroadcast = null;
+      }
     }
-
-    replaceManifests(rewrittenManifests, addedManifests);
-
-    return ImmutableRewriteManifests.Result.builder()
-        .rewrittenManifests(rewrittenManifests)
-        .addedManifests(addedManifests)
-        .build();
   }
 
   private RewriteManifests.Result rewriteManifests(ManifestContent content) {
@@ -430,8 +438,11 @@ public class RewriteManifestsSparkAction
   }
 
   private ManifestWriterFactory manifestWriters() {
+    if (tableBroadcast == null) {
+      tableBroadcast = sparkContext().broadcast(SerializableTableWithSize.copyOf(table));
+    }
     return new ManifestWriterFactory(
-        sparkContext().broadcast(SerializableTableWithSize.copyOf(table)),
+        tableBroadcast,
         formatVersion,
         spec.specId(),
         outputLocation,
