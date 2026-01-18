@@ -308,6 +308,15 @@ public class OverlapRewriteFilePlanner
     int batchStart = 0;
 
     while (batchStart < totalPairs) {
+      if (Thread.interrupted()) {
+        LOG.info(
+            "OVERLAP [{}]: findBestPairIncremental interrupted at batch {}",
+            table().name(),
+            batchStart);
+        Thread.currentThread().interrupt();
+        return null;
+      }
+
       int batchEnd = Math.min(batchStart + PAIRS_BATCH_SIZE, totalPairs);
 
       double bestImprovement = 0;
@@ -445,6 +454,12 @@ public class OverlapRewriteFilePlanner
 
     boolean improved = true;
     while (improved && !remaining.isEmpty()) {
+      if (Thread.interrupted()) {
+        LOG.info("OVERLAP [{}]: expandGroup interrupted, returning current group", table().name());
+        Thread.currentThread().interrupt();
+        return group;
+      }
+
       if (group.size() >= maxGroupInputFiles) {
         break;
       }
@@ -533,6 +548,15 @@ public class OverlapRewriteFilePlanner
     List<int[]> overlappingPairs = new ArrayList<>();
 
     for (int i = 0; i < sortedIdx.length; i++) {
+      if (Thread.interrupted()) {
+        LOG.info(
+            "OVERLAP [{}]: findOverlappingPairs interrupted at file {}",
+            table().name(),
+            i);
+        Thread.currentThread().interrupt();
+        return ImmutableList.of();
+      }
+
       int idxI = sortedIdx[i];
       int fileI = fileIndices.get(idxI)[0];
       Comparable<Object> upperI = uppers.get(idxI);

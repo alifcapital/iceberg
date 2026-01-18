@@ -840,7 +840,7 @@ public class SmallFilesRewritePlanner
         }
       } else {
         // No overlap - check if adjacent (small gap)
-        double distance = BoundsPacking.calculateDistance(maxUpper, lower);
+        double distance = BoundsPacking.calculateDistance(/* lower= */ maxUpper, /* upper= */ lower);
         if (BoundsPacking.isWithinGapThreshold(distance)) {
           // Adjacent - add to current cluster
           currentCluster.add(task);

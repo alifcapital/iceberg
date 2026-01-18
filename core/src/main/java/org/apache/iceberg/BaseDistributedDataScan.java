@@ -29,7 +29,6 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.iceberg.expressions.Expression;
@@ -280,17 +279,17 @@ abstract class BaseDistributedDataScan
       CloseableIterable<? extends ScanTask> fileTasks = manifestGroup.planFiles();
 
       // Collect metrics in one pass
-      AtomicLong totalDataRecords = new AtomicLong(0);
-      AtomicLong dataRecordsWithNoDeletes = new AtomicLong(0);
-      AtomicLong dataRecordsWithEqDeletes = new AtomicLong(0);
-      AtomicLong dataRecordsWithPosDeletes = new AtomicLong(0);
-      AtomicLong dataRecordsWithBothDeletes = new AtomicLong(0);
+      long totalDataRecords = 0;
+      long dataRecordsWithNoDeletes = 0;
+      long dataRecordsWithEqDeletes = 0;
+      long dataRecordsWithPosDeletes = 0;
+      long dataRecordsWithBothDeletes = 0;
 
       // Use Sets to track unique delete files
       Set<String> processedEqDeleteFiles = Sets.newHashSet();
       Set<String> processedPosDeleteFiles = Sets.newHashSet();
-      AtomicLong totalEqDeleteRecords = new AtomicLong(0);
-      AtomicLong totalPosDeleteRecords = new AtomicLong(0);
+      long totalEqDeleteRecords = 0;
+      long totalPosDeleteRecords = 0;
 
       for (ScanTask task : fileTasks) {
           if (task instanceof BaseFileScanTask) {
@@ -307,30 +306,30 @@ abstract class BaseDistributedDataScan
                       eqDeleteFileCount++;
                       // Only count records from files we haven't seen before
                       if (processedEqDeleteFiles.add(deleteFile.path().toString())) {
-                          totalEqDeleteRecords.addAndGet(deleteFile.recordCount());
+                          totalEqDeleteRecords += deleteFile.recordCount();
                       }
                   } else if (deleteFile.content() == FileContent.POSITION_DELETES) {
                       posDeleteFileCount++;
                       // Only count records from files we haven't seen before
                       if (processedPosDeleteFiles.add(deleteFile.path().toString())) {
-                          totalPosDeleteRecords.addAndGet(deleteFile.recordCount());
+                          totalPosDeleteRecords += deleteFile.recordCount();
                       }
                   }
               }
 
               // Update totals
               long dataRecordCount = dataFile.recordCount();
-              totalDataRecords.addAndGet(dataRecordCount);
+              totalDataRecords += dataRecordCount;
 
               // Categorize records
               if (eqDeleteFileCount == 0 && posDeleteFileCount == 0) {
-                  dataRecordsWithNoDeletes.addAndGet(dataRecordCount);
+                  dataRecordsWithNoDeletes += dataRecordCount;
               } else if (eqDeleteFileCount > 0 && posDeleteFileCount == 0) {
-                  dataRecordsWithEqDeletes.addAndGet(dataRecordCount);
+                  dataRecordsWithEqDeletes += dataRecordCount;
               } else if (eqDeleteFileCount == 0 && posDeleteFileCount > 0) {
-                  dataRecordsWithPosDeletes.addAndGet(dataRecordCount);
+                  dataRecordsWithPosDeletes += dataRecordCount;
               } else {
-                  dataRecordsWithBothDeletes.addAndGet(dataRecordCount);
+                  dataRecordsWithBothDeletes += dataRecordCount;
               }
           }
       }
@@ -345,13 +344,13 @@ abstract class BaseDistributedDataScan
                "\nUnique Delete Files:" +
                "\n  Equality delete files: {}, total records: {}" +
                "\n  Position delete files: {}, total records: {}",
-               totalDataRecords.get(),
-               dataRecordsWithNoDeletes.get(),
-               dataRecordsWithEqDeletes.get(),
-               dataRecordsWithPosDeletes.get(),
-               dataRecordsWithBothDeletes.get(),
-               processedEqDeleteFiles.size(), totalEqDeleteRecords.get(),
-               processedPosDeleteFiles.size(), totalPosDeleteRecords.get());
+               totalDataRecords,
+               dataRecordsWithNoDeletes,
+               dataRecordsWithEqDeletes,
+               dataRecordsWithPosDeletes,
+               dataRecordsWithBothDeletes,
+               processedEqDeleteFiles.size(), totalEqDeleteRecords,
+               processedPosDeleteFiles.size(), totalPosDeleteRecords);
 
       return (CloseableIterable<ScanTask>) fileTasks;
   }

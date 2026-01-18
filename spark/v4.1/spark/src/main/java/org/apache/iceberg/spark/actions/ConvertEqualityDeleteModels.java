@@ -405,4 +405,77 @@ final class ConvertEqualityDeleteModels {
       return size() == 0;
     }
   }
+
+  /**
+   * Result from a single partition task containing delete files and metrics.
+   * Used to return metrics from executors without accumulators.
+   */
+  static class TaskResult implements Serializable {
+    private final List<DeleteFileInfo> deleteFiles;
+    private final long dataFileReadTimeMs;
+    private final long posDeleteWriteTimeMs;
+    private final long posDeleteRecordsWritten;
+    private final long filesProcessed;
+    private final long filesSkipped;
+    private final long dataFileBytesRead;
+    private final long dataRecordsScanned;
+    private final long dataRecordsTotal;
+
+    TaskResult(
+        List<DeleteFileInfo> deleteFiles,
+        long dataFileReadTimeMs,
+        long posDeleteWriteTimeMs,
+        long posDeleteRecordsWritten,
+        long filesProcessed,
+        long filesSkipped,
+        long dataFileBytesRead,
+        long dataRecordsScanned,
+        long dataRecordsTotal) {
+      this.deleteFiles = deleteFiles;
+      this.dataFileReadTimeMs = dataFileReadTimeMs;
+      this.posDeleteWriteTimeMs = posDeleteWriteTimeMs;
+      this.posDeleteRecordsWritten = posDeleteRecordsWritten;
+      this.filesProcessed = filesProcessed;
+      this.filesSkipped = filesSkipped;
+      this.dataFileBytesRead = dataFileBytesRead;
+      this.dataRecordsScanned = dataRecordsScanned;
+      this.dataRecordsTotal = dataRecordsTotal;
+    }
+
+    List<DeleteFileInfo> deleteFiles() {
+      return deleteFiles;
+    }
+
+    long dataFileReadTimeMs() {
+      return dataFileReadTimeMs;
+    }
+
+    long posDeleteWriteTimeMs() {
+      return posDeleteWriteTimeMs;
+    }
+
+    long posDeleteRecordsWritten() {
+      return posDeleteRecordsWritten;
+    }
+
+    long filesProcessed() {
+      return filesProcessed;
+    }
+
+    long filesSkipped() {
+      return filesSkipped;
+    }
+
+    long dataFileBytesRead() {
+      return dataFileBytesRead;
+    }
+
+    long dataRecordsScanned() {
+      return dataRecordsScanned;
+    }
+
+    long dataRecordsTotal() {
+      return dataRecordsTotal;
+    }
+  }
 }
