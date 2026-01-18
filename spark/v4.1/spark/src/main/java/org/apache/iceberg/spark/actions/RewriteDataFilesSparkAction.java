@@ -107,7 +107,7 @@ public class RewriteDataFilesSparkAction
   private FileRewriteRunner<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> runner = null;
 
   RewriteDataFilesSparkAction(SparkSession spark, Table table) {
-    super(((org.apache.spark.sql.classic.SparkSession) spark).cloneSession());
+    super(spark);
     // Disable Adaptive Query Execution as this may change the output partitioning of our write
     spark().conf().set(SQLConf.ADAPTIVE_EXECUTION_ENABLED().key(), false);
     // Disable executor cache for delete files as each partition is rewritten separately.

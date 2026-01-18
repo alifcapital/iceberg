@@ -66,8 +66,8 @@ class SparkRewritePositionDeleteRunner
       PositionDeletesRewriteCoordinator.get();
 
   SparkRewritePositionDeleteRunner(SparkSession spark, Table table) {
+    super(spark, table);
     // Disable Adaptive Query Execution as this may change the output partitioning of our write
-    super(((org.apache.spark.sql.classic.SparkSession) spark).cloneSession(), table);
     this.spark().conf().set(SQLConf.ADAPTIVE_EXECUTION_ENABLED().key(), false);
   }
 

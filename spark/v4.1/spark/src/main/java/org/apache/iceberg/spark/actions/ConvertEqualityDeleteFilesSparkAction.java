@@ -98,7 +98,6 @@ import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.internal.SQLConf;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -241,9 +240,7 @@ public class ConvertEqualityDeleteFilesSparkAction
   private int maxTasksPerGroup = MAX_TASKS_PER_GROUP_DEFAULT;
 
   ConvertEqualityDeleteFilesSparkAction(SparkSession spark, Table table) {
-    super(((org.apache.spark.sql.classic.SparkSession) spark).cloneSession());
-    // Disable AQE to ensure predictable join behavior for the hash join
-    spark().conf().set(SQLConf.ADAPTIVE_EXECUTION_ENABLED().key(), false);
+    super(spark);
     this.table = table;
   }
 
