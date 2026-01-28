@@ -617,6 +617,12 @@ public class OverlapRewriteFilePlanner
       }
     }
 
+    // Fast path for UUID bucketing: costAfter ≈ 0 because buckets won't overlap
+    // Skip expensive simulation with K buckets × N remaining files
+    if (useUuidPrefixBucketing && numBuckets > 0) {
+      return costBefore;
+    }
+
     // Simulate merge+sort+split
     SimulationResult simulation = simulateMergeSplit(group);
 
