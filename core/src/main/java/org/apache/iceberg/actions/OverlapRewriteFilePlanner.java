@@ -294,12 +294,16 @@ public class OverlapRewriteFilePlanner
       return null;
     }
 
-    // Sort pairs by sum of record counts (descending) - higher record count = higher potential improvement
+    // Sort pairs by (bucketSpan × records) descending
+    // Files spanning more buckets with more records have higher potential improvement
+    // Without UUID bucketing: bucketSpan=1, so this degrades to sorting by records
     overlappingPairs.sort(
         (p1, p2) -> {
-          long sum1 = files.get(p1[0]).file().recordCount() + files.get(p1[1]).file().recordCount();
-          long sum2 = files.get(p2[0]).file().recordCount() + files.get(p2[1]).file().recordCount();
-          return Long.compare(sum2, sum1); // descending
+          long score1 = (long) getBucketSpan(files.get(p1[0])) * files.get(p1[0]).file().recordCount()
+                      + (long) getBucketSpan(files.get(p1[1])) * files.get(p1[1]).file().recordCount();
+          long score2 = (long) getBucketSpan(files.get(p2[0])) * files.get(p2[0]).file().recordCount()
+                      + (long) getBucketSpan(files.get(p2[1])) * files.get(p2[1]).file().recordCount();
+          return Long.compare(score2, score1); // descending
         });
 
     // Stage 1: Try to find pair with positive improvement, checking in batches
@@ -596,56 +600,194 @@ public class OverlapRewriteFilePlanner
     return overlappingPairs;
   }
 
+  /**
+   * Calculate improvement from merging a group of files.
+   *
+   * <p>Unified logic for both UUID and non-UUID tables:
+   * 1. Determine which buckets the group spans (without UUID = 1 bucket)
+   * 2. For each bucket, calculate improvement among files intersecting that bucket
+   * 3. Sum improvements across all buckets
+   *
+   * <p>Within each bucket, we use honest string-level cardinality-based cost.
+   * After merge+sort+split, files within a bucket are sorted and non-overlapping.
+   */
   private double calculateMergeImprovement(List<FileScanTask> allFiles, List<FileScanTask> group) {
+    Set<FileScanTask> groupSet = ImmutableSet.copyOf(group);
     List<FileScanTask> remaining =
-        allFiles.stream().filter(f -> !group.contains(f)).collect(Collectors.toList());
+        allFiles.stream().filter(f -> !groupSet.contains(f)).collect(Collectors.toList());
 
-    // Calculate cost BEFORE merge: internal (within group) + external (group vs remaining)
-    double costBefore = 0;
+    // Cache bucket ranges to avoid repeated calculations
+    Map<FileScanTask, int[]> bucketRanges = new java.util.HashMap<>();
+    for (FileScanTask task : allFiles) {
+      bucketRanges.put(task, getBucketRange(task));
+    }
 
-    // Internal costs within group
-    for (int i = 0; i < group.size(); i++) {
-      for (int j = i + 1; j < group.size(); j++) {
-        costBefore += calculatePairCost(group.get(i), group.get(j));
+    // Determine bucket range for the group
+    int minBucket = Integer.MAX_VALUE;
+    int maxBucket = Integer.MIN_VALUE;
+    for (FileScanTask task : group) {
+      int[] range = bucketRanges.get(task);
+      minBucket = Math.min(minBucket, range[0]);
+      maxBucket = Math.max(maxBucket, range[1]);
+    }
+
+    if (minBucket > maxBucket) {
+      return 0;
+    }
+
+    // Calculate improvement for each bucket
+    double totalImprovement = 0;
+
+    for (int bucket = minBucket; bucket <= maxBucket; bucket++) {
+      if (Thread.interrupted()) {
+        Thread.currentThread().interrupt();
+        return 0;
       }
-    }
 
-    // External costs between group and remaining
-    for (FileScanTask groupFile : group) {
-      for (FileScanTask remainingFile : remaining) {
-        costBefore += calculatePairCost(groupFile, remainingFile);
+      // Find group files intersecting this bucket
+      List<FileScanTask> groupInBucket = new ArrayList<>();
+      for (FileScanTask task : group) {
+        int[] range = bucketRanges.get(task);
+        if (range[0] <= bucket && bucket <= range[1]) {
+          groupInBucket.add(task);
+        }
       }
-    }
 
-    // Fast path for UUID bucketing: costAfter ≈ 0 because buckets won't overlap
-    // Skip expensive simulation with K buckets × N remaining files
-    if (useUuidPrefixBucketing && numBuckets > 0) {
-      return costBefore;
-    }
+      // Find remaining files intersecting this bucket
+      List<FileScanTask> remainingInBucket = new ArrayList<>();
+      for (FileScanTask task : remaining) {
+        int[] range = bucketRanges.get(task);
+        if (range[0] <= bucket && bucket <= range[1]) {
+          remainingInBucket.add(task);
+        }
+      }
 
-    // Simulate merge+sort+split
-    SimulationResult simulation = simulateMergeSplit(group);
+      if (groupInBucket.size() < 2 && remainingInBucket.isEmpty()) {
+        continue; // Nothing to improve in this bucket
+      }
 
-    // Calculate cost AFTER merge
-    double costAfter = 0;
+      // Calculate costBefore: honest string-level cost within this bucket
+      double costBefore = 0;
 
-    // Internal cost between simulated files (they may overlap on secondary columns)
-    for (int i = 0; i < simulation.files.size(); i++) {
-      for (int j = i + 1; j < simulation.files.size(); j++) {
-        costAfter +=
-            calculateCostBetweenSimulated(
+      // Internal costs within group (in this bucket)
+      for (int i = 0; i < groupInBucket.size(); i++) {
+        for (int j = i + 1; j < groupInBucket.size(); j++) {
+          costBefore += calculatePairCost(groupInBucket.get(i), groupInBucket.get(j));
+        }
+      }
+
+      // External costs: group vs remaining (in this bucket)
+      for (FileScanTask groupFile : groupInBucket) {
+        for (FileScanTask remainingFile : remainingInBucket) {
+          costBefore += calculatePairCost(groupFile, remainingFile);
+        }
+      }
+
+      // Calculate costAfter: after merge+sort+split within bucket
+      // Files are sorted by primary column → no overlap on primary column
+      // Use simulation to estimate costAfter
+      double costAfter = 0;
+      if (!groupInBucket.isEmpty()) {
+        SimulationResult simulation = simulateMergeSplitForBucket(groupInBucket);
+
+        // Internal cost between simulated files
+        for (int i = 0; i < simulation.files.size(); i++) {
+          for (int j = i + 1; j < simulation.files.size(); j++) {
+            costAfter += calculateCostBetweenSimulated(
                 simulation.files.get(i), simulation.files.get(j), simulation.context);
+          }
+        }
+
+        // External cost: simulated files vs remaining in bucket
+        for (SimulatedFile simFile : simulation.files) {
+          for (FileScanTask remainingFile : remainingInBucket) {
+            costAfter += calculateCostWithSimulated(simFile, remainingFile, simulation.context);
+          }
+        }
+      }
+
+      totalImprovement += (costBefore - costAfter);
+    }
+
+    return totalImprovement;
+  }
+
+  /**
+   * Simulate merge+sort+split for files within a single bucket.
+   * Uses regular positional splitting (not UUID bucket boundaries).
+   */
+  @SuppressWarnings("unchecked")
+  private SimulationResult simulateMergeSplitForBucket(List<FileScanTask> bucketFiles) {
+    SimulationContext ctx = new SimulationContext(columnFieldIds.size());
+
+    long totalRecords = 0;
+    long totalBytes = 0;
+
+    // Find union bounds for each column
+    for (FileScanTask task : bucketFiles) {
+      totalRecords += task.file().recordCount();
+      totalBytes += task.length();
+
+      for (int i = 0; i < columnFieldIds.size(); i++) {
+        int fieldId = columnFieldIds.get(i);
+        Type type = columnTypes.get(i);
+
+        ByteBuffer lowerBuf = task.file().lowerBounds().get(fieldId);
+        ByteBuffer upperBuf = task.file().upperBounds().get(fieldId);
+
+        if (lowerBuf != null && upperBuf != null) {
+          Comparable<Object> lower = (Comparable<Object>) Conversions.fromByteBuffer(type, lowerBuf);
+          Comparable<Object> upper = (Comparable<Object>) Conversions.fromByteBuffer(type, upperBuf);
+
+          if (ctx.minBounds[i] == null || lower.compareTo(ctx.minBounds[i]) < 0) {
+            ctx.minBounds[i] = lower;
+          }
+          if (ctx.maxBounds[i] == null || upper.compareTo(ctx.maxBounds[i]) > 0) {
+            ctx.maxBounds[i] = upper;
+          }
+        }
       }
     }
 
-    // External cost: simulated files vs remaining
-    for (SimulatedFile simFile : simulation.files) {
-      for (FileScanTask remainingFile : remaining) {
-        costAfter += calculateCostWithSimulated(simFile, remainingFile, simulation.context);
+    // Calculate ranges
+    for (int i = 0; i < columnFieldIds.size(); i++) {
+      if (ctx.minBounds[i] != null && ctx.maxBounds[i] != null) {
+        ctx.ranges[i] = calculateRange(ctx.minBounds[i], ctx.maxBounds[i], columnTypes.get(i));
       }
     }
 
-    return costBefore - costAfter;
+    // Calculate number of output files (don't create more files than records)
+    int numOutputFiles = (int) Math.min(expectedOutputFiles(totalBytes), Math.max(1, totalRecords));
+    if (numOutputFiles == 0) {
+      return new SimulationResult(ctx, ImmutableList.of());
+    }
+
+    // Create simulated files with non-overlapping normalized positions
+    List<SimulatedFile> result = new ArrayList<>();
+    long recordsPerFile = Math.max(1, totalRecords / numOutputFiles);
+
+    for (int f = 0; f < numOutputFiles; f++) {
+      double[] fileLowerPos = new double[columnFieldIds.size()];
+      double[] fileUpperPos = new double[columnFieldIds.size()];
+
+      // First column: split evenly (non-overlapping after sort)
+      fileLowerPos[0] = (double) f / numOutputFiles;
+      fileUpperPos[0] = (double) (f + 1) / numOutputFiles;
+
+      // Other columns: full range (conservative estimate)
+      for (int i = 1; i < columnFieldIds.size(); i++) {
+        fileLowerPos[i] = 0.0;
+        fileUpperPos[i] = 1.0;
+      }
+
+      long fileRecords = (f == numOutputFiles - 1)
+          ? totalRecords - recordsPerFile * f
+          : recordsPerFile;
+
+      result.add(new SimulatedFile(fileLowerPos, fileUpperPos, fileRecords));
+    }
+
+    return new SimulationResult(ctx, result);
   }
 
   /** Context for simulation containing union bounds of the group. */
@@ -653,13 +795,11 @@ public class OverlapRewriteFilePlanner
     final Object[] minBounds;
     final Object[] maxBounds;
     final double[] ranges;
-    boolean useUuidBucketing;
 
     SimulationContext(int numColumns) {
       this.minBounds = new Object[numColumns];
       this.maxBounds = new Object[numColumns];
       this.ranges = new double[numColumns];
-      this.useUuidBucketing = false;
     }
   }
 
@@ -685,148 +825,6 @@ public class OverlapRewriteFilePlanner
       this.context = context;
       this.files = files;
     }
-  }
-
-  /** Simulates merge+sort+split and returns list of hypothetical output files. */
-  @SuppressWarnings("unchecked")
-  private SimulationResult simulateMergeSplit(List<FileScanTask> group) {
-    SimulationContext ctx = new SimulationContext(columnFieldIds.size());
-
-    long totalRecords = 0;
-    long totalBytes = 0;
-
-    // Find union bounds for each column
-    for (FileScanTask task : group) {
-      totalRecords += task.file().recordCount();
-      totalBytes += task.length();
-
-      for (int i = 0; i < columnFieldIds.size(); i++) {
-        int fieldId = columnFieldIds.get(i);
-        Type type = columnTypes.get(i);
-
-        ByteBuffer lowerBuf = task.file().lowerBounds().get(fieldId);
-        ByteBuffer upperBuf = task.file().upperBounds().get(fieldId);
-
-        if (lowerBuf != null && upperBuf != null) {
-          Comparable<Object> lower =
-              (Comparable<Object>) Conversions.fromByteBuffer(type, lowerBuf);
-          Comparable<Object> upper =
-              (Comparable<Object>) Conversions.fromByteBuffer(type, upperBuf);
-
-          if (ctx.minBounds[i] == null || lower.compareTo(ctx.minBounds[i]) < 0) {
-            ctx.minBounds[i] = lower;
-          }
-          if (ctx.maxBounds[i] == null || upper.compareTo(ctx.maxBounds[i]) > 0) {
-            ctx.maxBounds[i] = upper;
-          }
-        }
-      }
-    }
-
-    // Calculate ranges
-    for (int i = 0; i < columnFieldIds.size(); i++) {
-      if (ctx.minBounds[i] != null && ctx.maxBounds[i] != null) {
-        ctx.ranges[i] = calculateRange(ctx.minBounds[i], ctx.maxBounds[i], columnTypes.get(i));
-      }
-    }
-
-    // Use UUID bucket simulation if enabled and first column looks like UUID
-    if (useUuidPrefixBucketing && numBuckets > 0 && isUuidBound(ctx.minBounds[0])) {
-      return simulateMergeSplitWithUuidBuckets(ctx, totalRecords);
-    }
-
-    // Calculate number of output files using the same logic as actual rewrite
-    int numOutputFiles = expectedOutputFiles(totalBytes);
-
-    // Create simulated files with non-overlapping normalized positions
-    List<SimulatedFile> result = new ArrayList<>();
-    long recordsPerFile = totalRecords / numOutputFiles;
-
-    for (int f = 0; f < numOutputFiles; f++) {
-      double[] fileLowerPos = new double[columnFieldIds.size()];
-      double[] fileUpperPos = new double[columnFieldIds.size()];
-
-      // First column: split evenly (non-overlapping)
-      fileLowerPos[0] = (double) f / numOutputFiles;
-      fileUpperPos[0] = (double) (f + 1) / numOutputFiles;
-
-      // Other columns: full range (conservative estimate)
-      for (int i = 1; i < columnFieldIds.size(); i++) {
-        fileLowerPos[i] = 0.0;
-        fileUpperPos[i] = 1.0;
-      }
-
-      long fileRecords =
-          (f == numOutputFiles - 1)
-              ? totalRecords - recordsPerFile * f // Last file gets remainder
-              : recordsPerFile;
-
-      result.add(new SimulatedFile(fileLowerPos, fileUpperPos, fileRecords));
-    }
-
-    return new SimulationResult(ctx, result);
-  }
-
-  /**
-   * Simulates merge+sort+split with UUID prefix bucketing.
-   *
-   * <p>Instead of equal positional splits, this simulates output files based on UUID hex bucket
-   * boundaries. Each bucket covers a range of hex prefixes (e.g., bucket 0 = 00-0f for 16 buckets).
-   *
-   * <p>Positions are normalized to [0,1] relative to full hex space (0-4095), not union bounds.
-   */
-  private SimulationResult simulateMergeSplitWithUuidBuckets(
-      SimulationContext ctx, long totalRecords) {
-
-    // Mark context as using UUID bucketing for proper normalization in cost calculations
-    ctx.useUuidBucketing = true;
-    // Use full hex range (0-4095) for first column normalization
-    ctx.ranges[0] = 4095.0;
-
-    int minHex = UuidBucketUtil.extractHexPrefix(ctx.minBounds[0]);
-    int maxHex = UuidBucketUtil.extractHexPrefix(ctx.maxBounds[0]);
-
-    int minBucket = UuidBucketUtil.hexToBucket(minHex, numBuckets);
-    int maxBucket = UuidBucketUtil.hexToBucket(maxHex, numBuckets);
-    int filledBuckets = maxBucket - minBucket + 1;
-
-    LOG.debug(
-        "OVERLAP [{}]: UUID bucketing simulation: minHex={}, maxHex={}, minBucket={}, maxBucket={}, filledBuckets={}",
-        table().name(),
-        Integer.toHexString(minHex),
-        Integer.toHexString(maxHex),
-        minBucket,
-        maxBucket,
-        filledBuckets);
-
-    List<SimulatedFile> files = new ArrayList<>();
-    long recordsPerBucket = totalRecords / filledBuckets;
-
-    for (int bucket = minBucket; bucket <= maxBucket; bucket++) {
-      double[] lowerPos = new double[columnFieldIds.size()];
-      double[] upperPos = new double[columnFieldIds.size()];
-
-      // First column: bucket bounds in hex space [0,1] relative to 0-4095
-      int bucketLowerHex = UuidBucketUtil.bucketLowerHex(bucket, numBuckets);
-      int bucketUpperHex = UuidBucketUtil.bucketUpperHex(bucket, numBuckets);
-      lowerPos[0] = bucketLowerHex / 4095.0;
-      upperPos[0] = bucketUpperHex / 4095.0;
-
-      // Other columns: full range (conservative estimate)
-      for (int i = 1; i < columnFieldIds.size(); i++) {
-        lowerPos[i] = 0.0;
-        upperPos[i] = 1.0;
-      }
-
-      long fileRecords =
-          (bucket == maxBucket)
-              ? totalRecords - recordsPerBucket * (filledBuckets - 1)
-              : recordsPerBucket;
-
-      files.add(new SimulatedFile(lowerPos, upperPos, fileRecords));
-    }
-
-    return new SimulationResult(ctx, files);
   }
 
   /** Calculate overlap cost between a simulated file and a real file. */
@@ -855,23 +853,10 @@ public class OverlapRewriteFilePlanner
       Comparable<Object> realUpper =
           (Comparable<Object>) Conversions.fromByteBuffer(type, realUpperBuf);
 
-      double realRange;
-      double realLowerPos;
-      double realUpperPos;
-
-      // For UUID bucketing on first column, use hex space (0-4095) for both range and positions
-      if (i == 0 && ctx.useUuidBucketing) {
-        int hexLower = UuidBucketUtil.extractHexPrefix(realLower);
-        int hexUpper = UuidBucketUtil.extractHexPrefix(realUpper);
-        realRange = hexUpper - hexLower;
-        realLowerPos = hexLower / 4095.0;
-        realUpperPos = hexUpper / 4095.0;
-      } else {
-        realRange = calculateRange(realLower, realUpper, type);
-        // Normalize real file bounds to 0..1 relative to union bounds
-        realLowerPos = normalizePosition(realLower, ctx.minBounds[i], ctx.ranges[i], type);
-        realUpperPos = normalizePosition(realUpper, ctx.minBounds[i], ctx.ranges[i], type);
-      }
+      double realRange = calculateRange(realLower, realUpper, type);
+      // Normalize real file bounds to 0..1 relative to union bounds
+      double realLowerPos = normalizePosition(realLower, ctx.minBounds[i], ctx.ranges[i], type);
+      double realUpperPos = normalizePosition(realUpper, ctx.minBounds[i], ctx.ranges[i], type);
 
       if (realRange <= 0) {
         continue;
@@ -1194,8 +1179,50 @@ public class OverlapRewriteFilePlanner
     }
   }
 
-  /** Checks if the bound value looks like a UUID string. */
-  private boolean isUuidBound(Object bound) {
-    return bound instanceof CharSequence && UuidBucketUtil.looksLikeUuid(bound.toString());
+  /**
+   * Get the bucket range [minBucket, maxBucket] for a file.
+   *
+   * <p>Without UUID bucketing, returns [0, 0] (single bucket for all files).
+   */
+  private int[] getBucketRange(FileScanTask task) {
+    if (!useUuidPrefixBucketing || numBuckets <= 0 || columnFieldIds.isEmpty()) {
+      return new int[] {0, 0};
+    }
+
+    int fieldId = columnFieldIds.get(0);
+    Type type = columnTypes.get(0);
+
+    ByteBuffer lowerBuf = task.file().lowerBounds().get(fieldId);
+    ByteBuffer upperBuf = task.file().upperBounds().get(fieldId);
+
+    if (lowerBuf == null || upperBuf == null) {
+      return new int[] {0, 0};
+    }
+
+    Object lower = Conversions.fromByteBuffer(type, lowerBuf);
+    Object upper = Conversions.fromByteBuffer(type, upperBuf);
+
+    // Verify bounds are actually UUIDs
+    if (!(lower instanceof CharSequence) || !UuidBucketUtil.looksLikeUuid(lower.toString())) {
+      return new int[] {0, 0};
+    }
+
+    int lowerHex = UuidBucketUtil.extractHexPrefix(lower);
+    int upperHex = UuidBucketUtil.extractHexPrefix(upper);
+
+    int lowerBucket = UuidBucketUtil.hexToBucket(lowerHex, numBuckets);
+    int upperBucket = UuidBucketUtil.hexToBucket(upperHex, numBuckets);
+
+    return new int[] {lowerBucket, upperBucket};
+  }
+
+  /**
+   * Get the bucket span (number of buckets) for a file.
+   *
+   * <p>Without UUID bucketing, returns 1 (single bucket for all files).
+   */
+  private int getBucketSpan(FileScanTask task) {
+    int[] range = getBucketRange(task);
+    return range[1] - range[0] + 1;
   }
 }
