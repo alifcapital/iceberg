@@ -47,6 +47,7 @@ import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.SparkWriteOptions;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.SortOrderUtil;
+import org.apache.iceberg.util.UuidBucketUtil;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -102,9 +103,6 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   public static final int SHUFFLE_PARTITIONS_PER_FILE_DEFAULT = 1;
 
   public static final String TARGET_ROW_GROUP_SIZE_BYTES = "target-row-group-size-bytes";
-
-  private static final int MIN_BUCKETS = 2;
-  private static final int MAX_BUCKETS = 1024;
 
   private int numShufflePartitionsPerFile;
   private String rowGroupSizeBytes;
@@ -172,7 +170,10 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
     String totalSizeStr = table().currentSnapshot().summary().get("total-files-size");
     if (totalSizeStr == null) {
-      LOG.debug("{} [{}]: Cannot compute UUID buckets: total-files-size not in snapshot summary", description(), table().name());
+      LOG.debug(
+          "{} [{}]: Cannot compute UUID buckets: total-files-size not in snapshot summary",
+          description(),
+          table().name());
       return 0;
     }
 
@@ -180,7 +181,12 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     try {
       totalSize = Long.parseLong(totalSizeStr);
     } catch (NumberFormatException e) {
-      LOG.warn("{} [{}]: Cannot parse total-files-size from snapshot summary: {}", description(), table().name(), totalSizeStr);
+      LOG.warn(
+          "{} [{}]: Cannot parse total-files-size from snapshot summary: {}",
+          description(),
+          table().name(),
+          totalSizeStr,
+          e);
       return 0;
     }
 
@@ -193,13 +199,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
                 org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
                 org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT));
 
-    if (targetFileSize <= 0) {
-      return 0;
-    }
-
-    long optimalFileCount = Math.max(1, totalSize / targetFileSize);
-    int power = Math.max(0, (int) Math.ceil(Math.log(optimalFileCount) / Math.log(2)));
-    return Math.max(MIN_BUCKETS, Math.min(MAX_BUCKETS, 1 << power));
+    return UuidBucketUtil.computeBuckets(totalSize, targetFileSize);
   }
 
   @Override
@@ -391,33 +391,37 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   /**
    * Builds a Catalyst expression for UUID bucket ID computation.
    *
-   * <p>Uses hex prefix bucketing: floor(conv(substring(uuid, 1, 2), 16, 10) * numBuckets / 256)
+   * <p>Uses hex prefix bucketing: floor(conv(substring(uuid, 1, 3), 16, 10) * numBuckets / 4096)
    *
-   * <p>This extracts first 2 hex characters (00-ff = 0-255), then maps to bucket range. For
-   * numBuckets=16, this groups by first hex char: 00-0f→0, 10-1f→1, ..., f0-ff→15.
+   * <p>This extracts first 3 hex characters (000-fff = 0-4095), then maps to bucket range. For
+   * numBuckets=16: 000-0ff→0, 100-1ff→1, ..., f00-fff→15.
    */
   private Expression buildUuidBucketExpression(Expression col, int numBuckets) {
 
-    // substring(col, 1, 2) - get first 2 characters (1-based indexing in SQL)
-    Expression prefix = new org.apache.spark.sql.catalyst.expressions.Substring(
-        col,
-        Literal.create(1, DataTypes.IntegerType),
-        Literal.create(2, DataTypes.IntegerType));
+    // substring(col, 1, 3) - get first 3 characters (1-based indexing in SQL)
+    Expression prefix =
+        new org.apache.spark.sql.catalyst.expressions.Substring(
+            col,
+            Literal.create(1, DataTypes.IntegerType),
+            Literal.create(3, DataTypes.IntegerType));
 
-    // conv(prefix, 16, 10) - convert hex to decimal (00-ff → 0-255)
-    Expression hexToDecimal = new org.apache.spark.sql.catalyst.expressions.Conv(
-        prefix,
-        Literal.create(16, DataTypes.IntegerType),
-        Literal.create(10, DataTypes.IntegerType));
+    // conv(prefix, 16, 10) - convert hex to decimal (000-fff → 0-4095)
+    Expression hexToDecimal =
+        new org.apache.spark.sql.catalyst.expressions.Conv(
+            prefix,
+            Literal.create(16, DataTypes.IntegerType),
+            Literal.create(10, DataTypes.IntegerType));
 
     // Cast to long for arithmetic
-    Expression asLong = new Cast(hexToDecimal, DataTypes.LongType, Option.empty(), EvalMode.LEGACY());
+    Expression asLong =
+        new Cast(hexToDecimal, DataTypes.LongType, Option.empty(), EvalMode.LEGACY());
 
-    // bucket = floor(hexValue * numBuckets / 256)
-    // For numBuckets=16: 00-0f→0, 10-1f→1, ..., f0-ff→15
-    // For numBuckets=32: 00-07→0, 08-0f→1, ..., f8-ff→31
-    Expression scaled = new Multiply(asLong, Literal.create((long) numBuckets, DataTypes.LongType));
-    Expression divided = new Divide(scaled, Literal.create(256L, DataTypes.LongType));
+    // bucket = floor(hexValue * numBuckets / 4096)
+    // For numBuckets=16: 000-0ff→0, 100-1ff→1, ..., f00-fff→15
+    // For numBuckets=1024: each bucket covers 4 hex values
+    Expression scaled =
+        new Multiply(asLong, Literal.create((long) numBuckets, DataTypes.LongType));
+    Expression divided = new Divide(scaled, Literal.create(4096L, DataTypes.LongType));
     Expression bucket = new Floor(divided);
 
     // Cast to int for partition ID

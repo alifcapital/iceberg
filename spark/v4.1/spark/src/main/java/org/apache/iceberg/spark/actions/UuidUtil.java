@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg.spark.actions;
 
+import org.apache.iceberg.util.UuidBucketUtil;
+
 /** Utility methods for UUID detection and handling. */
 final class UuidUtil {
 
@@ -30,23 +32,6 @@ final class UuidUtil {
    * chars: 8 hex + dash)
    */
   static boolean looksLikeUuid(String value) {
-    if (value == null || value.length() < 9) {
-      return false;
-    }
-
-    // Check for dash at position 8 (UUID format: xxxxxxxx-xxxx-...)
-    if (value.charAt(8) != '-') {
-      return false;
-    }
-
-    // Check that first 8 characters are hex
-    for (int i = 0; i < 8; i++) {
-      char c = value.charAt(i);
-      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
-        return false;
-      }
-    }
-
-    return true;
+    return UuidBucketUtil.looksLikeUuid(value);
   }
 }

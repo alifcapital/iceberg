@@ -46,6 +46,7 @@ import org.apache.iceberg.TableScan;
 import org.apache.iceberg.actions.RewriteDataFiles.FileGroupInfo;
 import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.iceberg.util.SortOrderUtil;
+import org.apache.iceberg.util.UuidBucketUtil;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
@@ -1002,28 +1003,8 @@ public class SmallFilesRewritePlanner
 
     Object lower = Conversions.fromByteBuffer(type, lowerBuf);
     if (lower instanceof CharSequence) {
-      return looksLikeUuid(lower.toString());
+      return UuidBucketUtil.looksLikeUuid(lower.toString());
     }
     return false;
-  }
-
-  /**
-   * Checks if a string value looks like a UUID.
-   * UUID format: xxxxxxxx-xxxx-... (8 hex chars, dash, ...)
-   */
-  private static boolean looksLikeUuid(String value) {
-    if (value == null || value.length() < 9) {
-      return false;
-    }
-    if (value.charAt(8) != '-') {
-      return false;
-    }
-    for (int i = 0; i < 8; i++) {
-      char c = value.charAt(i);
-      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
-        return false;
-      }
-    }
-    return true;
   }
 }

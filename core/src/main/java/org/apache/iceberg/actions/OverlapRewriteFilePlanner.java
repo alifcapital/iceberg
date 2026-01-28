@@ -50,6 +50,7 @@ import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.StructLikeMap;
+import org.apache.iceberg.util.UuidBucketUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -75,6 +76,7 @@ public class OverlapRewriteFilePlanner
 
   public static final String COLUMNS = "columns";
   public static final String USE_IDENTIFIER_KEYS = "use-identifier-keys";
+  public static final String USE_UUID_PREFIX_BUCKETING = "use-uuid-prefix-bucketing";
 
   private final Expression filter;
   private final Long snapshotId;
@@ -85,6 +87,8 @@ public class OverlapRewriteFilePlanner
   private long maxGroupSize;
   private long maxGroupInputFiles;
   private boolean skipRewrite;
+  private boolean useUuidPrefixBucketing;
+  private int numBuckets;
 
   public OverlapRewriteFilePlanner(Table table) {
     this(table, Expressions.alwaysTrue());
@@ -112,6 +116,7 @@ public class OverlapRewriteFilePlanner
         .addAll(super.validOptions())
         .add(COLUMNS)
         .add(USE_IDENTIFIER_KEYS)
+        .add(USE_UUID_PREFIX_BUCKETING)
         .build();
   }
 
@@ -176,6 +181,18 @@ public class OverlapRewriteFilePlanner
         PropertyUtil.propertyAsLong(
             options, MAX_FILE_GROUP_INPUT_FILES, MAX_FILE_GROUP_INPUT_FILES_DEFAULT);
 
+    // UUID prefix bucketing
+    this.useUuidPrefixBucketing =
+        PropertyUtil.propertyAsBoolean(options, USE_UUID_PREFIX_BUCKETING, false);
+    if (useUuidPrefixBucketing) {
+      long totalSize = getTotalFilesSize();
+      this.numBuckets = UuidBucketUtil.computeBuckets(totalSize, targetFileSize());
+      LOG.info(
+          "OVERLAP [{}]: UUID prefix bucketing enabled, totalSize={}, numBuckets={}",
+          table().name(),
+          totalSize,
+          numBuckets);
+    }
   }
 
   @Override
@@ -630,11 +647,13 @@ public class OverlapRewriteFilePlanner
     final Object[] minBounds;
     final Object[] maxBounds;
     final double[] ranges;
+    boolean useUuidBucketing;
 
     SimulationContext(int numColumns) {
       this.minBounds = new Object[numColumns];
       this.maxBounds = new Object[numColumns];
       this.ranges = new double[numColumns];
+      this.useUuidBucketing = false;
     }
   }
 
@@ -705,6 +724,11 @@ public class OverlapRewriteFilePlanner
       }
     }
 
+    // Use UUID bucket simulation if enabled and first column looks like UUID
+    if (useUuidPrefixBucketing && numBuckets > 0 && isUuidBound(ctx.minBounds[0])) {
+      return simulateMergeSplitWithUuidBuckets(ctx, totalRecords);
+    }
+
     // Calculate number of output files using the same logic as actual rewrite
     int numOutputFiles = expectedOutputFiles(totalBytes);
 
@@ -737,6 +761,68 @@ public class OverlapRewriteFilePlanner
     return new SimulationResult(ctx, result);
   }
 
+  /**
+   * Simulates merge+sort+split with UUID prefix bucketing.
+   *
+   * <p>Instead of equal positional splits, this simulates output files based on UUID hex bucket
+   * boundaries. Each bucket covers a range of hex prefixes (e.g., bucket 0 = 00-0f for 16 buckets).
+   *
+   * <p>Positions are normalized to [0,1] relative to full hex space (0-4095), not union bounds.
+   */
+  private SimulationResult simulateMergeSplitWithUuidBuckets(
+      SimulationContext ctx, long totalRecords) {
+
+    // Mark context as using UUID bucketing for proper normalization in cost calculations
+    ctx.useUuidBucketing = true;
+    // Use full hex range (0-4095) for first column normalization
+    ctx.ranges[0] = 4095.0;
+
+    int minHex = UuidBucketUtil.extractHexPrefix(ctx.minBounds[0]);
+    int maxHex = UuidBucketUtil.extractHexPrefix(ctx.maxBounds[0]);
+
+    int minBucket = UuidBucketUtil.hexToBucket(minHex, numBuckets);
+    int maxBucket = UuidBucketUtil.hexToBucket(maxHex, numBuckets);
+    int filledBuckets = maxBucket - minBucket + 1;
+
+    LOG.debug(
+        "OVERLAP [{}]: UUID bucketing simulation: minHex={}, maxHex={}, minBucket={}, maxBucket={}, filledBuckets={}",
+        table().name(),
+        Integer.toHexString(minHex),
+        Integer.toHexString(maxHex),
+        minBucket,
+        maxBucket,
+        filledBuckets);
+
+    List<SimulatedFile> files = new ArrayList<>();
+    long recordsPerBucket = totalRecords / filledBuckets;
+
+    for (int bucket = minBucket; bucket <= maxBucket; bucket++) {
+      double[] lowerPos = new double[columnFieldIds.size()];
+      double[] upperPos = new double[columnFieldIds.size()];
+
+      // First column: bucket bounds in hex space [0,1] relative to 0-4095
+      int bucketLowerHex = UuidBucketUtil.bucketLowerHex(bucket, numBuckets);
+      int bucketUpperHex = UuidBucketUtil.bucketUpperHex(bucket, numBuckets);
+      lowerPos[0] = bucketLowerHex / 4095.0;
+      upperPos[0] = bucketUpperHex / 4095.0;
+
+      // Other columns: full range (conservative estimate)
+      for (int i = 1; i < columnFieldIds.size(); i++) {
+        lowerPos[i] = 0.0;
+        upperPos[i] = 1.0;
+      }
+
+      long fileRecords =
+          (bucket == maxBucket)
+              ? totalRecords - recordsPerBucket * (filledBuckets - 1)
+              : recordsPerBucket;
+
+      files.add(new SimulatedFile(lowerPos, upperPos, fileRecords));
+    }
+
+    return new SimulationResult(ctx, files);
+  }
+
   /** Calculate overlap cost between a simulated file and a real file. */
   @SuppressWarnings("unchecked")
   private double calculateCostWithSimulated(
@@ -763,14 +849,27 @@ public class OverlapRewriteFilePlanner
       Comparable<Object> realUpper =
           (Comparable<Object>) Conversions.fromByteBuffer(type, realUpperBuf);
 
-      double realRange = calculateRange(realLower, realUpper, type);
+      double realRange;
+      double realLowerPos;
+      double realUpperPos;
+
+      // For UUID bucketing on first column, use hex space (0-4095) for both range and positions
+      if (i == 0 && ctx.useUuidBucketing) {
+        int hexLower = UuidBucketUtil.extractHexPrefix(realLower);
+        int hexUpper = UuidBucketUtil.extractHexPrefix(realUpper);
+        realRange = hexUpper - hexLower;
+        realLowerPos = hexLower / 4095.0;
+        realUpperPos = hexUpper / 4095.0;
+      } else {
+        realRange = calculateRange(realLower, realUpper, type);
+        // Normalize real file bounds to 0..1 relative to union bounds
+        realLowerPos = normalizePosition(realLower, ctx.minBounds[i], ctx.ranges[i], type);
+        realUpperPos = normalizePosition(realUpper, ctx.minBounds[i], ctx.ranges[i], type);
+      }
+
       if (realRange <= 0) {
         continue;
       }
-
-      // Normalize real file bounds to 0..1 relative to union bounds
-      double realLowerPos = normalizePosition(realLower, ctx.minBounds[i], ctx.ranges[i], type);
-      double realUpperPos = normalizePosition(realUpper, ctx.minBounds[i], ctx.ranges[i], type);
 
       // Clamp to 0..1
       realLowerPos = Math.max(0, Math.min(1, realLowerPos));
@@ -1067,5 +1166,30 @@ public class OverlapRewriteFilePlanner
         writeMaxFileSize(),
         inputSplitSize,
         expectedOutputFiles);
+  }
+
+  /** Gets total files size from snapshot summary. */
+  private long getTotalFilesSize() {
+    if (table().currentSnapshot() == null) {
+      return 0;
+    }
+
+    String totalSizeStr = table().currentSnapshot().summary().get("total-files-size");
+    if (totalSizeStr == null) {
+      return 0;
+    }
+
+    try {
+      return Long.parseLong(totalSizeStr);
+    } catch (NumberFormatException e) {
+      LOG.warn(
+          "OVERLAP [{}]: Cannot parse total-files-size: {}", table().name(), totalSizeStr, e);
+      return 0;
+    }
+  }
+
+  /** Checks if the bound value looks like a UUID string. */
+  private boolean isUuidBound(Object bound) {
+    return bound instanceof CharSequence && UuidBucketUtil.looksLikeUuid(bound.toString());
   }
 }
