@@ -294,23 +294,38 @@ public class OverlapRewriteFilePlanner
       return null;
     }
 
+    // Cache bucket ranges for all files - used by sort and improvement calculation
+    Map<FileScanTask, int[]> bucketRanges = new java.util.HashMap<>();
+    for (FileScanTask task : files) {
+      bucketRanges.put(task, getBucketRange(task));
+    }
+
+    if (Thread.interrupted()) {
+      Thread.currentThread().interrupt();
+      return null;
+    }
+
     // Sort pairs by (bucketSpan × records) descending
     // Files spanning more buckets with more records have higher potential improvement
     // Without UUID bucketing: bucketSpan=1, so this degrades to sorting by records
     overlappingPairs.sort(
         (p1, p2) -> {
-          long score1 = (long) getBucketSpan(files.get(p1[0])) * files.get(p1[0]).file().recordCount()
-                      + (long) getBucketSpan(files.get(p1[1])) * files.get(p1[1]).file().recordCount();
-          long score2 = (long) getBucketSpan(files.get(p2[0])) * files.get(p2[0]).file().recordCount()
-                      + (long) getBucketSpan(files.get(p2[1])) * files.get(p2[1]).file().recordCount();
+          int[] r1a = bucketRanges.get(files.get(p1[0]));
+          int[] r1b = bucketRanges.get(files.get(p1[1]));
+          int[] r2a = bucketRanges.get(files.get(p2[0]));
+          int[] r2b = bucketRanges.get(files.get(p2[1]));
+          long score1 = (long) (r1a[1] - r1a[0] + 1) * files.get(p1[0]).file().recordCount()
+                      + (long) (r1b[1] - r1b[0] + 1) * files.get(p1[1]).file().recordCount();
+          long score2 = (long) (r2a[1] - r2a[0] + 1) * files.get(p2[0]).file().recordCount()
+                      + (long) (r2b[1] - r2b[0] + 1) * files.get(p2[1]).file().recordCount();
           return Long.compare(score2, score1); // descending
         });
 
     // Stage 1: Try to find pair with positive improvement, checking in batches
-    List<FileScanTask> bestPair = findBestPairIncremental(files, overlappingPairs);
+    List<FileScanTask> bestPair = findBestPairIncremental(files, overlappingPairs, bucketRanges);
 
     if (bestPair != null) {
-      return expandGroup(files, bestPair);
+      return expandGroup(files, bestPair, bucketRanges);
     }
 
     // Stage 2: No positive improvement found - skip fallback
@@ -324,7 +339,7 @@ public class OverlapRewriteFilePlanner
    * Stage 1: Find best pair with positive improvement, checking batches of pairs.
    */
   private List<FileScanTask> findBestPairIncremental(
-      List<FileScanTask> files, List<int[]> overlappingPairs) {
+      List<FileScanTask> files, List<int[]> overlappingPairs, Map<FileScanTask, int[]> bucketRanges) {
     int totalPairs = overlappingPairs.size();
     int batchStart = 0;
 
@@ -350,7 +365,7 @@ public class OverlapRewriteFilePlanner
         FileScanTask b = files.get(pair[1]);
 
         pairsChecked++;
-        double improvement = calculateMergeImprovement(files, Arrays.asList(a, b));
+        double improvement = calculateMergeImprovement(files, Arrays.asList(a, b), bucketRanges);
 
         if (improvement > bestImprovement) {
           bestImprovement = improvement;
@@ -466,12 +481,13 @@ public class OverlapRewriteFilePlanner
   /**
    * Expand a group by adding more files while it improves the cost.
    */
-  private List<FileScanTask> expandGroup(List<FileScanTask> files, List<FileScanTask> initialPair) {
+  private List<FileScanTask> expandGroup(
+      List<FileScanTask> files, List<FileScanTask> initialPair, Map<FileScanTask, int[]> bucketRanges) {
     List<FileScanTask> group = new ArrayList<>(initialPair);
     List<FileScanTask> remaining =
         files.stream().filter(f -> !group.contains(f)).collect(Collectors.toList());
 
-    double bestImprovement = calculateMergeImprovement(files, group);
+    double bestImprovement = calculateMergeImprovement(files, group, bucketRanges);
 
     boolean improved = true;
     while (improved && !remaining.isEmpty()) {
@@ -499,7 +515,7 @@ public class OverlapRewriteFilePlanner
         List<FileScanTask> testGroup = new ArrayList<>(group);
         testGroup.add(candidate);
 
-        double newImprovement = calculateMergeImprovement(files, testGroup);
+        double newImprovement = calculateMergeImprovement(files, testGroup, bucketRanges);
         double additionalImprovement = newImprovement - bestImprovement;
 
         if (additionalImprovement > 0 && newImprovement > bestAdditionImprovement) {
@@ -611,16 +627,11 @@ public class OverlapRewriteFilePlanner
    * <p>Within each bucket, we use honest string-level cardinality-based cost.
    * After merge+sort+split, files within a bucket are sorted and non-overlapping.
    */
-  private double calculateMergeImprovement(List<FileScanTask> allFiles, List<FileScanTask> group) {
+  private double calculateMergeImprovement(
+      List<FileScanTask> allFiles, List<FileScanTask> group, Map<FileScanTask, int[]> bucketRanges) {
     Set<FileScanTask> groupSet = ImmutableSet.copyOf(group);
     List<FileScanTask> remaining =
         allFiles.stream().filter(f -> !groupSet.contains(f)).collect(Collectors.toList());
-
-    // Cache bucket ranges to avoid repeated calculations
-    Map<FileScanTask, int[]> bucketRanges = new java.util.HashMap<>();
-    for (FileScanTask task : allFiles) {
-      bucketRanges.put(task, getBucketRange(task));
-    }
 
     // Determine bucket range for the group
     int minBucket = Integer.MAX_VALUE;
@@ -635,7 +646,18 @@ public class OverlapRewriteFilePlanner
       return 0;
     }
 
-    // Calculate improvement for each bucket
+    // Fast path: if group spans multiple buckets, improvement is obvious
+    // No need for expensive per-bucket calculation
+    if (maxBucket > minBucket) {
+      long totalRecords = group.stream().mapToLong(t -> t.file().recordCount()).sum();
+      int totalSpan = group.stream().mapToInt(t -> {
+        int[] r = bucketRanges.get(t);
+        return r[1] - r[0] + 1;
+      }).sum();
+      return (double) totalSpan * totalRecords;
+    }
+
+    // Slow path: all files in same bucket - calculate honest improvement
     double totalImprovement = 0;
 
     for (int bucket = minBucket; bucket <= maxBucket; bucket++) {
@@ -1214,15 +1236,5 @@ public class OverlapRewriteFilePlanner
     int upperBucket = UuidBucketUtil.hexToBucket(upperHex, numBuckets);
 
     return new int[] {lowerBucket, upperBucket};
-  }
-
-  /**
-   * Get the bucket span (number of buckets) for a file.
-   *
-   * <p>Without UUID bucketing, returns 1 (single bucket for all files).
-   */
-  private int getBucketSpan(FileScanTask task) {
-    int[] range = getBucketRange(task);
-    return range[1] - range[0] + 1;
   }
 }
