@@ -254,16 +254,16 @@ public class SmallFilesRewritePlanner
     this.useUuidPrefixBucketing =
         PropertyUtil.propertyAsBoolean(options, USE_UUID_PREFIX_BUCKETING, false);
 
-    // Initialize sort order IDs for delete-files-only mode
-    if (deleteFilesOnly && useIdentifierKeys && !columnFieldIds.isEmpty()) {
+    // Initialize sort order IDs when identifier keys are available
+    if (useIdentifierKeys && !columnFieldIds.isEmpty()) {
       initSortOrderIds();
     }
   }
 
   /**
-   * Initialize sort order IDs for delete-files-only mode. Large files use single PK sort (if
-   * applicable) for eq delete convert optimization. Small files use full identifier key sort for
-   * good bounds.
+   * Initialize sort order IDs. Small files always use full identifier key sort for good bounds.
+   * Large files (in delete-files-only mode) use single PK sort if applicable for eq delete convert
+   * optimization.
    */
   private void initSortOrderIds() {
     Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
@@ -545,7 +545,7 @@ public class SmallFilesRewritePlanner
     }
 
     planSmallFilesWithSortOrderId(
-        ctx, partition, smallFiles, largeFiles, unsortedFallback, selectedGroups, null);
+        ctx, partition, smallFiles, largeFiles, unsortedFallback, selectedGroups, smallSortOrderId);
   }
 
   /** Plan small files with optional sortOrderId. */

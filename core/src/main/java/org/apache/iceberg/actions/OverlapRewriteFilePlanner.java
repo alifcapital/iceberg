@@ -142,15 +142,21 @@ public class OverlapRewriteFilePlanner
 
     List<String> columns;
     if (useIdentifierKeys) {
-      Set<String> identifierFieldNames = table().schema().identifierFieldNames();
-      if (identifierFieldNames.isEmpty()) {
+      Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
+      if (identifierFieldIds.isEmpty()) {
         LOG.info("OVERLAP [{}]: table has no identifier keys, skipping", table().name());
         this.skipRewrite = true;
         this.columnFieldIds = ImmutableList.of();
         this.columnTypes = ImmutableList.of();
         return;
       }
-      columns = identifierFieldNames.stream().sorted().collect(Collectors.toList());
+      // Sort by field ID to match the sort order used in SparkOverlapFileRewriteRunner
+      List<Integer> sortedFieldIds =
+          identifierFieldIds.stream().sorted().collect(Collectors.toList());
+      columns =
+          sortedFieldIds.stream()
+              .map(table().schema()::findColumnName)
+              .collect(Collectors.toList());
     } else {
       columns =
           Arrays.stream(columnsOption.split(","))
