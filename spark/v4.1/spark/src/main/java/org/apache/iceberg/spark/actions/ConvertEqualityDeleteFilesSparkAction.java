@@ -219,6 +219,16 @@ public class ConvertEqualityDeleteFilesSparkAction
 
   public static final int MAX_TASKS_PER_GROUP_DEFAULT = Integer.MAX_VALUE;
 
+  /**
+   * If enabled, the action will use merge join optimization for sorted Parquet files
+   * with Long, Integer, or Decimal equality delete columns. This can significantly
+   * reduce I/O by skipping row groups where delete keys don't overlap.
+   * Default is false.
+   */
+  public static final String MERGE_JOIN_ENABLED = "merge-join-opt.enabled";
+
+  public static final boolean MERGE_JOIN_ENABLED_DEFAULT = false;
+
   private static final Result EMPTY_RESULT =
       ImmutableConvertEqualityDeleteFiles.Result.builder()
           .convertedEqualityDeleteFilesCount(0)
@@ -241,6 +251,7 @@ public class ConvertEqualityDeleteFilesSparkAction
   private String cacheMountPath = null;
   private String cacheS3Prefix = null;
   private int maxTasksPerGroup = MAX_TASKS_PER_GROUP_DEFAULT;
+  private boolean mergeJoinEnabled = MERGE_JOIN_ENABLED_DEFAULT;
 
   ConvertEqualityDeleteFilesSparkAction(SparkSession spark, Table table) {
     super(spark);
@@ -281,6 +292,9 @@ public class ConvertEqualityDeleteFilesSparkAction
     this.maxTasksPerGroup =
         PropertyUtil.propertyAsInt(
             options(), MAX_TASKS_PER_GROUP, MAX_TASKS_PER_GROUP_DEFAULT);
+    this.mergeJoinEnabled =
+        PropertyUtil.propertyAsBoolean(
+            options(), MERGE_JOIN_ENABLED, MERGE_JOIN_ENABLED_DEFAULT);
 
     // Cache options for s3fs/FUSE mount
     this.cacheMountPath = options().get(CACHE_MOUNT_PATH);
@@ -1235,7 +1249,8 @@ public class ConvertEqualityDeleteFilesSparkAction
             cacheMountPath,
             cacheS3Prefix,
             groupIndex,
-            operationId));
+            operationId,
+            mergeJoinEnabled));
 
     // Set job group and description, then submit async
     String desc = String.format("ConvertEqDeletes: %s group=%d data_files=%d eq_delete_keys=%d",
@@ -1471,6 +1486,7 @@ public class ConvertEqualityDeleteFilesSparkAction
     private final String cacheS3Prefix;
     private final int groupIndex;
     private final String operationId;
+    private final boolean mergeJoinEnabled;
 
     ProcessPartitionFunction(
         Broadcast<Table> tableBroadcast,
@@ -1480,7 +1496,8 @@ public class ConvertEqualityDeleteFilesSparkAction
         String cacheMountPath,
         String cacheS3Prefix,
         int groupIndex,
-        String operationId) {
+        String operationId,
+        boolean mergeJoinEnabled) {
       this.tableBroadcast = tableBroadcast;
       this.eqDeleteKeysBroadcast = eqDeleteKeysBroadcast;
       this.deleteSchema = deleteSchema;
@@ -1489,6 +1506,7 @@ public class ConvertEqualityDeleteFilesSparkAction
       this.cacheS3Prefix = cacheS3Prefix;
       this.groupIndex = groupIndex;
       this.operationId = operationId;
+      this.mergeJoinEnabled = mergeJoinEnabled;
     }
 
     @Override
@@ -1729,13 +1747,16 @@ public class ConvertEqualityDeleteFilesSparkAction
 
         // Use row-group level merge join for Parquet files with Long or Decimal column
         // This allows skipping row groups where delete keys don't overlap
-        boolean useRowGroupMergeJoinLong = isSorted
+        // Requires merge-join-opt.enabled=true
+        boolean useRowGroupMergeJoinLong = mergeJoinEnabled
+            && isSorted
             && isSingleLongColumn
             && sortedLongKeys != null
             && longToIndex > longFromIndex
             && fileInfo.format() == FileFormat.PARQUET;
 
-        boolean useRowGroupMergeJoinDecimal = isSorted
+        boolean useRowGroupMergeJoinDecimal = mergeJoinEnabled
+            && isSorted
             && isSingleDecimalColumn
             && sortedDecimalKeys != null
             && sortedDecimalKeys.length > 0

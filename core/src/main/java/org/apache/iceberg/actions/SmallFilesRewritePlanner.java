@@ -118,6 +118,16 @@ public class SmallFilesRewritePlanner
 
   public static final double DELETE_RATIO_THRESHOLD_DEFAULT = 0.3;
 
+  /**
+   * If enabled, single Long/Integer/Decimal PK files will always be sorted for merge join
+   * optimization in convert_equality_deletes. When disabled, sorting only happens when
+   * a group will split into multiple files (for good bounds).
+   * Default is false.
+   */
+  public static final String MERGE_JOIN_ENABLED = "merge-join-opt.enabled";
+
+  public static final boolean MERGE_JOIN_ENABLED_DEFAULT = false;
+
   private final Expression filter;
   private final Long snapshotId;
   private final boolean caseSensitive;
@@ -134,6 +144,7 @@ public class SmallFilesRewritePlanner
   private boolean singleLongPk;
   private boolean useIdentifierKeys;
   private boolean useUuidPrefixBucketing;
+  private boolean mergeJoinEnabled;
 
   public SmallFilesRewritePlanner(Table table) {
     this(table, Expressions.alwaysTrue());
@@ -166,6 +177,7 @@ public class SmallFilesRewritePlanner
         .add(DELETE_FILES_ONLY)
         .add(DELETE_FILE_THRESHOLD)
         .add(DELETE_RATIO_THRESHOLD)
+        .add(MERGE_JOIN_ENABLED)
         .build();
   }
 
@@ -254,6 +266,9 @@ public class SmallFilesRewritePlanner
     this.useUuidPrefixBucketing =
         PropertyUtil.propertyAsBoolean(options, USE_UUID_PREFIX_BUCKETING, false);
 
+    this.mergeJoinEnabled =
+        PropertyUtil.propertyAsBoolean(options, MERGE_JOIN_ENABLED, MERGE_JOIN_ENABLED_DEFAULT);
+
     // Initialize sort order when identifier keys are available
     if (useIdentifierKeys && !columnFieldIds.isEmpty()) {
       initSortOrder();
@@ -274,16 +289,15 @@ public class SmallFilesRewritePlanner
     // Single Long/Integer/Decimal PK benefits from merge join optimization
     this.singleLongPk = isSingleLongOrDecimalIdentifierKey(identifierFieldIds);
 
-    if (singleLongPk) {
+    if (singleLongPk && mergeJoinEnabled) {
       LOG.info(
-          "SMALL_FILES [{}]: single Long/Integer/Decimal PK detected, "
+          "SMALL_FILES [{}]: single Long/Integer/Decimal PK with merge-join-opt.enabled=true, "
               + "will always sort for merge join optimization (sortOrderId={})",
           table().name(),
           sortOrderId);
     } else {
       LOG.info(
-          "SMALL_FILES [{}]: composite or non-numeric PK, "
-              + "will sort only when group splits into multiple files (sortOrderId={})",
+          "SMALL_FILES [{}]: will sort only when group splits into multiple files (sortOrderId={})",
           table().name(),
           sortOrderId);
     }
@@ -324,9 +338,9 @@ public class SmallFilesRewritePlanner
    * <p>Sort order is needed in two cases:
    *
    * <ul>
-   *   <li>Single Long/Integer/Decimal PK: always sort for merge join optimization in eq delete
-   *       convert
-   *   <li>Composite PK: sort only when group will split into multiple files (for good bounds)
+   *   <li>Single Long/Integer/Decimal PK with merge-join-opt.enabled=true: always sort for merge
+   *       join optimization in eq delete convert
+   *   <li>Any PK when group will split into multiple files: sort for good bounds
    * </ul>
    *
    * @param inputSize total size of input files in the group
@@ -338,12 +352,12 @@ public class SmallFilesRewritePlanner
       return null; // no identifier keys configured
     }
 
-    // Single Long PK - always sort for merge join optimization
-    if (singleLongPk) {
+    // Single Long PK with merge join enabled - always sort for merge join optimization
+    if (mergeJoinEnabled && singleLongPk) {
       return sortOrderId;
     }
 
-    // Composite PK - sort only if group will split into multiple files
+    // Sort only if group will split into multiple files (for good bounds)
     // Use the actual maxFileSize for this group (loners have smaller maxFileSize)
     if (inputSize > maxFileSize) {
       return sortOrderId;
@@ -520,8 +534,8 @@ public class SmallFilesRewritePlanner
         smallFiles.size());
 
     // Large files: each in its own group
-    // Sort only for single Long PK (merge join optimization), not for bounds (single file per group)
-    Integer largeSortOrderId = singleLongPk ? sortOrderId : null;
+    // Sort only for single Long PK with merge join enabled, not for bounds (single file per group)
+    Integer largeSortOrderId = (mergeJoinEnabled && singleLongPk) ? sortOrderId : null;
     for (FileScanTask largeFile : largeFilesWithDeletes) {
       selectedGroups.add(
           createRewriteGroup(
