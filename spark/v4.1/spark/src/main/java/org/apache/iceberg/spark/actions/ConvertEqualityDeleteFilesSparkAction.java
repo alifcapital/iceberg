@@ -22,6 +22,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -29,6 +30,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.math.BigDecimal;
+import java.nio.CharBuffer;
 import java.nio.ByteBuffer;
 import java.util.Set;
 import java.util.UUID;
@@ -86,6 +88,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.source.SerializableTableWithSize;
+import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.PropertyUtil;
@@ -1375,6 +1378,25 @@ public class ConvertEqualityDeleteFilesSparkAction
     return null;
   }
 
+  /** Extract bound for a field from serialized bounds map using Iceberg conversions. */
+  private static <T> T extractBound(
+      Map<Integer, byte[]> bounds, int fieldId, org.apache.iceberg.types.Type type) {
+    if (bounds == null) {
+      return null;
+    }
+    byte[] bytes = bounds.get(fieldId);
+    if (bytes == null) {
+      return null;
+    }
+    Object value = Conversions.fromByteBuffer(type, ByteBuffer.wrap(bytes));
+    if (value instanceof CharBuffer) {
+      value = value.toString();
+    }
+    @SuppressWarnings("unchecked")
+    T result = (T) value;
+    return result;
+  }
+
   /** Convert ByteBuffer bounds map to byte[] for serialization. */
   private static Map<Integer, byte[]> convertBounds(Map<Integer, ByteBuffer> bounds) {
     if (bounds == null) {
@@ -1532,15 +1554,28 @@ public class ConvertEqualityDeleteFilesSparkAction
       // Nulls are handled separately via hash join fallback
       Types.NestedField firstCol = deleteSchema.columns().get(0);
       int eqDeleteFieldId = firstCol.fieldId();
-      List<Long> sortedLongKeys = null;
+      org.apache.iceberg.types.Type eqDeleteFieldType = firstCol.type();
+      long[] sortedLongKeys = null;
       List<String> sortedStringKeys = null;
-      List<BigDecimal> sortedDecimalKeys = null;
+      BigDecimal[] sortedDecimalKeys = null;
 
       if (isSingleLongColumn && longKeys != null) {
-        sortedLongKeys = longKeys.stream()
-            .filter(k -> k != null)
-            .sorted()
-            .collect(Collectors.toList());
+        int keyCount = longKeys.size();
+        if (longKeys.contains(null)) {
+          keyCount -= 1;
+        }
+        long[] keys = new long[Math.max(0, keyCount)];
+        int idx = 0;
+        for (Long key : longKeys) {
+          if (key != null) {
+            keys[idx++] = key;
+          }
+        }
+        if (idx != keys.length) {
+          keys = Arrays.copyOf(keys, idx);
+        }
+        Arrays.sort(keys);
+        sortedLongKeys = keys;
       } else if (isSingleStringColumn && stringKeys != null) {
         sortedStringKeys = stringKeys.stream()
             .filter(k -> k != null)
@@ -1550,8 +1585,22 @@ public class ConvertEqualityDeleteFilesSparkAction
         sortedDecimalKeys = decimalKeys.stream()
             .filter(k -> k != null)
             .sorted()
-            .collect(Collectors.toList());
+            .toArray(BigDecimal[]::new);
       }
+
+      // Precompute min/max delete keys for fast file-level bounds skipping
+      Long minLongKey = (sortedLongKeys != null && sortedLongKeys.length > 0)
+          ? sortedLongKeys[0] : null;
+      Long maxLongKey = (sortedLongKeys != null && sortedLongKeys.length > 0)
+          ? sortedLongKeys[sortedLongKeys.length - 1] : null;
+      String minStringKey = (sortedStringKeys != null && !sortedStringKeys.isEmpty())
+          ? sortedStringKeys.get(0) : null;
+      String maxStringKey = (sortedStringKeys != null && !sortedStringKeys.isEmpty())
+          ? sortedStringKeys.get(sortedStringKeys.size() - 1) : null;
+      BigDecimal minDecimalKey = (sortedDecimalKeys != null && sortedDecimalKeys.length > 0)
+          ? sortedDecimalKeys[0] : null;
+      BigDecimal maxDecimalKey = (sortedDecimalKeys != null && sortedDecimalKeys.length > 0)
+          ? sortedDecimalKeys[sortedDecimalKeys.length - 1] : null;
 
       // Check if any delete keys contain null (need hash join for null matching)
       boolean hasNullDeleteKey = (isSingleLongColumn && longKeys != null && longKeys.contains(null))
@@ -1570,30 +1619,76 @@ public class ConvertEqualityDeleteFilesSparkAction
         metricFilesProcessed++;
         List<PositionDelete<Record>> matches = Lists.newArrayList();
 
+        // Fast file-level bounds skip using delete key min/max
+        if (!hasNullDeleteKey) {
+          boolean skipByBounds = false;
+          if (isSingleLongColumn && minLongKey != null && maxLongKey != null) {
+            Long fileLower = extractLongBound(fileInfo.lowerBounds(), eqDeleteFieldId);
+            Long fileUpper = extractLongBound(fileInfo.upperBounds(), eqDeleteFieldId);
+            if (fileLower != null && fileUpper != null
+                && (maxLongKey < fileLower || minLongKey > fileUpper)) {
+              skipByBounds = true;
+            }
+          } else if (isSingleStringColumn && minStringKey != null && maxStringKey != null) {
+            String fileLower = extractBound(fileInfo.lowerBounds(), eqDeleteFieldId, eqDeleteFieldType);
+            String fileUpper = extractBound(fileInfo.upperBounds(), eqDeleteFieldId, eqDeleteFieldType);
+            if (fileLower != null && fileUpper != null
+                && (maxStringKey.compareTo(fileLower) < 0 || minStringKey.compareTo(fileUpper) > 0)) {
+              skipByBounds = true;
+            }
+          } else if (isSingleDecimalColumn && minDecimalKey != null && maxDecimalKey != null) {
+            BigDecimal fileLower = extractBound(fileInfo.lowerBounds(), eqDeleteFieldId, eqDeleteFieldType);
+            BigDecimal fileUpper = extractBound(fileInfo.upperBounds(), eqDeleteFieldId, eqDeleteFieldType);
+            if (fileLower != null && fileUpper != null
+                && (maxDecimalKey.compareTo(fileLower) < 0 || minDecimalKey.compareTo(fileUpper) > 0)) {
+              skipByBounds = true;
+            }
+          }
+
+          if (skipByBounds) {
+            metricFilesSkipped++;
+            metricDataRecordsTotal += fileInfo.recordCount();
+            continue;
+          }
+        }
+
         InputFile inputFile = getInputFileWithCache(fileInfo.path(), table, cacheMountPath, cacheS3Prefix);
 
         // Filter delete keys by file bounds for more precise bloom filter
-        List<Long> filteredLongKeys = sortedLongKeys;
+        int longFromIndex = 0;
+        int longToIndex = sortedLongKeys != null ? sortedLongKeys.length : 0;
         Set<Long> filteredLongKeysSet = longKeys;
-        if (isSingleLongColumn && sortedLongKeys != null && !sortedLongKeys.isEmpty()) {
+        if (isSingleLongColumn && sortedLongKeys != null && sortedLongKeys.length > 0) {
           Long fileLower = extractLongBound(fileInfo.lowerBounds(), eqDeleteFieldId);
           Long fileUpper = extractLongBound(fileInfo.upperBounds(), eqDeleteFieldId);
           if (fileLower != null && fileUpper != null) {
             // Binary search to find range of keys within file bounds
-            int fromIndex = Collections.binarySearch(sortedLongKeys, fileLower);
+            int fromIndex = Arrays.binarySearch(sortedLongKeys, fileLower);
             if (fromIndex < 0) {
               fromIndex = -(fromIndex + 1);
             }
-            int toIndex = Collections.binarySearch(sortedLongKeys, fileUpper);
+            int toIndex = Arrays.binarySearch(sortedLongKeys, fileUpper);
             if (toIndex < 0) {
               toIndex = -(toIndex + 1);
             } else {
               toIndex++; // include the matching key
             }
-            if (fromIndex < toIndex && fromIndex < sortedLongKeys.size()) {
-              filteredLongKeys = sortedLongKeys.subList(fromIndex, Math.min(toIndex, sortedLongKeys.size()));
-              filteredLongKeysSet = new HashSet<>(filteredLongKeys);
+            if (fromIndex < toIndex && fromIndex < sortedLongKeys.length) {
+              longFromIndex = fromIndex;
+              longToIndex = Math.min(toIndex, sortedLongKeys.length);
             }
+          }
+        }
+        if (isSingleLongColumn && longFromIndex >= longToIndex && !hasNullDeleteKey) {
+          metricFilesSkipped++;
+          metricDataRecordsTotal += fileInfo.recordCount();
+          continue;
+        }
+        if (isSingleLongColumn && sortedLongKeys != null
+            && (longFromIndex != 0 || longToIndex != sortedLongKeys.length)) {
+          filteredLongKeysSet = new HashSet<>(Math.max(1, longToIndex - longFromIndex));
+          for (int i = longFromIndex; i < longToIndex; i++) {
+            filteredLongKeysSet.add(sortedLongKeys[i]);
           }
         }
 
@@ -1637,19 +1732,21 @@ public class ConvertEqualityDeleteFilesSparkAction
         boolean useRowGroupMergeJoinLong = isSorted
             && isSingleLongColumn
             && sortedLongKeys != null
+            && longToIndex > longFromIndex
             && fileInfo.format() == FileFormat.PARQUET;
 
         boolean useRowGroupMergeJoinDecimal = isSorted
             && isSingleDecimalColumn
             && sortedDecimalKeys != null
+            && sortedDecimalKeys.length > 0
             && fileInfo.format() == FileFormat.PARQUET;
 
         if (useRowGroupMergeJoinLong) {
           LOG.debug("Using ROW_GROUP_MERGE_JOIN path for file={}, sorted={}, longColumn={}, deleteKeysCount={}",
-              fileInfo.path(), isSorted, isSingleLongColumn, filteredLongKeys.size());
+              fileInfo.path(), isSorted, isSingleLongColumn, longToIndex - longFromIndex);
           try {
             ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.execute(
-                inputFile, projectionSchema, filteredLongKeys,
+                inputFile, projectionSchema, sortedLongKeys, longFromIndex, longToIndex,
                 eqDeleteFieldId, eqColumnName, fileInfo.path(), bloomFilter);
             matches.addAll(result.matches);
             recordsScannedInFile = result.recordsScanned;
@@ -1659,10 +1756,10 @@ public class ConvertEqualityDeleteFilesSparkAction
           }
         } else if (useRowGroupMergeJoinDecimal) {
           LOG.debug("Using ROW_GROUP_MERGE_JOIN path for file={}, sorted={}, decimalColumn={}, deleteKeysCount={}",
-              fileInfo.path(), isSorted, isSingleDecimalColumn, sortedDecimalKeys.size());
+              fileInfo.path(), isSorted, isSingleDecimalColumn, sortedDecimalKeys.length);
           try {
             ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.executeDecimal(
-                inputFile, projectionSchema, sortedDecimalKeys,
+                inputFile, projectionSchema, sortedDecimalKeys, 0, sortedDecimalKeys.length,
                 eqDeleteFieldId, eqColumnName, fileInfo.path(), bloomFilter);
             matches.addAll(result.matches);
             recordsScannedInFile = result.recordsScanned;
