@@ -130,8 +130,8 @@ public class SmallFilesRewritePlanner
   private boolean deleteFilesOnly;
   private int deleteFileThreshold;
   private double deleteRatioThreshold;
-  private Integer largeSortOrderId;
-  private Integer smallSortOrderId;
+  private Integer sortOrderId;
+  private boolean singleLongPk;
   private boolean useIdentifierKeys;
   private boolean useUuidPrefixBucketing;
 
@@ -254,40 +254,38 @@ public class SmallFilesRewritePlanner
     this.useUuidPrefixBucketing =
         PropertyUtil.propertyAsBoolean(options, USE_UUID_PREFIX_BUCKETING, false);
 
-    // Initialize sort order IDs when identifier keys are available
+    // Initialize sort order when identifier keys are available
     if (useIdentifierKeys && !columnFieldIds.isEmpty()) {
-      initSortOrderIds();
+      initSortOrder();
     }
   }
 
   /**
-   * Initialize sort order IDs. Small files always use full identifier key sort for good bounds.
-   * Large files (in delete-files-only mode) use single PK sort if applicable for eq delete convert
-   * optimization.
+   * Initialize sort order. Single Long/Integer/Decimal PK always gets sorted (for merge join
+   * optimization). Composite PK is sorted only when group splits into multiple files.
    */
-  private void initSortOrderIds() {
+  private void initSortOrder() {
     Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
 
-    // Sort order for small files: full identifier keys sort
-    SortOrder smallFilesSortOrder = buildSortOrderFromFieldIds(columnFieldIds);
-    this.smallSortOrderId = ensureSortOrderRegistered(smallFilesSortOrder);
+    // Register sort order for identifier keys
+    SortOrder identifierKeysSortOrder = buildSortOrderFromFieldIds(columnFieldIds);
+    this.sortOrderId = ensureSortOrderRegistered(identifierKeysSortOrder);
 
-    // Sort order for large files: single Long/Integer/Decimal PK or unsorted
-    if (isSingleLongOrDecimalIdentifierKey(identifierFieldIds)) {
-      // Single Long/Integer/Decimal PK - sort helps ROW_GROUP_MERGE_JOIN in eq delete convert
-      SortOrder largeSortOrder = buildSortOrderFromFieldIds(columnFieldIds);
-      this.largeSortOrderId = ensureSortOrderRegistered(largeSortOrder);
+    // Single Long/Integer/Decimal PK benefits from merge join optimization
+    this.singleLongPk = isSingleLongOrDecimalIdentifierKey(identifierFieldIds);
+
+    if (singleLongPk) {
       LOG.info(
-          "SMALL_FILES [{}]: delete-files-only: single Long/Integer/Decimal PK detected, "
-              + "large files will be sorted (sortOrderId={})",
+          "SMALL_FILES [{}]: single Long/Integer/Decimal PK detected, "
+              + "will always sort for merge join optimization (sortOrderId={})",
           table().name(),
-          largeSortOrderId);
+          sortOrderId);
     } else {
-      // Composite PK or non-numeric type - sorting won't help eq delete convert
-      this.largeSortOrderId = null; // null means unsorted
       LOG.info(
-          "SMALL_FILES [{}]: delete-files-only: composite or non-numeric PK, large files will be unsorted",
-          table().name());
+          "SMALL_FILES [{}]: composite or non-numeric PK, "
+              + "will sort only when group splits into multiple files (sortOrderId={})",
+          table().name(),
+          sortOrderId);
     }
   }
 
@@ -318,6 +316,40 @@ public class SmallFilesRewritePlanner
     return typeId == Type.TypeID.LONG
         || typeId == Type.TypeID.INTEGER
         || typeId == Type.TypeID.DECIMAL;
+  }
+
+  /**
+   * Determines sort order ID for a file group based on its size and target file size.
+   *
+   * <p>Sort order is needed in two cases:
+   *
+   * <ul>
+   *   <li>Single Long/Integer/Decimal PK: always sort for merge join optimization in eq delete
+   *       convert
+   *   <li>Composite PK: sort only when group will split into multiple files (for good bounds)
+   * </ul>
+   *
+   * @param inputSize total size of input files in the group
+   * @param maxFileSize max file size for this group (affects split calculation)
+   * @return sort order ID or null if sorting is not needed
+   */
+  private Integer getSortOrderIdForGroup(long inputSize, long maxFileSize) {
+    if (sortOrderId == null) {
+      return null; // no identifier keys configured
+    }
+
+    // Single Long PK - always sort for merge join optimization
+    if (singleLongPk) {
+      return sortOrderId;
+    }
+
+    // Composite PK - sort only if group will split into multiple files
+    // Use the actual maxFileSize for this group (loners have smaller maxFileSize)
+    if (inputSize > maxFileSize) {
+      return sortOrderId;
+    }
+
+    return null; // single output file - sorting won't improve bounds
   }
 
   /**
@@ -487,7 +519,9 @@ public class SmallFilesRewritePlanner
         largeFilesWithDeletes.size(),
         smallFiles.size());
 
-    // Large files: each in its own group with largeSortOrderId
+    // Large files: each in its own group
+    // Sort only for single Long PK (merge join optimization), not for bounds (single file per group)
+    Integer largeSortOrderId = singleLongPk ? sortOrderId : null;
     for (FileScanTask largeFile : largeFilesWithDeletes) {
       selectedGroups.add(
           createRewriteGroup(
@@ -498,7 +532,7 @@ public class SmallFilesRewritePlanner
               largeSortOrderId));
     }
 
-    // Small files: use normal small files logic with smallSortOrderId
+    // Small files: use normal small files logic
     if (smallFiles.size() >= 2) {
       // Get ALL large files for covered ranges calculation
       List<FileScanTask> largeFilesForRanges =
@@ -507,13 +541,7 @@ public class SmallFilesRewritePlanner
               .collect(Collectors.toList());
 
       planSmallFilesWithSortOrderId(
-          ctx,
-          partition,
-          smallFiles,
-          largeFilesForRanges,
-          unsortedFallback,
-          selectedGroups,
-          smallSortOrderId);
+          ctx, partition, smallFiles, largeFilesForRanges, unsortedFallback, selectedGroups);
     }
   }
 
@@ -545,25 +573,26 @@ public class SmallFilesRewritePlanner
     }
 
     planSmallFilesWithSortOrderId(
-        ctx, partition, smallFiles, largeFiles, unsortedFallback, selectedGroups, smallSortOrderId);
+        ctx, partition, smallFiles, largeFiles, unsortedFallback, selectedGroups);
   }
 
-  /** Plan small files with optional sortOrderId. */
+  /** Plan small files - sortOrderId is determined per-group based on expected output files. */
   private void planSmallFilesWithSortOrderId(
       RewriteExecutionContext ctx,
       StructLike partition,
       List<FileScanTask> smallFiles,
       List<FileScanTask> largeFiles,
       boolean unsortedFallback,
-      List<RewriteFileGroup> selectedGroups,
-      Integer sortOrderId) {
+      List<RewriteFileGroup> selectedGroups) {
 
     if (unsortedFallback) {
       // Unsorted fallback: group all small files without overlap analysis
       for (List<FileScanTask> group : groupFiles(smallFiles)) {
         if (enoughInputFiles(group)) {
+          long inputSize = inputSize(group);
+          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, writeMaxFileSize());
           selectedGroups.add(
-              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), sortOrderId));
+              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), groupSortOrderId));
         }
       }
     } else {
@@ -618,14 +647,18 @@ public class SmallFilesRewritePlanner
       // Create groups for cleanZone and overlap files (standard writeMaxFileSize)
       for (List<FileScanTask> group : cleanZoneGroups) {
         if (enoughInputFiles(group)) {
+          long inputSize = inputSize(group);
+          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, writeMaxFileSize());
           selectedGroups.add(
-              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), sortOrderId));
+              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), groupSortOrderId));
         }
       }
       for (List<FileScanTask> group : overlapGroups) {
         if (enoughInputFiles(group)) {
+          long inputSize = inputSize(group);
+          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, writeMaxFileSize());
           selectedGroups.add(
-              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), sortOrderId));
+              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), groupSortOrderId));
         }
       }
       // Create groups for loners (smaller writeMaxFileSize so they grow gradually)
@@ -639,8 +672,10 @@ public class SmallFilesRewritePlanner
       } else {
         for (List<FileScanTask> group : lonerGroups) {
           if (enoughInputFiles(group)) {
+            long inputSize = inputSize(group);
+            Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, lonerWriteMaxFileSize);
             selectedGroups.add(
-                createRewriteGroup(ctx, partition, group, lonerWriteMaxFileSize, sortOrderId));
+                createRewriteGroup(ctx, partition, group, lonerWriteMaxFileSize, groupSortOrderId));
           }
         }
       }
