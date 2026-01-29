@@ -33,6 +33,7 @@ import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.parquet.ParquetBloomRowGroupFilter;
 import org.apache.iceberg.parquet.ParquetDictionaryRowGroupFilter;
+import org.apache.iceberg.parquet.ParquetSchemaUtil;
 import org.apache.iceberg.parquet.ParquetValueReader;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
@@ -239,9 +240,13 @@ class ParquetRowGroupMergeJoin {
       MessageType fileSchema = reader.getFileMetaData().getSchema();
       List<BlockMetaData> rowGroups = reader.getRowGroups();
 
+      // Project only the columns we need (eq delete column) to avoid reading entire file
+      MessageType projectedSchema = ParquetSchemaUtil.pruneColumns(fileSchema, readSchema);
+      reader.setRequestedSchema(projectedSchema);
+
       // Create Iceberg reader for records (without ROW_POSITION)
       ParquetValueReader<Record> model =
-          (ParquetValueReader<Record>) GenericParquetReaders.buildReader(readSchema, fileSchema);
+          (ParquetValueReader<Record>) GenericParquetReaders.buildReader(readSchema, projectedSchema);
 
       int deletePtr = 0; // Shared across row groups for efficiency
       long rowPosition = 0; // Track row position manually
