@@ -485,15 +485,15 @@ public class SmallFilesRewritePlanner
       if (deleteFilesOnly) {
         // delete-files-only mode: process files with delete files + tiny files
         planDeleteFilesOnly(ctx, partition, filesWithBounds, selectedGroups);
-        // Also merge tiny files (< 4 MB) using standard small files logic
+        // Also merge tiny files (< 4 MB) using standard small files logic, no sorting
         planSmallFiles(
             ctx, partition, filesWithBounds, unsortedFallback, selectedGroups,
-            lonerWriteMaxFileSize, lonerWriteMaxFileSize);
+            lonerWriteMaxFileSize, lonerWriteMaxFileSize, true);
       } else {
         // Normal mode: merge small files
         planSmallFiles(
             ctx, partition, filesWithBounds, unsortedFallback, selectedGroups,
-            minFileSize(), writeMaxFileSize());
+            minFileSize(), writeMaxFileSize(), false);
       }
     }
 
@@ -556,6 +556,7 @@ public class SmallFilesRewritePlanner
    *
    * @param smallFileThreshold files below this size are considered "small"
    * @param targetFileSize target size for output files
+   * @param skipSorting if true, do not apply sort order to output files
    */
   private void planSmallFiles(
       RewriteExecutionContext ctx,
@@ -564,7 +565,8 @@ public class SmallFilesRewritePlanner
       boolean unsortedFallback,
       List<RewriteFileGroup> selectedGroups,
       long smallFileThreshold,
-      long targetFileSize) {
+      long targetFileSize,
+      boolean skipSorting) {
 
     // Separate into large and small files based on threshold
     List<FileScanTask> largeFiles =
@@ -591,13 +593,15 @@ public class SmallFilesRewritePlanner
     }
 
     planSmallFilesWithSortOrderId(
-        ctx, partition, smallFiles, largeFiles, unsortedFallback, selectedGroups, targetFileSize);
+        ctx, partition, smallFiles, largeFiles, unsortedFallback, selectedGroups,
+        targetFileSize, skipSorting);
   }
 
   /**
    * Plan small files - sortOrderId is determined per-group based on expected output files.
    *
    * @param targetFileSize target size for output files (cleanZone and overlap groups)
+   * @param skipSorting if true, do not apply sort order to output files
    */
   private void planSmallFilesWithSortOrderId(
       RewriteExecutionContext ctx,
@@ -606,7 +610,8 @@ public class SmallFilesRewritePlanner
       List<FileScanTask> largeFiles,
       boolean unsortedFallback,
       List<RewriteFileGroup> selectedGroups,
-      long targetFileSize) {
+      long targetFileSize,
+      boolean skipSorting) {
 
     // For loners, use the smaller of targetFileSize and lonerWriteMaxFileSize
     long lonerTargetFileSize = Math.min(targetFileSize, lonerWriteMaxFileSize);
@@ -616,7 +621,7 @@ public class SmallFilesRewritePlanner
       for (List<FileScanTask> group : groupFiles(smallFiles, targetFileSize)) {
         if (enoughInputFiles(group)) {
           long inputSize = inputSize(group);
-          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, targetFileSize);
+          Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, targetFileSize);
           selectedGroups.add(
               createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
         }
@@ -674,7 +679,7 @@ public class SmallFilesRewritePlanner
       for (List<FileScanTask> group : cleanZoneGroups) {
         if (enoughInputFiles(group)) {
           long inputSize = inputSize(group);
-          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, targetFileSize);
+          Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, targetFileSize);
           selectedGroups.add(
               createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
         }
@@ -682,7 +687,7 @@ public class SmallFilesRewritePlanner
       for (List<FileScanTask> group : overlapGroups) {
         if (enoughInputFiles(group)) {
           long inputSize = inputSize(group);
-          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, targetFileSize);
+          Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, targetFileSize);
           selectedGroups.add(
               createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
         }
@@ -699,7 +704,7 @@ public class SmallFilesRewritePlanner
         for (List<FileScanTask> group : lonerGroups) {
           if (enoughInputFiles(group)) {
             long inputSize = inputSize(group);
-            Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, lonerTargetFileSize);
+            Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, lonerTargetFileSize);
             selectedGroups.add(
                 createRewriteGroup(ctx, partition, group, lonerTargetFileSize, groupSortOrderId));
           }
