@@ -193,11 +193,6 @@ public class OverlapRewriteFilePlanner
     if (useUuidPrefixBucketing) {
       long totalSize = getTotalFilesSize();
       this.numBuckets = UuidBucketUtil.computeBuckets(totalSize, targetFileSize());
-      LOG.info(
-          "OVERLAP [{}]: UUID prefix bucketing enabled, totalSize={}, numBuckets={}",
-          table().name(),
-          totalSize,
-          numBuckets);
     }
   }
 

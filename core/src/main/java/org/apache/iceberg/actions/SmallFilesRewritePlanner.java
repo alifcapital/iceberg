@@ -144,6 +144,7 @@ public class SmallFilesRewritePlanner
   private boolean singleLongPk;
   private boolean useIdentifierKeys;
   private boolean useUuidPrefixBucketing;
+  private int numBuckets;
   private boolean mergeJoinEnabled;
 
   public SmallFilesRewritePlanner(Table table) {
@@ -265,6 +266,10 @@ public class SmallFilesRewritePlanner
 
     this.useUuidPrefixBucketing =
         PropertyUtil.propertyAsBoolean(options, USE_UUID_PREFIX_BUCKETING, false);
+    if (useUuidPrefixBucketing) {
+      long totalSize = getTotalFilesSize();
+      this.numBuckets = UuidBucketUtil.computeBuckets(totalSize, targetFileSize());
+    }
 
     this.mergeJoinEnabled =
         PropertyUtil.propertyAsBoolean(options, MERGE_JOIN_ENABLED, MERGE_JOIN_ENABLED_DEFAULT);
@@ -626,89 +631,171 @@ public class SmallFilesRewritePlanner
               createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
         }
       }
-    } else {
-      // Build covered ranges from large files (merged overlapping ranges)
-      List<CoveredRange> coveredRanges = buildCoveredRanges(largeFiles);
+      return;
+    }
 
-      // Categorize small files into 3 groups:
-      // 1. Clean zone files - entirely outside large file bounds
-      // 2. Overlap files - inside large bounds but overlap with other small files
-      // 3. Loners - inside large bounds, no overlap with other small files
-      List<FileScanTask> cleanZoneFiles = new ArrayList<>();
-      List<FileScanTask> insideLargeFiles = new ArrayList<>();
-
-      for (FileScanTask task : smallFiles) {
-        if (isInCleanZone(task, coveredRanges)) {
-          cleanZoneFiles.add(task);
-        } else {
-          insideLargeFiles.add(task);
-        }
-      }
-
-      // Group clean zone files using bin packing
-      List<List<FileScanTask>> cleanZoneGroups = groupFiles(cleanZoneFiles, targetFileSize);
-
-      // Group files inside large bounds by overlap clusters
-      // Returns: list of clusters (overlapping files) + list of loners
-      OverlapResult overlapResult = groupByOverlapClusters(insideLargeFiles);
-
-      // Bin pack each overlap cluster
-      List<List<FileScanTask>> overlapGroups = new ArrayList<>();
-      for (List<FileScanTask> cluster : overlapResult.clusters) {
-        overlapGroups.addAll(groupFiles(cluster, targetFileSize));
-      }
-
-      // Group loners together
-      List<List<FileScanTask>> lonerGroups = groupFiles(overlapResult.loners, lonerTargetFileSize);
-
-      int overlapFilesCount = overlapResult.clusters.stream().mapToInt(List::size).sum();
-      LOG.info(
-          "SMALL_FILES [{}]: partition={} | cleanZone: {} files -> {} groups | "
-              + "overlap: {} files ({} clusters) -> {} groups | loners: {} files -> {} groups",
-          table().name(),
-          partition,
-          cleanZoneFiles.size(),
-          cleanZoneGroups.size(),
-          overlapFilesCount,
-          overlapResult.clusters.size(),
-          overlapGroups.size(),
-          overlapResult.loners.size(),
-          lonerGroups.size());
-
-      // Create groups for cleanZone and overlap files
-      for (List<FileScanTask> group : cleanZoneGroups) {
-        if (enoughInputFiles(group)) {
-          long inputSize = inputSize(group);
-          Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, targetFileSize);
-          selectedGroups.add(
-              createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
-        }
-      }
-      for (List<FileScanTask> group : overlapGroups) {
-        if (enoughInputFiles(group)) {
-          long inputSize = inputSize(group);
-          Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, targetFileSize);
-          selectedGroups.add(
-              createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
-        }
-      }
-      // Create groups for loners (smaller target so they grow gradually)
-      // Skip loners if UUID prefix bucketing is enabled and bounds look like UUID
-      boolean skipLoners = useUuidPrefixBucketing && hasUuidBounds(overlapResult.loners);
-      if (skipLoners) {
-        LOG.info(
-            "SMALL_FILES [{}]: skipping {} loner files due to UUID prefix bucketing",
-            table().name(),
-            overlapResult.loners.size());
+    // Check if UUID bucketing should be used
+    if (useUuidPrefixBucketing && numBuckets > 0 && !smallFiles.isEmpty()) {
+      int firstBucket = getFileBucket(smallFiles.get(0));
+      if (firstBucket >= 0) {
+        // UUID detected - process per bucket
+        planSmallFilesPerBucket(
+            ctx, partition, smallFiles, largeFiles, selectedGroups,
+            targetFileSize, lonerTargetFileSize, skipSorting);
+        return;
       } else {
-        for (List<FileScanTask> group : lonerGroups) {
-          if (enoughInputFiles(group)) {
-            long inputSize = inputSize(group);
-            Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, lonerTargetFileSize);
-            selectedGroups.add(
-                createRewriteGroup(ctx, partition, group, lonerTargetFileSize, groupSortOrderId));
-          }
-        }
+        LOG.info(
+            "SMALL_FILES [{}]: UUID prefix bucketing skipped: bounds don't look like UUID",
+            table().name());
+      }
+    }
+
+    // Standard processing without UUID bucketing
+    planSmallFilesCleanZoneOverlap(
+        ctx, partition, smallFiles, largeFiles, selectedGroups,
+        targetFileSize, lonerTargetFileSize, skipSorting);
+  }
+
+  /**
+   * Plan small files with UUID bucket awareness - process each bucket independently.
+   */
+  private void planSmallFilesPerBucket(
+      RewriteExecutionContext ctx,
+      StructLike partition,
+      List<FileScanTask> smallFiles,
+      List<FileScanTask> largeFiles,
+      List<RewriteFileGroup> selectedGroups,
+      long targetFileSize,
+      long lonerTargetFileSize,
+      boolean skipSorting) {
+
+    // Group files by bucket
+    Map<Integer, List<FileScanTask>> smallByBucket = new java.util.HashMap<>();
+    Map<Integer, List<FileScanTask>> largeByBucket = new java.util.HashMap<>();
+
+    for (FileScanTask task : smallFiles) {
+      int bucket = getFileBucket(task);
+      if (bucket >= 0) {
+        smallByBucket.computeIfAbsent(bucket, k -> new ArrayList<>()).add(task);
+      }
+    }
+
+    for (FileScanTask task : largeFiles) {
+      int bucket = getFileBucket(task);
+      if (bucket >= 0) {
+        largeByBucket.computeIfAbsent(bucket, k -> new ArrayList<>()).add(task);
+      }
+    }
+
+    LOG.info(
+        "SMALL_FILES [{}]: partition={} | UUID bucketing: {} small files in {} buckets, numBuckets={}",
+        table().name(),
+        partition,
+        smallFiles.size(),
+        smallByBucket.size(),
+        numBuckets);
+
+    // Process each bucket independently
+    for (Map.Entry<Integer, List<FileScanTask>> entry : smallByBucket.entrySet()) {
+      int bucket = entry.getKey();
+      List<FileScanTask> bucketSmallFiles = entry.getValue();
+      List<FileScanTask> bucketLargeFiles = largeByBucket.getOrDefault(bucket, ImmutableList.of());
+
+      if (bucketSmallFiles.size() < 2) {
+        continue; // Need at least 2 small files to merge within a bucket
+      }
+
+      planSmallFilesCleanZoneOverlap(
+          ctx, partition, bucketSmallFiles, bucketLargeFiles, selectedGroups,
+          targetFileSize, lonerTargetFileSize, skipSorting);
+    }
+  }
+
+  /**
+   * Core logic for cleanZone/overlap/loners grouping.
+   */
+  private void planSmallFilesCleanZoneOverlap(
+      RewriteExecutionContext ctx,
+      StructLike partition,
+      List<FileScanTask> smallFiles,
+      List<FileScanTask> largeFiles,
+      List<RewriteFileGroup> selectedGroups,
+      long targetFileSize,
+      long lonerTargetFileSize,
+      boolean skipSorting) {
+
+    // Build covered ranges from large files (merged overlapping ranges)
+    List<CoveredRange> coveredRanges = buildCoveredRanges(largeFiles);
+
+    // Categorize small files into 3 groups:
+    // 1. Clean zone files - entirely outside large file bounds
+    // 2. Overlap files - inside large bounds but overlap with other small files
+    // 3. Loners - inside large bounds, no overlap with other small files
+    List<FileScanTask> cleanZoneFiles = new ArrayList<>();
+    List<FileScanTask> insideLargeFiles = new ArrayList<>();
+
+    for (FileScanTask task : smallFiles) {
+      if (isInCleanZone(task, coveredRanges)) {
+        cleanZoneFiles.add(task);
+      } else {
+        insideLargeFiles.add(task);
+      }
+    }
+
+    // Group clean zone files using bin packing
+    List<List<FileScanTask>> cleanZoneGroups = groupFiles(cleanZoneFiles, targetFileSize);
+
+    // Group files inside large bounds by overlap clusters
+    // Returns: list of clusters (overlapping files) + list of loners
+    OverlapResult overlapResult = groupByOverlapClusters(insideLargeFiles);
+
+    // Bin pack each overlap cluster
+    List<List<FileScanTask>> overlapGroups = new ArrayList<>();
+    for (List<FileScanTask> cluster : overlapResult.clusters) {
+      overlapGroups.addAll(groupFiles(cluster, targetFileSize));
+    }
+
+    // Group loners together
+    List<List<FileScanTask>> lonerGroups = groupFiles(overlapResult.loners, lonerTargetFileSize);
+
+    int overlapFilesCount = overlapResult.clusters.stream().mapToInt(List::size).sum();
+    LOG.info(
+        "SMALL_FILES [{}]: partition={} | cleanZone: {} files -> {} groups | "
+            + "overlap: {} files ({} clusters) -> {} groups | loners: {} files -> {} groups",
+        table().name(),
+        partition,
+        cleanZoneFiles.size(),
+        cleanZoneGroups.size(),
+        overlapFilesCount,
+        overlapResult.clusters.size(),
+        overlapGroups.size(),
+        overlapResult.loners.size(),
+        lonerGroups.size());
+
+    // Create groups for cleanZone and overlap files
+    for (List<FileScanTask> group : cleanZoneGroups) {
+      if (enoughInputFiles(group)) {
+        long inputSize = inputSize(group);
+        Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, targetFileSize);
+        selectedGroups.add(
+            createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
+      }
+    }
+    for (List<FileScanTask> group : overlapGroups) {
+      if (enoughInputFiles(group)) {
+        long inputSize = inputSize(group);
+        Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, targetFileSize);
+        selectedGroups.add(
+            createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
+      }
+    }
+    // Create groups for loners (smaller target so they grow gradually)
+    for (List<FileScanTask> group : lonerGroups) {
+      if (enoughInputFiles(group)) {
+        long inputSize = inputSize(group);
+        Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, lonerTargetFileSize);
+        selectedGroups.add(
+            createRewriteGroup(ctx, partition, group, lonerTargetFileSize, groupSortOrderId));
       }
     }
   }
@@ -1049,28 +1136,49 @@ public class SmallFilesRewritePlanner
         sortOrderId);
   }
 
+  /** Gets total files size from snapshot summary. */
+  private long getTotalFilesSize() {
+    if (table().currentSnapshot() == null) {
+      return 0;
+    }
+
+    String totalSizeStr = table().currentSnapshot().summary().get("total-files-size");
+    if (totalSizeStr == null) {
+      return 0;
+    }
+
+    try {
+      return Long.parseLong(totalSizeStr);
+    } catch (NumberFormatException e) {
+      return 0;
+    }
+  }
+
   /**
-   * Checks if loner files have UUID-like bounds.
-   * Only checks the first file - if it has UUID bounds, all do.
+   * Get the bucket for a file based on its lower bound.
+   * Returns -1 if bucket cannot be determined.
    */
-  private boolean hasUuidBounds(List<FileScanTask> loners) {
-    if (loners.isEmpty() || columnFieldIds.isEmpty()) {
-      return false;
+  private int getFileBucket(FileScanTask task) {
+    if (numBuckets <= 0 || columnFieldIds.isEmpty()) {
+      return -1;
     }
 
     int fieldId = columnFieldIds.get(0);
     Type type = columnTypes.get(0);
 
-    FileScanTask firstLoner = loners.get(0);
-    ByteBuffer lowerBuf = firstLoner.file().lowerBounds().get(fieldId);
+    ByteBuffer lowerBuf = task.file().lowerBounds() != null
+        ? task.file().lowerBounds().get(fieldId)
+        : null;
     if (lowerBuf == null) {
-      return false;
+      return -1;
     }
 
     Object lower = Conversions.fromByteBuffer(type, lowerBuf);
-    if (lower instanceof CharSequence) {
-      return UuidBucketUtil.looksLikeUuid(lower.toString());
+    if (!(lower instanceof CharSequence) || !UuidBucketUtil.looksLikeUuid(lower.toString())) {
+      return -1;
     }
-    return false;
+
+    int lowerHex = UuidBucketUtil.extractHexPrefix(lower);
+    return UuidBucketUtil.hexToBucket(lowerHex, numBuckets);
   }
 }
