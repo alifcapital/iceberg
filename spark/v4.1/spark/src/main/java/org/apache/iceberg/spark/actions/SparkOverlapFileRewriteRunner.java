@@ -207,4 +207,11 @@ class SparkOverlapFileRewriteRunner extends SparkShufflingFileRewriteRunner {
   protected boolean useUuidPrefixBucketing() {
     return useUuidPrefixBucketingOption() && sortOrder != null && sortOrder.isSorted();
   }
+
+  @Override
+  protected SortOrder uuidBucketingSortOrder(SortOrder groupSortOrder) {
+    // For ZORDER, groupSortOrder is Z_SORT_ORDER with fake field id=0
+    // Use the real sortOrder (based on columns) for UUID column lookup
+    return sortOrder;
+  }
 }

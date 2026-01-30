@@ -157,6 +157,13 @@ class SparkSmallFilesRewriteRunner extends SparkShufflingFileRewriteRunner {
   }
 
   @Override
+  protected SortOrder uuidBucketingSortOrder(SortOrder groupSortOrder) {
+    // For ZORDER, groupSortOrder is Z_SORT_ORDER with fake field id=0
+    // Use the real sortOrder (based on columns) for UUID column lookup
+    return sortOrder;
+  }
+
+  @Override
   protected SortOrder sortOrder() {
     return useZOrder ? Z_SORT_ORDER : sortOrder;
   }

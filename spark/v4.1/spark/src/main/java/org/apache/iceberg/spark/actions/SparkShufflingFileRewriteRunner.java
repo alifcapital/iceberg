@@ -255,11 +255,12 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
     // Check if UUID prefix bucketing is enabled and applicable
     if (useUuidPrefixBucketing() && uuidBuckets > 0) {
-      if (isFirstSortColumnUuid(groupSortOrder, group)) {
+      org.apache.iceberg.SortOrder uuidSortOrder = uuidBucketingSortOrder(groupSortOrder);
+      if (isFirstSortColumnUuid(uuidSortOrder, group)) {
         LOG.info("{} [{}]: Using UUID prefix bucketing with {} buckets", description(), table().name(), uuidBuckets);
         return df ->
             transformPlan(
-                df, plan -> uuidPrefixSortPlan(groupSortOrder, plan, ordering, uuidBuckets, numShufflePartitions));
+                df, plan -> uuidPrefixSortPlan(uuidSortOrder, plan, ordering, uuidBuckets, numShufflePartitions));
       } else {
         LOG.info("{} [{}]: UUID prefix bucketing skipped: bounds don't look like UUID", description(), table().name());
       }
@@ -270,6 +271,14 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   /** Override in subclass to enable UUID prefix bucketing. */
   protected boolean useUuidPrefixBucketing() {
     return false;
+  }
+
+  /**
+   * Returns the sort order to use for UUID prefix bucketing column lookup.
+   * For ZORDER, this should return the real sort order (not Z_SORT_ORDER).
+   */
+  protected org.apache.iceberg.SortOrder uuidBucketingSortOrder(org.apache.iceberg.SortOrder groupSortOrder) {
+    return groupSortOrder;
   }
 
   /**

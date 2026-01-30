@@ -40,6 +40,7 @@ import org.apache.spark.sql.types.IntegerType;
 import org.apache.spark.sql.types.LongType;
 import org.apache.spark.sql.types.ShortType;
 import org.apache.spark.sql.types.StringType;
+import org.apache.spark.sql.types.DecimalType;
 import org.apache.spark.sql.types.TimestampType;
 import scala.collection.JavaConverters;
 import scala.collection.Seq;
@@ -180,6 +181,50 @@ class SparkZOrderUDF implements Serializable {
     return udf;
   }
 
+  private static final int DECIMAL_BUFFER_SIZE = 16; // 128 bits for Decimal(38,0)
+  private static final byte[] DECIMAL_EMPTY = new byte[DECIMAL_BUFFER_SIZE];
+
+  private UserDefinedFunction decimalToOrderedBytesUDF() {
+    int position = inputCol;
+    UserDefinedFunction udf =
+        functions
+            .udf(
+                (java.math.BigDecimal value) -> {
+                  if (value == null) {
+                    return DECIMAL_EMPTY;
+                  }
+                  // Convert to BigInteger (works for any scale, effectively truncates to integer)
+                  java.math.BigInteger bigInt = value.toBigInteger();
+                  byte[] bytes = bigInt.toByteArray(); // two's complement, big-endian
+
+                  byte[] result = new byte[DECIMAL_BUFFER_SIZE];
+                  // Pad/truncate to 16 bytes, preserving sign extension
+                  if (bytes.length >= DECIMAL_BUFFER_SIZE) {
+                    // Take rightmost 16 bytes
+                    System.arraycopy(
+                        bytes, bytes.length - DECIMAL_BUFFER_SIZE, result, 0, DECIMAL_BUFFER_SIZE);
+                  } else {
+                    // Sign-extend: fill with 0x00 for positive, 0xFF for negative
+                    byte signByte = (bigInt.signum() < 0) ? (byte) 0xFF : (byte) 0x00;
+                    int padLen = DECIMAL_BUFFER_SIZE - bytes.length;
+                    for (int i = 0; i < padLen; i++) {
+                      result[i] = signByte;
+                    }
+                    System.arraycopy(bytes, 0, result, padLen, bytes.length);
+                  }
+                  // Flip sign bit for correct ordering (same as wholeNumberOrderedBytes)
+                  result[0] ^= (byte) 0x80;
+                  return result;
+                },
+                DataTypes.BinaryType)
+            .withName("DECIMAL_ORDERED_BYTES");
+
+    this.inputCol++;
+    increaseOutputSize(DECIMAL_BUFFER_SIZE);
+
+    return udf;
+  }
+
   private UserDefinedFunction floatToOrderedBytesUDF() {
     int position = inputCol;
     UserDefinedFunction udf =
@@ -311,6 +356,8 @@ class SparkZOrderUDF implements Serializable {
       return longToOrderedBytesUDF().apply(column.cast(DataTypes.LongType));
     } else if (type instanceof DateType) {
       return longToOrderedBytesUDF().apply(functions.unix_date(column).cast(DataTypes.LongType));
+    } else if (type instanceof DecimalType) {
+      return decimalToOrderedBytesUDF().apply(column);
     } else {
       throw new IllegalArgumentException(
           String.format(
