@@ -256,14 +256,17 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     int numShufflePartitions = Math.max(1, expectedOutputFiles * numShufflePartitionsPerFile);
 
     // Check if UUID prefix bucketing is enabled and applicable
-    if (useUuidPrefixBucketing() && uuidBuckets > 0 && isFirstSortColumnUuid(groupSortOrder, group)) {
-      LOG.info("{} [{}]: Using UUID prefix bucketing with {} buckets", description(), table().name(), uuidBuckets);
-      return df ->
-          transformPlan(
-              df, plan -> uuidPrefixSortPlan(groupSortOrder, plan, ordering, uuidBuckets, numShufflePartitions));
-    } else {
-      return df -> transformPlan(df, plan -> sortPlan(plan, ordering, numShufflePartitions));
+    if (useUuidPrefixBucketing() && uuidBuckets > 0) {
+      if (isFirstSortColumnUuid(groupSortOrder, group)) {
+        LOG.info("{} [{}]: Using UUID prefix bucketing with {} buckets", description(), table().name(), uuidBuckets);
+        return df ->
+            transformPlan(
+                df, plan -> uuidPrefixSortPlan(groupSortOrder, plan, ordering, uuidBuckets, numShufflePartitions));
+      } else {
+        LOG.info("{} [{}]: UUID prefix bucketing skipped: bounds don't look like UUID", description(), table().name());
+      }
     }
+    return df -> transformPlan(df, plan -> sortPlan(plan, ordering, numShufflePartitions));
   }
 
   /** Override in subclass to enable UUID prefix bucketing. */
