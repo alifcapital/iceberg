@@ -85,7 +85,6 @@ class SparkSmallFilesRewriteRunner extends SparkShufflingFileRewriteRunner {
               .map(table().schema()::findColumnName)
               .collect(Collectors.toList());
       this.sortOrder = buildSortOrderFromFieldIds(sortedFieldIds);
-      ensureSortOrderRegistered(this.sortOrder);
     } else {
       this.columns = parseColumnsOption(columnsOption);
       Preconditions.checkArgument(

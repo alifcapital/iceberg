@@ -30,17 +30,11 @@ import java.util.stream.Collectors;
 import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileScanTask;
-import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.NullOrder;
-import org.apache.iceberg.ReplaceSortOrder;
 import org.apache.iceberg.Schema;
-import org.apache.iceberg.SortDirection;
-import org.apache.iceberg.SortField;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.TableMetadata;
-import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.actions.RewriteDataFiles.FileGroupInfo;
@@ -118,16 +112,6 @@ public class SmallFilesRewritePlanner
 
   public static final double DELETE_RATIO_THRESHOLD_DEFAULT = 0.3;
 
-  /**
-   * If enabled, single Long/Integer/Decimal PK files will always be sorted for merge join
-   * optimization in convert_equality_deletes. When disabled, sorting only happens when
-   * a group will split into multiple files (for good bounds).
-   * Default is false.
-   */
-  public static final String MERGE_JOIN_ENABLED = "merge-join-opt.enabled";
-
-  public static final boolean MERGE_JOIN_ENABLED_DEFAULT = false;
-
   private final Expression filter;
   private final Long snapshotId;
   private final boolean caseSensitive;
@@ -141,11 +125,9 @@ public class SmallFilesRewritePlanner
   private int deleteFileThreshold;
   private double deleteRatioThreshold;
   private Integer sortOrderId;
-  private boolean singleLongPk;
   private boolean useIdentifierKeys;
   private boolean useUuidPrefixBucketing;
   private int numBuckets;
-  private boolean mergeJoinEnabled;
 
   public SmallFilesRewritePlanner(Table table) {
     this(table, Expressions.alwaysTrue());
@@ -178,7 +160,6 @@ public class SmallFilesRewritePlanner
         .add(DELETE_FILES_ONLY)
         .add(DELETE_FILE_THRESHOLD)
         .add(DELETE_RATIO_THRESHOLD)
-        .add(MERGE_JOIN_ENABLED)
         .build();
   }
 
@@ -271,9 +252,6 @@ public class SmallFilesRewritePlanner
       this.numBuckets = UuidBucketUtil.computeBuckets(totalSize, targetFileSize());
     }
 
-    this.mergeJoinEnabled =
-        PropertyUtil.propertyAsBoolean(options, MERGE_JOIN_ENABLED, MERGE_JOIN_ENABLED_DEFAULT);
-
     // Initialize sort order when identifier keys are available
     if (useIdentifierKeys && !columnFieldIds.isEmpty()) {
       initSortOrder();
@@ -281,31 +259,30 @@ public class SmallFilesRewritePlanner
   }
 
   /**
-   * Initialize sort order. Single Long/Integer/Decimal PK always gets sorted (for merge join
-   * optimization). Composite PK is sorted only when group splits into multiple files.
+   * Initialize sort order. Sorting is applied only when group splits into multiple files
+   * (for good bounds).
    */
   private void initSortOrder() {
-    Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
-
-    // Register sort order for identifier keys
+    // Build sort order for identifier keys (used when group splits into multiple files)
     SortOrder identifierKeysSortOrder = buildSortOrderFromFieldIds(columnFieldIds);
-    this.sortOrderId = ensureSortOrderRegistered(identifierKeysSortOrder);
+    this.sortOrderId = findMatchingSortOrder(identifierKeysSortOrder);
 
-    // Single Long/Integer/Decimal PK benefits from merge join optimization
-    this.singleLongPk = isSingleLongOrDecimalIdentifierKey(identifierFieldIds);
+    LOG.info(
+        "SMALL_FILES [{}]: will sort only when group splits into multiple files (sortOrderId={})",
+        table().name(),
+        sortOrderId);
+  }
 
-    if (singleLongPk && mergeJoinEnabled) {
-      LOG.info(
-          "SMALL_FILES [{}]: single Long/Integer/Decimal PK with merge-join-opt.enabled=true, "
-              + "will always sort for merge join optimization (sortOrderId={})",
-          table().name(),
-          sortOrderId);
-    } else {
-      LOG.info(
-          "SMALL_FILES [{}]: will sort only when group splits into multiple files (sortOrderId={})",
-          table().name(),
-          sortOrderId);
+  /**
+   * Find matching sort order in table without registering a new one.
+   * Returns the sort order ID if found, null otherwise.
+   */
+  private Integer findMatchingSortOrder(SortOrder newSortOrder) {
+    SortOrder existing = SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder);
+    if (existing.isSorted()) {
+      return existing.orderId();
     }
+    return null;
   }
 
   private SortOrder buildSortOrderFromFieldIds(List<Integer> fieldIds) {
@@ -319,34 +296,9 @@ public class SmallFilesRewritePlanner
   }
 
   /**
-   * Checks if identifier key is a single Long/Integer/Decimal column. These types benefit from
-   * ROW_GROUP_MERGE_JOIN optimization in eq delete convert.
-   */
-  private boolean isSingleLongOrDecimalIdentifierKey(Set<Integer> identifierFieldIds) {
-    if (identifierFieldIds.size() != 1) {
-      return false;
-    }
-    Integer fieldId = identifierFieldIds.iterator().next();
-    Types.NestedField field = table().schema().findField(fieldId);
-    if (field == null) {
-      return false;
-    }
-    Type.TypeID typeId = field.type().typeId();
-    return typeId == Type.TypeID.LONG
-        || typeId == Type.TypeID.INTEGER
-        || typeId == Type.TypeID.DECIMAL;
-  }
-
-  /**
    * Determines sort order ID for a file group based on its size and target file size.
    *
-   * <p>Sort order is needed in two cases:
-   *
-   * <ul>
-   *   <li>Single Long/Integer/Decimal PK with merge-join-opt.enabled=true: always sort for merge
-   *       join optimization in eq delete convert
-   *   <li>Any PK when group will split into multiple files: sort for good bounds
-   * </ul>
+   * <p>Sort order is needed when group will split into multiple files (for good bounds).
    *
    * @param inputSize total size of input files in the group
    * @param maxFileSize max file size for this group (affects split calculation)
@@ -357,11 +309,6 @@ public class SmallFilesRewritePlanner
       return null; // no identifier keys configured
     }
 
-    // Single Long PK with merge join enabled - always sort for merge join optimization
-    if (mergeJoinEnabled && singleLongPk) {
-      return sortOrderId;
-    }
-
     // Sort only if group will split into multiple files (for good bounds)
     // Use the actual maxFileSize for this group (loners have smaller maxFileSize)
     if (inputSize > maxFileSize) {
@@ -369,47 +316,6 @@ public class SmallFilesRewritePlanner
     }
 
     return null; // single output file - sorting won't improve bounds
-  }
-
-  /**
-   * Ensures the sort order is registered in the table and returns its ID. Returns the sort order ID
-   * if found or registered.
-   */
-  private Integer ensureSortOrderRegistered(SortOrder newSortOrder) {
-    // Check if matching sort order already exists
-    SortOrder existing = SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder);
-    if (existing.isSorted()) {
-      return existing.orderId();
-    }
-
-    // Need to add the sort order
-    if (table().sortOrder().isUnsorted()) {
-      // No default sort order - use replaceSortOrder (becomes default)
-      LOG.info("SMALL_FILES [{}]: registering sort order as table default", table().name());
-      ReplaceSortOrder replace = table().replaceSortOrder();
-      for (SortField field : newSortOrder.fields()) {
-        String columnName = table().schema().findColumnName(field.sourceId());
-        if (field.direction() == SortDirection.ASC) {
-          replace.asc(columnName, field.nullOrder());
-        } else {
-          replace.desc(columnName, field.nullOrder());
-        }
-      }
-      replace.commit();
-    } else {
-      // Has different default - use addSortOrder (don't change default)
-      LOG.info("SMALL_FILES [{}]: adding sort order without changing table default", table().name());
-      TableOperations ops = ((HasTableOperations) table()).operations();
-      TableMetadata current = ops.current();
-      TableMetadata updated = TableMetadata.buildFrom(current).addSortOrder(newSortOrder).build();
-      ops.commit(current, updated);
-    }
-
-    // Refresh to pick up the new sort order
-    table().refresh();
-    SortOrder registered = SortOrderUtil.maybeFindTableSortOrder(table(), newSortOrder);
-    LOG.info("SMALL_FILES [{}]: sort order registered with orderId={}", table().name(), registered.orderId());
-    return registered.orderId();
   }
 
   /** Returns true if file has too many delete files (>= threshold). */
@@ -543,8 +449,7 @@ public class SmallFilesRewritePlanner
         filesWithDeletes.size());
 
     // Files with deletes: each in its own group
-    // Sort only for single Long PK with merge join enabled, not for bounds (single file per group)
-    Integer fileSortOrderId = (mergeJoinEnabled && singleLongPk) ? sortOrderId : null;
+    // No sorting needed for single file groups (sorting only helps with bounds for multi-file groups)
     for (FileScanTask fileWithDeletes : filesWithDeletes) {
       selectedGroups.add(
           createRewriteGroup(
@@ -552,7 +457,7 @@ public class SmallFilesRewritePlanner
               partition,
               ImmutableList.of(fileWithDeletes),
               writeMaxFileSize(),
-              fileSortOrderId));
+              null));
     }
   }
 

@@ -30,8 +30,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.math.BigDecimal;
-import java.nio.CharBuffer;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
@@ -73,9 +73,6 @@ import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
 import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.Snapshot;
-import org.apache.iceberg.SortDirection;
-import org.apache.iceberg.SortField;
-import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DeleteWriteResult;
 import org.apache.iceberg.io.FileWriter;
@@ -219,16 +216,6 @@ public class ConvertEqualityDeleteFilesSparkAction
 
   public static final int MAX_TASKS_PER_GROUP_DEFAULT = Integer.MAX_VALUE;
 
-  /**
-   * If enabled, the action will use merge join optimization for sorted Parquet files
-   * with Long, Integer, or Decimal equality delete columns. This can significantly
-   * reduce I/O by skipping row groups where delete keys don't overlap.
-   * Default is false.
-   */
-  public static final String MERGE_JOIN_ENABLED = "merge-join-opt.enabled";
-
-  public static final boolean MERGE_JOIN_ENABLED_DEFAULT = false;
-
   private static final Result EMPTY_RESULT =
       ImmutableConvertEqualityDeleteFiles.Result.builder()
           .convertedEqualityDeleteFilesCount(0)
@@ -251,7 +238,6 @@ public class ConvertEqualityDeleteFilesSparkAction
   private String cacheMountPath = null;
   private String cacheS3Prefix = null;
   private int maxTasksPerGroup = MAX_TASKS_PER_GROUP_DEFAULT;
-  private boolean mergeJoinEnabled = MERGE_JOIN_ENABLED_DEFAULT;
 
   ConvertEqualityDeleteFilesSparkAction(SparkSession spark, Table table) {
     super(spark);
@@ -292,9 +278,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     this.maxTasksPerGroup =
         PropertyUtil.propertyAsInt(
             options(), MAX_TASKS_PER_GROUP, MAX_TASKS_PER_GROUP_DEFAULT);
-    this.mergeJoinEnabled =
-        PropertyUtil.propertyAsBoolean(
-            options(), MERGE_JOIN_ENABLED, MERGE_JOIN_ENABLED_DEFAULT);
 
     // Cache options for s3fs/FUSE mount
     this.cacheMountPath = options().get(CACHE_MOUNT_PATH);
@@ -1249,8 +1232,7 @@ public class ConvertEqualityDeleteFilesSparkAction
             cacheMountPath,
             cacheS3Prefix,
             groupIndex,
-            operationId,
-            mergeJoinEnabled));
+            operationId));
 
     // Set job group and description, then submit async
     String desc = String.format("ConvertEqDeletes: %s group=%d data_files=%d eq_delete_keys=%d",
@@ -1486,7 +1468,6 @@ public class ConvertEqualityDeleteFilesSparkAction
     private final String cacheS3Prefix;
     private final int groupIndex;
     private final String operationId;
-    private final boolean mergeJoinEnabled;
 
     ProcessPartitionFunction(
         Broadcast<Table> tableBroadcast,
@@ -1496,8 +1477,7 @@ public class ConvertEqualityDeleteFilesSparkAction
         String cacheMountPath,
         String cacheS3Prefix,
         int groupIndex,
-        String operationId,
-        boolean mergeJoinEnabled) {
+        String operationId) {
       this.tableBroadcast = tableBroadcast;
       this.eqDeleteKeysBroadcast = eqDeleteKeysBroadcast;
       this.deleteSchema = deleteSchema;
@@ -1506,7 +1486,6 @@ public class ConvertEqualityDeleteFilesSparkAction
       this.cacheS3Prefix = cacheS3Prefix;
       this.groupIndex = groupIndex;
       this.operationId = operationId;
-      this.mergeJoinEnabled = mergeJoinEnabled;
     }
 
     @Override
@@ -1736,113 +1715,63 @@ public class ConvertEqualityDeleteFilesSparkAction
           bloomFilter = BloomFilterBuilder.buildMultiColumnFilter(deleteKeys, deleteSchema, maxBloomFilterKeys);
         }
 
-        // Check if file is sorted by eq delete column
-        boolean isSorted = isSingleColumn
-            && !hasNullDeleteKey
-            && canUseMergeJoin(table, fileInfo.sortOrderId(), eqDeleteFieldId);
-
         boolean anyRowsRead = false;
         long recordsScannedInFile = 0;
         long dataReadStart = System.currentTimeMillis();
 
-        // Use row-group level merge join for Parquet files with Long or Decimal column
-        // This allows skipping row groups where delete keys don't overlap
-        // Requires merge-join-opt.enabled=true
-        boolean useRowGroupMergeJoinLong = mergeJoinEnabled
-            && isSorted
-            && isSingleLongColumn
-            && sortedLongKeys != null
-            && longToIndex > longFromIndex
-            && fileInfo.format() == FileFormat.PARQUET;
+        // Standard reader path with hash join
+        int deleteKeysCount = isSingleLongColumn ? longKeys.size() :
+            isSingleStringColumn ? stringKeys.size() :
+            isSingleDecimalColumn ? decimalKeys.size() : deleteKeys.size();
+        LOG.debug("Processing file={}, singleColumn={}, longColumn={}, deleteKeysCount={}",
+            fileInfo.path(), isSingleColumn, isSingleLongColumn, deleteKeysCount);
+        try (CloseableIterable<Record> reader =
+            openDataFileForRead(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
 
-        boolean useRowGroupMergeJoinDecimal = mergeJoinEnabled
-            && isSorted
-            && isSingleDecimalColumn
-            && sortedDecimalKeys != null
-            && sortedDecimalKeys.length > 0
-            && fileInfo.format() == FileFormat.PARQUET;
+          for (Record record : reader) {
+            if (!anyRowsRead) {
+              anyRowsRead = true;
+            }
+            recordsScannedInFile++;
+            boolean match = false;
 
-        if (useRowGroupMergeJoinLong) {
-          LOG.debug("Using ROW_GROUP_MERGE_JOIN path for file={}, sorted={}, longColumn={}, deleteKeysCount={}",
-              fileInfo.path(), isSorted, isSingleLongColumn, longToIndex - longFromIndex);
-          try {
-            ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.execute(
-                inputFile, projectionSchema, sortedLongKeys, longFromIndex, longToIndex,
-                eqDeleteFieldId, eqColumnName, fileInfo.path(), bloomFilter);
-            matches.addAll(result.matches);
-            recordsScannedInFile = result.recordsScanned;
-            anyRowsRead = result.recordsScanned > 0 || !result.matches.isEmpty();
-          } catch (IOException e) {
-            throw new RuntimeException("Failed to perform row-group merge join on " + fileInfo.path(), e);
-          }
-        } else if (useRowGroupMergeJoinDecimal) {
-          LOG.debug("Using ROW_GROUP_MERGE_JOIN path for file={}, sorted={}, decimalColumn={}, deleteKeysCount={}",
-              fileInfo.path(), isSorted, isSingleDecimalColumn, sortedDecimalKeys.length);
-          try {
-            ParquetRowGroupMergeJoin.Result result = ParquetRowGroupMergeJoin.executeDecimal(
-                inputFile, projectionSchema, sortedDecimalKeys, 0, sortedDecimalKeys.length,
-                eqDeleteFieldId, eqColumnName, fileInfo.path(), bloomFilter);
-            matches.addAll(result.matches);
-            recordsScannedInFile = result.recordsScanned;
-            anyRowsRead = result.recordsScanned > 0 || !result.matches.isEmpty();
-          } catch (IOException e) {
-            throw new RuntimeException("Failed to perform row-group merge join on " + fileInfo.path(), e);
-          }
-        } else {
-          // Standard reader path with hash join
-          int deleteKeysCount = isSingleLongColumn ? longKeys.size() :
-              isSingleStringColumn ? stringKeys.size() :
-              isSingleDecimalColumn ? decimalKeys.size() : deleteKeys.size();
-          LOG.debug("Using STANDARD path for file={}, sorted={}, singleColumn={}, longColumn={}, deleteKeysCount={}",
-              fileInfo.path(), isSorted, isSingleColumn, isSingleLongColumn, deleteKeysCount);
-          try (CloseableIterable<Record> reader =
-              openDataFileForRead(inputFile, projectionSchema, fileInfo.format(), bloomFilter)) {
-
-            for (Record record : reader) {
-              if (!anyRowsRead) {
-                anyRowsRead = true;
-              }
-              recordsScannedInFile++;
-              boolean match = false;
-
-              if (isSingleLongColumn) {
-                Object val = record.get(0);
-                // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
-                if (val == null) {
-                  match = longKeys.contains(null);
-                } else {
-                  long key = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
-                  match = longKeys.contains(key);
-                }
-              } else if (isSingleStringColumn) {
-                Object val = record.get(0);
-                String key = val != null ? val.toString() : null;
-                match = stringKeys.contains(key);
-              } else if (isSingleDecimalColumn) {
-                Object val = record.get(0);
-                // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
-                if (val == null) {
-                  match = decimalKeys.contains(null);
-                } else {
-                  match = decimalKeys.contains((BigDecimal) val);
-                }
+            if (isSingleLongColumn) {
+              Object val = record.get(0);
+              // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+              if (val == null) {
+                match = longKeys.contains(null);
               } else {
-                List<Object> recordKey = Lists.newArrayListWithCapacity(keyColumnCount);
-                for (int i = 0; i < keyColumnCount; i++) {
-                  recordKey.add(record.get(i));
-                }
-                match = deleteKeys.contains(recordKey);
+                long key = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+                match = longKeys.contains(key);
               }
+            } else if (isSingleStringColumn) {
+              Object val = record.get(0);
+              String key = val != null ? val.toString() : null;
+              match = stringKeys.contains(key);
+            } else if (isSingleDecimalColumn) {
+              Object val = record.get(0);
+              // Handle NULL per Iceberg spec: "A null value in a delete column matches a row if the row's value is null"
+              if (val == null) {
+                match = decimalKeys.contains(null);
+              } else {
+                match = decimalKeys.contains((BigDecimal) val);
+              }
+            } else {
+              List<Object> recordKey = Lists.newArrayListWithCapacity(keyColumnCount);
+              for (int i = 0; i < keyColumnCount; i++) {
+                recordKey.add(record.get(i));
+              }
+              match = deleteKeys.contains(recordKey);
+            }
 
-              if (match) {
-                Long pos = (Long) record.get(posColumnIndex);
-                PositionDelete<Record> posDelete = PositionDelete.create();
-                posDelete.set(fileInfo.path(), pos, null);
-                matches.add(posDelete);
-              }
+            if (match) {
+              Long pos = (Long) record.get(posColumnIndex);
+              PositionDelete<Record> posDelete = PositionDelete.create();
+              posDelete.set(fileInfo.path(), pos, null);
+              matches.add(posDelete);
             }
           }
-        } // end else (standard reader path)
+        }
         metricDataFileReadTimeMs += System.currentTimeMillis() - dataReadStart;
 
         // Update data records metrics
@@ -1877,26 +1806,6 @@ public class ConvertEqualityDeleteFilesSparkAction
           metricDataFileBytesRead,
           metricDataRecordsScanned,
           metricDataRecordsTotal)).iterator();
-    }
-
-    /**
-     * Check if merge join can be used for this data file.
-     * Merge join requires:
-     * 1. Data file has a non-zero sort order
-     * 2. Sort order starts with the eq delete field (identity transform, ASC direction)
-     */
-    private boolean canUseMergeJoin(Table table, Integer sortOrderId, int eqDeleteFieldId) {
-      if (sortOrderId == null || sortOrderId == 0) {
-        return false;
-      }
-      SortOrder sortOrder = table.sortOrders().get(sortOrderId);
-      if (sortOrder == null || sortOrder.fields().isEmpty()) {
-        return false;
-      }
-      SortField firstField = sortOrder.fields().get(0);
-      return firstField.sourceId() == eqDeleteFieldId
-          && firstField.direction() == SortDirection.ASC
-          && firstField.transform().isIdentity();
     }
 
   }
