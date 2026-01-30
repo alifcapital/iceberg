@@ -483,11 +483,17 @@ public class SmallFilesRewritePlanner
       }
 
       if (deleteFilesOnly) {
-        // delete-files-only mode: process files with delete files
+        // delete-files-only mode: process files with delete files + tiny files
         planDeleteFilesOnly(ctx, partition, filesWithBounds, selectedGroups);
+        // Also merge tiny files (< 4 MB) using standard small files logic
+        planSmallFiles(
+            ctx, partition, filesWithBounds, unsortedFallback, selectedGroups,
+            lonerWriteMaxFileSize, lonerWriteMaxFileSize);
       } else {
         // Normal mode: merge small files
-        planSmallFiles(ctx, partition, filesWithBounds, unsortedFallback, selectedGroups);
+        planSmallFiles(
+            ctx, partition, filesWithBounds, unsortedFallback, selectedGroups,
+            minFileSize(), writeMaxFileSize());
       }
     }
 
@@ -503,35 +509,33 @@ public class SmallFilesRewritePlanner
         CloseableIterable.of(selectedGroups), totalGroupCount, groupsInPartition);
   }
 
-  /** Plan for delete-files-only mode. */
+  /**
+   * Plan for delete-files-only mode: rewrite files >= 4 MB with delete files.
+   * Tiny files (< 4 MB) are handled separately by planSmallFiles.
+   */
   private void planDeleteFilesOnly(
       RewriteExecutionContext ctx,
       StructLike partition,
       List<FileScanTask> filesWithBounds,
       List<RewriteFileGroup> selectedGroups) {
 
-    // Files with delete files (any size, meeting delete threshold)
+    // Files with delete files (>= 4 MB, meeting delete threshold)
+    // Tiny files with deletes will be grouped with other tiny files in planSmallFiles
     List<FileScanTask> filesWithDeletes =
         filesWithBounds.stream()
+            .filter(t -> t.length() >= lonerWriteMaxFileSize)
             .filter(this::hasDeletes)
             .collect(Collectors.toList());
 
-    // Tiny files: < lonerWriteMaxFileSize (4 MB by default), pack them together
-    List<FileScanTask> tinyFiles =
-        filesWithBounds.stream()
-            .filter(t -> t.length() < lonerWriteMaxFileSize)
-            .collect(Collectors.toList());
-
-    if (filesWithDeletes.isEmpty() && tinyFiles.isEmpty()) {
+    if (filesWithDeletes.isEmpty()) {
       return;
     }
 
     LOG.info(
-        "SMALL_FILES [{}]: delete-files-only: partition={} filesWithDeletes={} tinyFiles={}",
+        "SMALL_FILES [{}]: delete-files-only: partition={} filesWithDeletes={}",
         table().name(),
         partition,
-        filesWithDeletes.size(),
-        tinyFiles.size());
+        filesWithDeletes.size());
 
     // Files with deletes: each in its own group
     // Sort only for single Long PK with merge join enabled, not for bounds (single file per group)
@@ -545,81 +549,76 @@ public class SmallFilesRewritePlanner
               writeMaxFileSize(),
               fileSortOrderId));
     }
-
-    // Tiny files: bin pack to lonerWriteMaxFileSize (4 MB)
-    if (tinyFiles.size() >= 2) {
-      List<List<FileScanTask>> tinyGroups = groupFilesForTiny(tinyFiles);
-      for (List<FileScanTask> group : tinyGroups) {
-        if (group.size() >= 2) {
-          long inputSize = inputSize(group);
-          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, lonerWriteMaxFileSize);
-          selectedGroups.add(
-              createRewriteGroup(ctx, partition, group, lonerWriteMaxFileSize, groupSortOrderId));
-        }
-      }
-    }
   }
 
-  /** Group tiny files using bin packing with lonerWriteMaxFileSize as target. */
-  private List<List<FileScanTask>> groupFilesForTiny(List<FileScanTask> files) {
-    if (files.isEmpty()) {
-      return ImmutableList.of();
-    }
-
-    BinPacking.ListPacker<FileScanTask> packer =
-        new BinPacking.ListPacker<>(lonerWriteMaxFileSize, 1, false, maxGroupInputFiles);
-
-    return packer.pack(files, FileScanTask::length);
-  }
-
-  /** Plan for normal small files mode. */
+  /**
+   * Plan for small files mode.
+   *
+   * @param smallFileThreshold files below this size are considered "small"
+   * @param targetFileSize target size for output files
+   */
   private void planSmallFiles(
       RewriteExecutionContext ctx,
       StructLike partition,
       List<FileScanTask> filesWithBounds,
       boolean unsortedFallback,
-      List<RewriteFileGroup> selectedGroups) {
+      List<RewriteFileGroup> selectedGroups,
+      long smallFileThreshold,
+      long targetFileSize) {
 
-    // Separate into large and small files
+    // Separate into large and small files based on threshold
     List<FileScanTask> largeFiles =
-        filesWithBounds.stream().filter(t -> !isSmallFile(t)).collect(Collectors.toList());
+        filesWithBounds.stream()
+            .filter(t -> t.length() >= smallFileThreshold)
+            .collect(Collectors.toList());
 
     List<FileScanTask> smallFiles =
-        filesWithBounds.stream().filter(this::isSmallFile).collect(Collectors.toList());
+        filesWithBounds.stream()
+            .filter(t -> t.length() < smallFileThreshold)
+            .collect(Collectors.toList());
 
     LOG.debug(
-        "SMALL_FILES [{}]: partition={} total={} large={} small={}",
+        "SMALL_FILES [{}]: partition={} total={} large={} small={} threshold={}",
         table().name(),
         partition,
         filesWithBounds.size(),
         largeFiles.size(),
-        smallFiles.size());
+        smallFiles.size(),
+        smallFileThreshold);
 
     if (smallFiles.size() < 2) {
       return; // Need at least 2 small files to merge
     }
 
     planSmallFilesWithSortOrderId(
-        ctx, partition, smallFiles, largeFiles, unsortedFallback, selectedGroups);
+        ctx, partition, smallFiles, largeFiles, unsortedFallback, selectedGroups, targetFileSize);
   }
 
-  /** Plan small files - sortOrderId is determined per-group based on expected output files. */
+  /**
+   * Plan small files - sortOrderId is determined per-group based on expected output files.
+   *
+   * @param targetFileSize target size for output files (cleanZone and overlap groups)
+   */
   private void planSmallFilesWithSortOrderId(
       RewriteExecutionContext ctx,
       StructLike partition,
       List<FileScanTask> smallFiles,
       List<FileScanTask> largeFiles,
       boolean unsortedFallback,
-      List<RewriteFileGroup> selectedGroups) {
+      List<RewriteFileGroup> selectedGroups,
+      long targetFileSize) {
+
+    // For loners, use the smaller of targetFileSize and lonerWriteMaxFileSize
+    long lonerTargetFileSize = Math.min(targetFileSize, lonerWriteMaxFileSize);
 
     if (unsortedFallback) {
       // Unsorted fallback: group all small files without overlap analysis
-      for (List<FileScanTask> group : groupFiles(smallFiles)) {
+      for (List<FileScanTask> group : groupFiles(smallFiles, targetFileSize)) {
         if (enoughInputFiles(group)) {
           long inputSize = inputSize(group);
-          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, writeMaxFileSize());
+          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, targetFileSize);
           selectedGroups.add(
-              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), groupSortOrderId));
+              createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
         }
       }
     } else {
@@ -642,7 +641,7 @@ public class SmallFilesRewritePlanner
       }
 
       // Group clean zone files using bin packing
-      List<List<FileScanTask>> cleanZoneGroups = groupFiles(cleanZoneFiles);
+      List<List<FileScanTask>> cleanZoneGroups = groupFiles(cleanZoneFiles, targetFileSize);
 
       // Group files inside large bounds by overlap clusters
       // Returns: list of clusters (overlapping files) + list of loners
@@ -651,11 +650,11 @@ public class SmallFilesRewritePlanner
       // Bin pack each overlap cluster
       List<List<FileScanTask>> overlapGroups = new ArrayList<>();
       for (List<FileScanTask> cluster : overlapResult.clusters) {
-        overlapGroups.addAll(groupFiles(cluster));
+        overlapGroups.addAll(groupFiles(cluster, targetFileSize));
       }
 
       // Group loners together
-      List<List<FileScanTask>> lonerGroups = groupFiles(overlapResult.loners);
+      List<List<FileScanTask>> lonerGroups = groupFiles(overlapResult.loners, lonerTargetFileSize);
 
       int overlapFilesCount = overlapResult.clusters.stream().mapToInt(List::size).sum();
       LOG.info(
@@ -671,24 +670,24 @@ public class SmallFilesRewritePlanner
           overlapResult.loners.size(),
           lonerGroups.size());
 
-      // Create groups for cleanZone and overlap files (standard writeMaxFileSize)
+      // Create groups for cleanZone and overlap files
       for (List<FileScanTask> group : cleanZoneGroups) {
         if (enoughInputFiles(group)) {
           long inputSize = inputSize(group);
-          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, writeMaxFileSize());
+          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, targetFileSize);
           selectedGroups.add(
-              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), groupSortOrderId));
+              createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
         }
       }
       for (List<FileScanTask> group : overlapGroups) {
         if (enoughInputFiles(group)) {
           long inputSize = inputSize(group);
-          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, writeMaxFileSize());
+          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, targetFileSize);
           selectedGroups.add(
-              createRewriteGroup(ctx, partition, group, writeMaxFileSize(), groupSortOrderId));
+              createRewriteGroup(ctx, partition, group, targetFileSize, groupSortOrderId));
         }
       }
-      // Create groups for loners (smaller writeMaxFileSize so they grow gradually)
+      // Create groups for loners (smaller target so they grow gradually)
       // Skip loners if UUID prefix bucketing is enabled and bounds look like UUID
       boolean skipLoners = useUuidPrefixBucketing && hasUuidBounds(overlapResult.loners);
       if (skipLoners) {
@@ -700,18 +699,13 @@ public class SmallFilesRewritePlanner
         for (List<FileScanTask> group : lonerGroups) {
           if (enoughInputFiles(group)) {
             long inputSize = inputSize(group);
-            Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, lonerWriteMaxFileSize);
+            Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, lonerTargetFileSize);
             selectedGroups.add(
-                createRewriteGroup(ctx, partition, group, lonerWriteMaxFileSize, groupSortOrderId));
+                createRewriteGroup(ctx, partition, group, lonerTargetFileSize, groupSortOrderId));
           }
         }
       }
     }
-  }
-
-  /** Check if file is considered "small" based on min file size threshold. */
-  private boolean isSmallFile(FileScanTask task) {
-    return task.length() < minFileSize();
   }
 
   /** Represents a covered range from large files [lower, upper]. */
@@ -937,9 +931,13 @@ public class SmallFilesRewritePlanner
     return new OverlapResult(clusters, loners);
   }
 
-  /** Group files using bin packing, sorted by lower bound if columns specified. */
+  /**
+   * Group files using bin packing, sorted by lower bound if columns specified.
+   *
+   * @param targetFileSize target size for bin packing (max size per group)
+   */
   @SuppressWarnings("unchecked")
-  private List<List<FileScanTask>> groupFiles(List<FileScanTask> files) {
+  private List<List<FileScanTask>> groupFiles(List<FileScanTask> files, long targetFileSize) {
     if (files.isEmpty()) {
       return ImmutableList.of();
     }
@@ -962,9 +960,10 @@ public class SmallFilesRewritePlanner
               }));
     }
 
-    // Use bin packing to group files
+    // Use bin packing to group files - use min of maxGroupSize and targetFileSize
+    long binSize = Math.min(maxGroupSize, targetFileSize);
     BinPacking.ListPacker<FileScanTask> packer =
-        new BinPacking.ListPacker<>(maxGroupSize, 1, false, maxGroupInputFiles);
+        new BinPacking.ListPacker<>(binSize, 1, false, maxGroupInputFiles);
 
     return packer.pack(filesToPack, FileScanTask::length);
   }
