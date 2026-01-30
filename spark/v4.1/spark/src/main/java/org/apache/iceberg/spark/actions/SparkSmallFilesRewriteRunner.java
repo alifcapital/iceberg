@@ -18,16 +18,24 @@
  */
 package org.apache.iceberg.spark.actions;
 
+import static org.apache.spark.sql.functions.array;
+
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.apache.iceberg.NullOrder;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.SortDirection;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.RewriteFileGroup;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.ZOrderByteUtils;
+import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -36,15 +44,28 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Runner for the SMALL_FILES rewrite strategy. This runner reads small files from clean zones,
- * sorts them by the specified columns, and writes them back. The sorting ensures that output files
- * have non-overlapping bounds within the clean zone.
+ * sorts them, and writes them back.
+ *
+ * <p>For single-column keys: uses ORDER BY and sets SORT_ORDER_ID in file metadata.
+ *
+ * <p>For multi-column keys: uses ZORDER (Z-order curve) for better multi-dimensional clustering,
+ * improving data skipping for queries on any combination of columns. ZORDER files do not have
+ * SORT_ORDER_ID set because Z-order is not representable as a linear sort order.
  */
 class SparkSmallFilesRewriteRunner extends SparkShufflingFileRewriteRunner {
 
   private static final Logger LOG = LoggerFactory.getLogger(SparkSmallFilesRewriteRunner.class);
+  private static final String Z_COLUMN = "ICEBERG_ZORDER_VALUE";
+  private static final Schema Z_SCHEMA =
+      new Schema(Types.NestedField.required(0, Z_COLUMN, Types.BinaryType.get()));
+  private static final SortOrder Z_SORT_ORDER =
+      SortOrder.builderFor(Z_SCHEMA)
+          .sortBy(Z_COLUMN, SortDirection.ASC, NullOrder.NULLS_LAST)
+          .build();
 
   private SortOrder sortOrder;
   private List<String> columns;
+  private boolean useZOrder;
 
   SparkSmallFilesRewriteRunner(SparkSession spark, Table table) {
     super(spark, table);
@@ -70,6 +91,7 @@ class SparkSmallFilesRewriteRunner extends SparkShufflingFileRewriteRunner {
         COLUMNS,
         USE_IDENTIFIER_KEYS);
 
+    List<String> rawColumns;
     if (useIdentifierKeys) {
       Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
       if (identifierFieldIds.isEmpty()) {
@@ -80,17 +102,47 @@ class SparkSmallFilesRewriteRunner extends SparkShufflingFileRewriteRunner {
       }
       List<Integer> sortedFieldIds =
           identifierFieldIds.stream().sorted().collect(Collectors.toList());
-      this.columns =
+      rawColumns =
           sortedFieldIds.stream()
               .map(table().schema()::findColumnName)
               .collect(Collectors.toList());
-      this.sortOrder = buildSortOrderFromFieldIds(sortedFieldIds);
     } else {
-      this.columns = parseColumnsOption(columnsOption);
+      rawColumns = parseColumnsOption(columnsOption);
       Preconditions.checkArgument(
-          !columns.isEmpty(), "'%s' option must specify at least one column", COLUMNS);
-      validateColumnsExist(columns);
-      this.sortOrder = buildSortOrderFromColumns(columns);
+          !rawColumns.isEmpty(), "'%s' option must specify at least one column", COLUMNS);
+      validateColumnsExist(rawColumns);
+    }
+
+    // Filter out identity partition columns (constant within partition, useless for sorting)
+    this.columns = filterIdentityPartitionColumns(rawColumns);
+
+    if (columns.isEmpty()) {
+      LOG.info(
+          "All columns are identity partition columns, using unsorted fallback. "
+              + "Original columns: {}",
+          rawColumns);
+      this.sortOrder = SortOrder.unsorted();
+      return;
+    }
+
+    // Build sort order from filtered columns
+    List<Integer> filteredFieldIds =
+        columns.stream()
+            .map(col -> table().schema().findField(col).fieldId())
+            .collect(Collectors.toList());
+    this.sortOrder = buildSortOrderFromFieldIds(filteredFieldIds);
+
+    this.useZOrder = columns.size() > 1;
+    if (!columns.isEmpty()) {
+      if (useZOrder) {
+        LOG.info(
+            "SMALL_FILES [{}]: using ZORDER for {} columns: {}",
+            table().name(),
+            columns.size(),
+            columns);
+      } else {
+        LOG.info("SMALL_FILES [{}]: using ORDER BY for column: {}", table().name(), columns.get(0));
+      }
     }
   }
 
@@ -106,27 +158,75 @@ class SparkSmallFilesRewriteRunner extends SparkShufflingFileRewriteRunner {
 
   @Override
   protected SortOrder sortOrder() {
-    return sortOrder;
+    return useZOrder ? Z_SORT_ORDER : sortOrder;
+  }
+
+  @Override
+  protected Schema sortSchema() {
+    if (useZOrder) {
+      return new Schema(
+          new ImmutableList.Builder<Types.NestedField>()
+              .addAll(table().schema().columns())
+              .addAll(Z_SCHEMA.columns())
+              .build());
+    }
+    return table().schema();
   }
 
   @Override
   protected SortOrder effectiveSortOrder(RewriteFileGroup fileGroup) {
     Integer sortOrderId = fileGroup.sortOrderId();
-    if (sortOrderId != null) {
-      SortOrder groupSortOrder = table().sortOrders().get(sortOrderId);
-      if (groupSortOrder != null) {
-        LOG.debug("Using sort order from group sortOrderId={}", sortOrderId);
-        return groupSortOrder;
-      } else {
-        LOG.warn("Sort order with id {} not found in table, using default", sortOrderId);
-      }
+
+    // sortOrderId == null means group is small (single output file) - no sorting needed
+    if (sortOrderId == null) {
+      return SortOrder.unsorted();
     }
-    return sortOrder();
+
+    // For ZORDER (multi-column), use Z_SORT_ORDER
+    if (useZOrder) {
+      return Z_SORT_ORDER;
+    }
+
+    // For single-column ORDER BY, use the sort order from table
+    SortOrder groupSortOrder = table().sortOrders().get(sortOrderId);
+    if (groupSortOrder != null) {
+      return groupSortOrder;
+    }
+
+    LOG.warn("Sort order with id {} not found in table, using default", sortOrderId);
+    return sortOrder;
   }
 
   @Override
-  protected Dataset<Row> sortedDF(Dataset<Row> df, Function<Dataset<Row>, Dataset<Row>> sortFunc) {
-    return sortFunc.apply(df);
+  protected Dataset<Row> sortedDF(
+      Dataset<Row> df, Function<Dataset<Row>, Dataset<Row>> sortFunc, SortOrder groupSortOrder) {
+    // For single-column or unsorted: just apply sortFunc (ORDER BY or no-op)
+    if (!useZOrder || columns.isEmpty()) {
+      return sortFunc.apply(df);
+    }
+
+    // For multi-column: use ZORDER
+    // Create new UDF for each call to avoid state accumulation
+    SparkZOrderUDF zOrderUDF =
+        new SparkZOrderUDF(
+            columns.size(), ZOrderByteUtils.PRIMITIVE_BUFFER_SIZE, Integer.MAX_VALUE);
+
+    // Convert each column to Z-order bytes and interleave them
+    Column[] zOrderCols =
+        columns.stream()
+            .map(
+                col -> {
+                  org.apache.spark.sql.types.DataType type = df.schema().apply(col).dataType();
+                  return zOrderUDF.sortedLexicographically(df.col(col), type);
+                })
+            .toArray(Column[]::new);
+
+    Column zValue = zOrderUDF.interleaveBytes(array(zOrderCols));
+
+    // Add Z-value column, sort by it, then drop it
+    Dataset<Row> zValueDF = df.withColumn(Z_COLUMN, zValue);
+    Dataset<Row> sortedDF = sortFunc.apply(zValueDF);
+    return sortedDF.drop(Z_COLUMN);
   }
 
   List<String> columns() {

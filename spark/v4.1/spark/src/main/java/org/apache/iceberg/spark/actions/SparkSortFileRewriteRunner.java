@@ -104,7 +104,6 @@ class SparkSortFileRewriteRunner extends SparkShufflingFileRewriteRunner {
       List<Integer> sortedFieldIds =
           identifierFieldIds.stream().sorted().collect(Collectors.toList());
       this.sortOrder = buildSortOrderFromFieldIds(sortedFieldIds);
-      ensureSortOrderRegistered(this.sortOrder);
     } else if (columnsOption != null) {
       List<String> columns = parseColumnsOption(columnsOption);
       Preconditions.checkArgument(
@@ -147,7 +146,8 @@ class SparkSortFileRewriteRunner extends SparkShufflingFileRewriteRunner {
   }
 
   @Override
-  protected Dataset<Row> sortedDF(Dataset<Row> df, Function<Dataset<Row>, Dataset<Row>> sortFunc) {
+  protected Dataset<Row> sortedDF(
+      Dataset<Row> df, Function<Dataset<Row>, Dataset<Row>> sortFunc, SortOrder groupSortOrder) {
     return sortFunc.apply(df);
   }
 

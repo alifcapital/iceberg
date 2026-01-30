@@ -140,7 +140,7 @@ public class OverlapRewriteFilePlanner
         COLUMNS,
         USE_IDENTIFIER_KEYS);
 
-    List<String> columns;
+    List<String> rawColumns;
     if (useIdentifierKeys) {
       Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
       if (identifierFieldIds.isEmpty()) {
@@ -153,18 +153,33 @@ public class OverlapRewriteFilePlanner
       // Sort by field ID to match the sort order used in SparkOverlapFileRewriteRunner
       List<Integer> sortedFieldIds =
           identifierFieldIds.stream().sorted().collect(Collectors.toList());
-      columns =
+      rawColumns =
           sortedFieldIds.stream()
               .map(table().schema()::findColumnName)
               .collect(Collectors.toList());
     } else {
-      columns =
+      rawColumns =
           Arrays.stream(columnsOption.split(","))
               .map(String::trim)
               .filter(s -> !s.isEmpty())
               .collect(Collectors.toList());
       Preconditions.checkArgument(
-          !columns.isEmpty(), "'%s' option must specify at least one column", COLUMNS);
+          !rawColumns.isEmpty(), "'%s' option must specify at least one column", COLUMNS);
+    }
+
+    // Filter out identity partition columns (constant within partition, useless for sorting)
+    Set<Integer> identityPartitionFieldIds = table().spec().identitySourceIds();
+    List<String> columns = filterIdentityPartitionColumns(rawColumns, identityPartitionFieldIds);
+
+    if (columns.isEmpty()) {
+      LOG.info(
+          "OVERLAP [{}]: all columns are identity partition columns, skipping. Original: {}",
+          table().name(),
+          rawColumns);
+      this.skipRewrite = true;
+      this.columnFieldIds = ImmutableList.of();
+      this.columnTypes = ImmutableList.of();
+      return;
     }
 
     // Validate and resolve columns to field IDs
@@ -176,7 +191,6 @@ public class OverlapRewriteFilePlanner
       Preconditions.checkArgument(field != null, "Column '%s' not found in table schema", column);
       columnFieldIds.add(field.fieldId());
       columnTypes.add(field.type());
-      LOG.info("OVERLAP [{}]: init column='{}' fieldId={} type={}", table().name(), column, field.fieldId(), field.type());
     }
 
     // Parse group limits
@@ -736,8 +750,13 @@ public class OverlapRewriteFilePlanner
   }
 
   /**
-   * Simulate merge+sort+split for files within a single bucket.
-   * Uses regular positional splitting (not UUID bucket boundaries).
+   * Simulate merge+sort+split for files using ZORDER.
+   *
+   * <p>After ZORDER, files are laid out along the Z-curve. Each file covers a contiguous
+   * segment of the Z-curve, which corresponds to a "hypercube" in n-dimensional space.
+   *
+   * <p>For M output files and d columns, the space is divided into a grid of size
+   * ceil(M^(1/d)) per dimension. Files are assigned to grid cells in Z-order.
    */
   @SuppressWarnings("unchecked")
   private SimulationResult simulateMergeSplitForBucket(List<FileScanTask> bucketFiles) {
@@ -785,32 +804,95 @@ public class OverlapRewriteFilePlanner
       return new SimulationResult(ctx, ImmutableList.of());
     }
 
-    // Create simulated files with non-overlapping normalized positions
+    int numCols = columnFieldIds.size();
+    List<SimulatedFile> result = simulateZOrderBounds(numOutputFiles, numCols, totalRecords);
+
+    return new SimulationResult(ctx, result);
+  }
+
+  /**
+   * Simulate ZORDER file bounds by distributing files along a Z-curve.
+   *
+   * <p>Algorithm:
+   * 1. Create a grid of size gridSize^numCols where gridSize = ceil(numFiles^(1/numCols))
+   * 2. Generate all grid cells in Z-order (Morton order)
+   * 3. Assign consecutive cells to each file
+   * 4. Calculate bounding box for each file's cells
+   */
+  private List<SimulatedFile> simulateZOrderBounds(int numFiles, int numCols, long totalRecords) {
+    // Grid size per dimension, capped to avoid overflow
+    int gridSize = Math.min(1000, (int) Math.ceil(Math.pow(numFiles, 1.0 / numCols)));
+    long totalCellsLong = (long) Math.pow(gridSize, numCols);
+    int totalCells = (int) Math.min(totalCellsLong, 1_000_000);
+
+    // Generate all grid cells in Z-order
+    List<int[]> zOrderCells = new ArrayList<>(totalCells);
+    for (int z = 0; z < totalCells; z++) {
+      zOrderCells.add(decodeMorton(z, numCols, gridSize));
+    }
+
+    // Distribute cells among files
+    int cellsPerFile = (int) Math.ceil((double) totalCells / numFiles);
+    long recordsPerFile = Math.max(1, totalRecords / numFiles);
+
     List<SimulatedFile> result = new ArrayList<>();
-    long recordsPerFile = Math.max(1, totalRecords / numOutputFiles);
+    for (int f = 0; f < numFiles; f++) {
+      int startCell = f * cellsPerFile;
+      int endCell = Math.min(startCell + cellsPerFile, totalCells);
 
-    for (int f = 0; f < numOutputFiles; f++) {
-      double[] fileLowerPos = new double[columnFieldIds.size()];
-      double[] fileUpperPos = new double[columnFieldIds.size()];
-
-      // First column: split evenly (non-overlapping after sort)
-      fileLowerPos[0] = (double) f / numOutputFiles;
-      fileUpperPos[0] = (double) (f + 1) / numOutputFiles;
-
-      // Other columns: full range (conservative estimate)
-      for (int i = 1; i < columnFieldIds.size(); i++) {
-        fileLowerPos[i] = 0.0;
-        fileUpperPos[i] = 1.0;
+      if (startCell >= totalCells) {
+        break;
       }
 
-      long fileRecords = (f == numOutputFiles - 1)
+      // Calculate bounding box for this file's cells
+      double[] lowerPos = new double[numCols];
+      double[] upperPos = new double[numCols];
+      Arrays.fill(lowerPos, 1.0);
+      Arrays.fill(upperPos, 0.0);
+
+      for (int c = startCell; c < endCell; c++) {
+        int[] cell = zOrderCells.get(c);
+        for (int d = 0; d < numCols; d++) {
+          lowerPos[d] = Math.min(lowerPos[d], (double) cell[d] / gridSize);
+          upperPos[d] = Math.max(upperPos[d], (double) (cell[d] + 1) / gridSize);
+        }
+      }
+
+      long fileRecords = (f == numFiles - 1)
           ? totalRecords - recordsPerFile * f
           : recordsPerFile;
 
-      result.add(new SimulatedFile(fileLowerPos, fileUpperPos, fileRecords));
+      result.add(new SimulatedFile(lowerPos, upperPos, fileRecords));
     }
 
-    return new SimulationResult(ctx, result);
+    return result;
+  }
+
+  /**
+   * Decode a Morton code (Z-order index) into grid cell coordinates.
+   *
+   * <p>Morton code interleaves bits of all dimensions. For 2D with gridSize=4:
+   * Z=0 → (0,0), Z=1 → (1,0), Z=2 → (0,1), Z=3 → (1,1), Z=4 → (2,0), etc.
+   */
+  private int[] decodeMorton(int z, int numCols, int gridSize) {
+    int[] coords = new int[numCols];
+    int bitsPerDim = Math.min(10, (int) Math.ceil(Math.log(gridSize) / Math.log(2)));
+
+    for (int bit = 0; bit < bitsPerDim; bit++) {
+      for (int d = 0; d < numCols; d++) {
+        int bitIndex = bit * numCols + d;
+        if (bitIndex < 31 && (z & (1 << bitIndex)) != 0) {
+          coords[d] |= (1 << bit);
+        }
+      }
+    }
+
+    // Clamp to gridSize (in case gridSize is not a power of 2)
+    for (int d = 0; d < numCols; d++) {
+      coords[d] = Math.min(coords[d], gridSize - 1);
+    }
+
+    return coords;
   }
 
   /** Context for simulation containing union bounds of the group. */
@@ -850,25 +932,32 @@ public class OverlapRewriteFilePlanner
     }
   }
 
-  /** Calculate overlap cost between a simulated file and a real file. */
+  /**
+   * Calculate volumetric overlap cost between a simulated file and a real file.
+   * Uses the same formula as calculatePairCost: cost = overlapVolume × (densityA + densityB)
+   */
   @SuppressWarnings("unchecked")
   private double calculateCostWithSimulated(
       SimulatedFile simFile, FileScanTask realFile, SimulationContext ctx) {
-    double totalCost = 0;
+    double simVolume = 1.0;
+    double realVolume = 1.0;
+    double overlapVolume = 1.0;
+    boolean hasNonZeroDim = false;
 
     for (int i = 0; i < columnFieldIds.size(); i++) {
       int fieldId = columnFieldIds.get(i);
       Type type = columnTypes.get(i);
 
-      if (ctx.minBounds[i] == null || ctx.maxBounds[i] == null || ctx.ranges[i] <= 0) {
-        continue;
+      // Handle missing context bounds
+      if (ctx.minBounds[i] == null || ctx.maxBounds[i] == null) {
+        return 0;
       }
 
       ByteBuffer realLowerBuf = realFile.file().lowerBounds().get(fieldId);
       ByteBuffer realUpperBuf = realFile.file().upperBounds().get(fieldId);
 
       if (realLowerBuf == null || realUpperBuf == null) {
-        continue;
+        return 0;
       }
 
       Comparable<Object> realLower =
@@ -877,13 +966,10 @@ public class OverlapRewriteFilePlanner
           (Comparable<Object>) Conversions.fromByteBuffer(type, realUpperBuf);
 
       double realRange = calculateRange(realLower, realUpper, type);
+
       // Normalize real file bounds to 0..1 relative to union bounds
       double realLowerPos = normalizePosition(realLower, ctx.minBounds[i], ctx.ranges[i], type);
       double realUpperPos = normalizePosition(realUpper, ctx.minBounds[i], ctx.ranges[i], type);
-
-      if (realRange <= 0) {
-        continue;
-      }
 
       // Clamp to 0..1
       realLowerPos = Math.max(0, Math.min(1, realLowerPos));
@@ -892,29 +978,51 @@ public class OverlapRewriteFilePlanner
       double simLowerPos = simFile.lowerPos[i];
       double simUpperPos = simFile.upperPos[i];
 
+      double simRange = (simUpperPos - simLowerPos) * ctx.ranges[i];
+
+      // Handle "point" dimensions (zero or near-zero range)
+      // If either file is a point in this dimension, check overlap and skip dimension
+      if (ctx.ranges[i] <= 0 || realRange <= 0 || simRange <= 0) {
+        // At least one is a point - check if there's any overlap
+        double overlapLowerPos = Math.max(simLowerPos, realLowerPos);
+        double overlapUpperPos = Math.min(simUpperPos, realUpperPos);
+        if (overlapLowerPos > overlapUpperPos) {
+          return 0; // No overlap → no cost
+        }
+        // Overlap exists → skip this dimension (don't multiply into volume)
+        continue;
+      }
+
       // Calculate overlap in normalized space
       double overlapLowerPos = Math.max(simLowerPos, realLowerPos);
       double overlapUpperPos = Math.min(simUpperPos, realUpperPos);
 
       if (overlapLowerPos >= overlapUpperPos) {
-        continue; // No overlap
+        return 0; // No overlap on this column → no cost
       }
 
-      // Convert overlap back to actual range
+      // Convert to actual ranges
       double overlapRange = (overlapUpperPos - overlapLowerPos) * ctx.ranges[i];
-      double simRange = (simUpperPos - simLowerPos) * ctx.ranges[i];
 
-      if (simRange <= 0) {
-        continue;
-      }
-
-      double simCardinality = simFile.records / simRange;
-      double realCardinality = realFile.file().recordCount() / realRange;
-
-      totalCost += overlapRange * (simCardinality + realCardinality);
+      simVolume *= simRange;
+      realVolume *= realRange;
+      overlapVolume *= overlapRange;
+      hasNonZeroDim = true;
     }
 
-    return totalCost;
+    // If all dimensions are point-like, no meaningful cost
+    if (!hasNonZeroDim) {
+      return 0;
+    }
+
+    if (simVolume <= 0 || realVolume <= 0) {
+      return 0;
+    }
+
+    double simDensity = simFile.records / simVolume;
+    double realDensity = realFile.file().recordCount() / realVolume;
+
+    return overlapVolume * (simDensity + realDensity);
   }
 
   /** Normalize a value to 0..1 position relative to min bound and range. */
@@ -926,13 +1034,31 @@ public class OverlapRewriteFilePlanner
     return distanceFromMin / range;
   }
 
-  /** Calculate overlap cost between two simulated files. */
+  /**
+   * Calculate volumetric overlap cost between two simulated files.
+   * Uses the same formula as calculatePairCost: cost = overlapVolume × (densityA + densityB)
+   */
   private double calculateCostBetweenSimulated(
       SimulatedFile a, SimulatedFile b, SimulationContext ctx) {
-    double totalCost = 0;
+    double volumeA = 1.0;
+    double volumeB = 1.0;
+    double overlapVolume = 1.0;
+    boolean hasNonZeroDim = false;
 
     for (int i = 0; i < columnFieldIds.size(); i++) {
-      if (ctx.ranges[i] <= 0) {
+      double aRange = (a.upperPos[i] - a.lowerPos[i]) * ctx.ranges[i];
+      double bRange = (b.upperPos[i] - b.lowerPos[i]) * ctx.ranges[i];
+
+      // Handle "point" dimensions (zero or near-zero range)
+      // If either file is a point in this dimension, check overlap and skip dimension
+      if (ctx.ranges[i] <= 0 || aRange <= 0 || bRange <= 0) {
+        // At least one is a point - check if there's any overlap
+        double overlapLowerPos = Math.max(a.lowerPos[i], b.lowerPos[i]);
+        double overlapUpperPos = Math.min(a.upperPos[i], b.upperPos[i]);
+        if (overlapLowerPos > overlapUpperPos) {
+          return 0; // No overlap → no cost
+        }
+        // Overlap exists → skip this dimension (don't multiply into volume)
         continue;
       }
 
@@ -941,43 +1067,103 @@ public class OverlapRewriteFilePlanner
       double overlapUpperPos = Math.min(a.upperPos[i], b.upperPos[i]);
 
       if (overlapLowerPos >= overlapUpperPos) {
-        continue; // No overlap
+        return 0; // No overlap on this column → no cost
       }
 
-      // Convert to actual range
+      // Convert to actual ranges
       double overlapRange = (overlapUpperPos - overlapLowerPos) * ctx.ranges[i];
-      double aRange = (a.upperPos[i] - a.lowerPos[i]) * ctx.ranges[i];
-      double bRange = (b.upperPos[i] - b.lowerPos[i]) * ctx.ranges[i];
 
-      if (aRange <= 0 || bRange <= 0) {
-        continue;
-      }
-
-      double aCardinality = a.records / aRange;
-      double bCardinality = b.records / bRange;
-
-      totalCost += overlapRange * (aCardinality + bCardinality);
+      volumeA *= aRange;
+      volumeB *= bRange;
+      overlapVolume *= overlapRange;
+      hasNonZeroDim = true;
     }
 
-    return totalCost;
+    // If all dimensions are point-like, no meaningful cost
+    if (!hasNonZeroDim) {
+      return 0;
+    }
+
+    if (volumeA <= 0 || volumeB <= 0) {
+      return 0;
+    }
+
+    double densityA = a.records / volumeA;
+    double densityB = b.records / volumeB;
+
+    return overlapVolume * (densityA + densityB);
   }
 
+  /**
+   * Calculate pair cost using volumetric overlap.
+   *
+   * <p>For multi-column sorting (ORDER BY or ZORDER), the cost is based on the n-dimensional
+   * overlap volume. This correctly handles the case where files don't overlap on at least one
+   * column (cost = 0), which is the expected state after ZORDER optimization.
+   *
+   * <p>Formula: cost = overlapVolume × (densityA + densityB)
+   * where density = records / volume, and volume = Π(range_i) for all columns.
+   */
   private double calculatePairCost(FileScanTask a, FileScanTask b) {
-    double totalCost = 0;
+    double volumeA = 1.0;
+    double volumeB = 1.0;
+    double overlapVolume = 1.0;
+    boolean hasNonZeroDim = false;
 
     for (int i = 0; i < columnFieldIds.size(); i++) {
       int fieldId = columnFieldIds.get(i);
       Type type = columnTypes.get(i);
 
-      double cost = calculatePairCostForColumn(a, b, fieldId, type);
-      totalCost += cost;
+      double[] ranges = calculateRangesForColumn(a, b, fieldId, type);
+      if (ranges == null) {
+        return 0; // Missing bounds
+      }
+
+      double aRange = ranges[0];
+      double bRange = ranges[1];
+      double overlap = ranges[2];
+
+      // Handle "point" dimensions (zero or near-zero range)
+      if (aRange <= 0 || bRange <= 0) {
+        // For point dimensions, check if there's any overlap
+        // overlap will be 0 if points don't intersect, > 0 if they do
+        if (overlap <= 0) {
+          return 0; // Points don't overlap → no cost
+        }
+        // Points overlap → skip this dimension (don't multiply into volume)
+        continue;
+      }
+
+      if (overlap <= 0) {
+        return 0; // No overlap on this column → no cost
+      }
+
+      volumeA *= aRange;
+      volumeB *= bRange;
+      overlapVolume *= overlap;
+      hasNonZeroDim = true;
     }
 
-    return totalCost;
+    // If all dimensions are point-like, no meaningful cost
+    if (!hasNonZeroDim) {
+      return 0;
+    }
+
+    long aRecords = a.file().recordCount();
+    long bRecords = b.file().recordCount();
+
+    double densityA = aRecords / volumeA;
+    double densityB = bRecords / volumeB;
+
+    return overlapVolume * (densityA + densityB);
   }
 
+  /**
+   * Calculate ranges for a single column: [aRange, bRange, overlap].
+   * Returns null if bounds are missing.
+   */
   @SuppressWarnings("unchecked")
-  private <T extends Comparable<T>> double calculatePairCostForColumn(
+  private <T extends Comparable<T>> double[] calculateRangesForColumn(
       FileScanTask a, FileScanTask b, int fieldId, Type type) {
     ByteBuffer aLowerBuf = a.file().lowerBounds().get(fieldId);
     ByteBuffer aUpperBuf = a.file().upperBounds().get(fieldId);
@@ -985,7 +1171,7 @@ public class OverlapRewriteFilePlanner
     ByteBuffer bUpperBuf = b.file().upperBounds().get(fieldId);
 
     if (aLowerBuf == null || aUpperBuf == null || bLowerBuf == null || bUpperBuf == null) {
-      return 0; // No bounds, can't calculate
+      return null;
     }
 
     T aLower = (T) Conversions.fromByteBuffer(type, aLowerBuf);
@@ -993,39 +1179,19 @@ public class OverlapRewriteFilePlanner
     T bLower = (T) Conversions.fromByteBuffer(type, bLowerBuf);
     T bUpper = (T) Conversions.fromByteBuffer(type, bUpperBuf);
 
-    LOG.debug(
-        "OVERLAP: fieldId={} aLower={} aUpper={} bLower={} bUpper={}",
-        fieldId,
-        aLower,
-        aUpper,
-        bLower,
-        bUpper);
+    double aRange = calculateRange(aLower, aUpper, type);
+    double bRange = calculateRange(bLower, bUpper, type);
 
     // Calculate overlap
     T overlapLower = max(aLower, bLower);
     T overlapUpper = min(aUpper, bUpper);
 
-    if (overlapLower.compareTo(overlapUpper) >= 0) {
-      return 0; // No overlap
+    double overlap = 0;
+    if (overlapLower.compareTo(overlapUpper) < 0) {
+      overlap = calculateRange(overlapLower, overlapUpper, type);
     }
 
-    // Calculate ranges and cardinalities
-    double aRange = calculateRange(aLower, aUpper, type);
-    double bRange = calculateRange(bLower, bUpper, type);
-    double overlap = calculateRange(overlapLower, overlapUpper, type);
-
-    if (aRange <= 0 || bRange <= 0) {
-      return 0; // Can't calculate cardinality
-    }
-
-    long aRecords = a.file().recordCount();
-    long bRecords = b.file().recordCount();
-
-    double aCardinality = aRecords / aRange;
-    double bCardinality = bRecords / bRange;
-
-    // Cost = overlap * (card_A + card_B) is the "penalty" for overlapping
-    return overlap * (aCardinality + bCardinality);
+    return new double[] {aRange, bRange, overlap};
   }
 
   private <T extends Comparable<T>> T max(T a, T b) {
@@ -1237,5 +1403,26 @@ public class OverlapRewriteFilePlanner
     int upperBucket = UuidBucketUtil.hexToBucket(upperHex, numBuckets);
 
     return new int[] {lowerBucket, upperBucket};
+  }
+
+  private List<String> filterIdentityPartitionColumns(
+      List<String> columnNames, Set<Integer> identityPartitionFieldIds) {
+    if (identityPartitionFieldIds.isEmpty()) {
+      return columnNames;
+    }
+
+    List<String> filtered = new ArrayList<>();
+    for (String colName : columnNames) {
+      Types.NestedField field = table().schema().findField(colName);
+      if (field != null && identityPartitionFieldIds.contains(field.fieldId())) {
+        LOG.warn(
+            "OVERLAP [{}]: ignoring column '{}' - identity partition column",
+            table().name(),
+            colName);
+      } else {
+        filtered.add(colName);
+      }
+    }
+    return filtered;
   }
 }

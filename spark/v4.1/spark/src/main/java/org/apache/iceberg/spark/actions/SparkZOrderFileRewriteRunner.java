@@ -124,7 +124,8 @@ class SparkZOrderFileRewriteRunner extends SparkShufflingFileRewriteRunner {
   }
 
   @Override
-  protected Dataset<Row> sortedDF(Dataset<Row> df, Function<Dataset<Row>, Dataset<Row>> sortFunc) {
+  protected Dataset<Row> sortedDF(
+      Dataset<Row> df, Function<Dataset<Row>, Dataset<Row>> sortFunc, SortOrder groupSortOrder) {
     Dataset<Row> zValueDF = df.withColumn(Z_COLUMN, zValue(df));
     Dataset<Row> sortedDF = sortFunc.apply(zValueDF);
     return sortedDF.drop(Z_COLUMN);
