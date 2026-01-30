@@ -484,7 +484,7 @@ public class SmallFilesRewritePlanner
 
       if (deleteFilesOnly) {
         // delete-files-only mode: process files with delete files
-        planDeleteFilesOnly(ctx, partition, filesWithBounds, unsortedFallback, selectedGroups);
+        planDeleteFilesOnly(ctx, partition, filesWithBounds, selectedGroups);
       } else {
         // Normal mode: merge small files
         planSmallFiles(ctx, partition, filesWithBounds, unsortedFallback, selectedGroups);
@@ -508,55 +508,68 @@ public class SmallFilesRewritePlanner
       RewriteExecutionContext ctx,
       StructLike partition,
       List<FileScanTask> filesWithBounds,
-      boolean unsortedFallback,
       List<RewriteFileGroup> selectedGroups) {
 
-    // Large files: only those with delete files
-    List<FileScanTask> largeFilesWithDeletes =
+    // Files with delete files (any size, meeting delete threshold)
+    List<FileScanTask> filesWithDeletes =
         filesWithBounds.stream()
-            .filter(t -> !isSmallFile(t))
             .filter(this::hasDeletes)
             .collect(Collectors.toList());
 
-    // Small files: ALL of them (they need merging regardless of delete files)
-    List<FileScanTask> smallFiles =
-        filesWithBounds.stream().filter(this::isSmallFile).collect(Collectors.toList());
+    // Tiny files: < lonerWriteMaxFileSize (4 MB by default), pack them together
+    List<FileScanTask> tinyFiles =
+        filesWithBounds.stream()
+            .filter(t -> t.length() < lonerWriteMaxFileSize)
+            .collect(Collectors.toList());
 
-    if (largeFilesWithDeletes.isEmpty() && smallFiles.isEmpty()) {
+    if (filesWithDeletes.isEmpty() && tinyFiles.isEmpty()) {
       return;
     }
 
     LOG.info(
-        "SMALL_FILES [{}]: delete-files-only: partition={} largeWithDeletes={} smallFiles={}",
+        "SMALL_FILES [{}]: delete-files-only: partition={} filesWithDeletes={} tinyFiles={}",
         table().name(),
         partition,
-        largeFilesWithDeletes.size(),
-        smallFiles.size());
+        filesWithDeletes.size(),
+        tinyFiles.size());
 
-    // Large files: each in its own group
+    // Files with deletes: each in its own group
     // Sort only for single Long PK with merge join enabled, not for bounds (single file per group)
-    Integer largeSortOrderId = (mergeJoinEnabled && singleLongPk) ? sortOrderId : null;
-    for (FileScanTask largeFile : largeFilesWithDeletes) {
+    Integer fileSortOrderId = (mergeJoinEnabled && singleLongPk) ? sortOrderId : null;
+    for (FileScanTask fileWithDeletes : filesWithDeletes) {
       selectedGroups.add(
           createRewriteGroup(
               ctx,
               partition,
-              ImmutableList.of(largeFile),
+              ImmutableList.of(fileWithDeletes),
               writeMaxFileSize(),
-              largeSortOrderId));
+              fileSortOrderId));
     }
 
-    // Small files: use normal small files logic
-    if (smallFiles.size() >= 2) {
-      // Get ALL large files for covered ranges calculation
-      List<FileScanTask> largeFilesForRanges =
-          filesWithBounds.stream()
-              .filter(t -> !isSmallFile(t))
-              .collect(Collectors.toList());
-
-      planSmallFilesWithSortOrderId(
-          ctx, partition, smallFiles, largeFilesForRanges, unsortedFallback, selectedGroups);
+    // Tiny files: bin pack to lonerWriteMaxFileSize (4 MB)
+    if (tinyFiles.size() >= 2) {
+      List<List<FileScanTask>> tinyGroups = groupFilesForTiny(tinyFiles);
+      for (List<FileScanTask> group : tinyGroups) {
+        if (group.size() >= 2) {
+          long inputSize = inputSize(group);
+          Integer groupSortOrderId = getSortOrderIdForGroup(inputSize, lonerWriteMaxFileSize);
+          selectedGroups.add(
+              createRewriteGroup(ctx, partition, group, lonerWriteMaxFileSize, groupSortOrderId));
+        }
+      }
     }
+  }
+
+  /** Group tiny files using bin packing with lonerWriteMaxFileSize as target. */
+  private List<List<FileScanTask>> groupFilesForTiny(List<FileScanTask> files) {
+    if (files.isEmpty()) {
+      return ImmutableList.of();
+    }
+
+    BinPacking.ListPacker<FileScanTask> packer =
+        new BinPacking.ListPacker<>(lonerWriteMaxFileSize, 1, false, maxGroupInputFiles);
+
+    return packer.pack(files, FileScanTask::length);
   }
 
   /** Plan for normal small files mode. */
