@@ -113,35 +113,44 @@ class SparkOverlapFileRewriteRunner extends SparkShufflingFileRewriteRunner {
     }
 
     // Filter out identity partition columns (constant within partition, useless for sorting)
-    this.columns = filterIdentityPartitionColumns(rawColumns);
+    List<String> filteredColumns = filterIdentityPartitionColumns(rawColumns);
 
-    if (columns.isEmpty()) {
+    if (filteredColumns.isEmpty()) {
       LOG.info(
           "All columns are identity partition columns, using unsorted fallback. "
               + "Original columns: {}",
           rawColumns);
+      this.columns = ImmutableList.of();
       this.sortOrder = SortOrder.unsorted();
       return;
     }
 
-    // Build sort order from filtered columns
-    List<Integer> filteredFieldIds =
+    // Check if ZORDER is enabled (default: false)
+    boolean useZOrderOption =
+        Boolean.parseBoolean(options.getOrDefault(USE_ZORDER, "false"));
+
+    // ZORDER only when explicitly enabled AND multiple columns
+    this.useZOrder = useZOrderOption && filteredColumns.size() > 1;
+
+    // For ORDER BY (default): use only first column
+    // For ZORDER: use all columns
+    this.columns = useZOrder ? filteredColumns : ImmutableList.of(filteredColumns.get(0));
+
+    // Build sort order from columns
+    List<Integer> columnFieldIds =
         columns.stream()
             .map(col -> table().schema().findField(col).fieldId())
             .collect(Collectors.toList());
-    this.sortOrder = buildSortOrderFromFieldIds(filteredFieldIds);
+    this.sortOrder = buildSortOrderFromFieldIds(columnFieldIds);
 
-    this.useZOrder = columns.size() > 1;
-    if (!columns.isEmpty()) {
-      if (useZOrder) {
-        LOG.info(
-            "OVERLAP [{}]: using ZORDER for {} columns: {}",
-            table().name(),
-            columns.size(),
-            columns);
-      } else {
-        LOG.info("OVERLAP [{}]: using ORDER BY for column: {}", table().name(), columns.get(0));
-      }
+    if (useZOrder) {
+      LOG.info(
+          "OVERLAP [{}]: using ZORDER for {} columns: {}",
+          table().name(),
+          columns.size(),
+          columns);
+    } else {
+      LOG.info("OVERLAP [{}]: using ORDER BY for column: {}", table().name(), columns.get(0));
     }
   }
 

@@ -80,6 +80,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
   public static final String COLUMNS = "columns";
   public static final String USE_IDENTIFIER_KEYS = "use-identifier-keys";
   public static final String USE_UUID_PREFIX_BUCKETING = "use-uuid-prefix-bucketing";
+  public static final String USE_ZORDER = "use-zorder";
 
   /**
    * The number of shuffle partitions to use for each output file. By default, this file rewriter
