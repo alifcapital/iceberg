@@ -293,6 +293,7 @@ public class OverlapRewriteFilePlanner
 
   private static final int PAIRS_BATCH_SIZE = 1000;
   private static final int MIN_IMPROVEMENT = 1000;
+  private static final double MIN_IMPROVEMENT_RATIO = 0.05; // 5%
 
   private List<FileScanTask> findBestGroup(List<FileScanTask> files) {
     if (files.size() < 2) {
@@ -641,6 +642,8 @@ public class OverlapRewriteFilePlanner
    *
    * <p>Within each bucket, we use honest string-level cardinality-based cost.
    * After merge+sort+split, files within a bucket are sorted and non-overlapping.
+   *
+   * <p>Returns 0 if improvement ratio is less than MIN_IMPROVEMENT_RATIO (5%).
    */
   private double calculateMergeImprovement(
       List<FileScanTask> allFiles, List<FileScanTask> group, Map<FileScanTask, int[]> bucketRanges) {
@@ -674,6 +677,7 @@ public class OverlapRewriteFilePlanner
 
     // Slow path: all files in same bucket - calculate honest improvement
     double totalImprovement = 0;
+    double totalCostBefore = 0;
 
     for (int bucket = minBucket; bucket <= maxBucket; bucket++) {
       if (Thread.interrupted()) {
@@ -743,7 +747,13 @@ public class OverlapRewriteFilePlanner
         }
       }
 
+      totalCostBefore += costBefore;
       totalImprovement += (costBefore - costAfter);
+    }
+
+    // Skip if improvement ratio is less than 5%
+    if (totalCostBefore > 0 && totalImprovement / totalCostBefore < MIN_IMPROVEMENT_RATIO) {
+      return 0;
     }
 
     return totalImprovement;
