@@ -1204,21 +1204,21 @@ public class OverlapRewriteFilePlanner
 
   /**
    * Calculate the numeric range between two values.
-   * For numbers: simple subtraction.
-   * For strings: difference of first differing code point.
+   * For numbers: upper - lower + 1 (bounds are inclusive, minimum 1).
+   * For strings: difference of first differing code point + 1.
    */
   private double calculateRange(Object lower, Object upper, Type type) {
     if (lower instanceof Boolean && upper instanceof Boolean) {
       int lowerVal = (Boolean) lower ? 1 : 0;
       int upperVal = (Boolean) upper ? 1 : 0;
-      return upperVal - lowerVal;
+      return Math.max(1, upperVal - lowerVal + 1);
     } else if (lower instanceof Number && upper instanceof Number) {
-      return ((Number) upper).doubleValue() - ((Number) lower).doubleValue();
+      return Math.max(1, ((Number) upper).doubleValue() - ((Number) lower).doubleValue() + 1);
     } else if (lower instanceof CharSequence && upper instanceof CharSequence) {
-      return calculateStringRange((CharSequence) lower, (CharSequence) upper);
+      return Math.max(1, calculateStringRange((CharSequence) lower, (CharSequence) upper) + 1);
     } else {
       // For other types (UUID, binary, etc.) - compare bytes
-      return calculateBytesRange(lower, upper, type);
+      return Math.max(1, calculateBytesRange(lower, upper, type) + 1);
     }
   }
 
