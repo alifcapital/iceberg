@@ -420,9 +420,11 @@ public class OverlapRewriteFilePlanner
 
       if (bestPair != null && bestImprovement >= MIN_IMPROVEMENT) {
         LOG.info(
-            "OVERLAP [{}]: best pair {} + {} records, improvement={}",
+            "OVERLAP [{}]: best pair {} {} records + {} {} records, improvement={}",
             table().name(),
+            formatBounds(bestPair.get(0)),
             bestPair.get(0).file().recordCount(),
+            formatBounds(bestPair.get(1)),
             bestPair.get(1).file().recordCount(),
             (long) bestImprovement);
         return bestPair;
@@ -566,8 +568,10 @@ public class OverlapRewriteFilePlanner
         bestImprovement = bestAdditionImprovement;
         improved = true;
         LOG.info(
-            "OVERLAP [{}]: added file, groupSize={} totalBytes={} improvement={}",
+            "OVERLAP [{}]: added file {} {} records, groupSize={} totalBytes={} improvement={}",
             table().name(),
+            formatBounds(bestAddition),
+            bestAddition.file().recordCount(),
             group.size(),
             group.stream().mapToLong(FileScanTask::length).sum(),
             (long) bestImprovement);
@@ -1619,5 +1623,26 @@ public class OverlapRewriteFilePlanner
       }
     }
     return filtered;
+  }
+
+  /**
+   * Format bounds of a file for logging.
+   * Returns string like "[lower..upper]" for the first column.
+   */
+  private String formatBounds(FileScanTask task) {
+    if (columnFieldIds.isEmpty()) {
+      return "[?..?]";
+    }
+
+    int fieldId = columnFieldIds.get(0);
+    Type type = columnTypes.get(0);
+
+    ByteBuffer lowerBuf = task.file().lowerBounds().get(fieldId);
+    ByteBuffer upperBuf = task.file().upperBounds().get(fieldId);
+
+    Object lower = lowerBuf != null ? Conversions.fromByteBuffer(type, lowerBuf) : null;
+    Object upper = upperBuf != null ? Conversions.fromByteBuffer(type, upperBuf) : null;
+
+    return "[" + lower + ".." + upper + "]";
   }
 }
