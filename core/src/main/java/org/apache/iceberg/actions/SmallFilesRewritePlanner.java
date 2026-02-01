@@ -183,6 +183,24 @@ public class SmallFilesRewritePlanner
         COLUMNS,
         USE_IDENTIFIER_KEYS);
 
+    // Initialize options that are needed even for unsorted fallback
+    this.maxGroupSize =
+        PropertyUtil.propertyAsLong(
+            options, MAX_FILE_GROUP_SIZE_BYTES, MAX_FILE_GROUP_SIZE_BYTES_DEFAULT);
+    this.maxGroupInputFiles =
+        PropertyUtil.propertyAsLong(
+            options, MAX_FILE_GROUP_INPUT_FILES, MAX_FILE_GROUP_INPUT_FILES_DEFAULT);
+    this.lonerWriteMaxFileSize =
+        PropertyUtil.propertyAsLong(
+            options, LONER_TARGET_FILE_SIZE_BYTES, LONER_TARGET_FILE_SIZE_BYTES_DEFAULT);
+    this.deleteFilesOnly =
+        PropertyUtil.propertyAsBoolean(options, DELETE_FILES_ONLY, DELETE_FILES_ONLY_DEFAULT);
+    this.deleteFileThreshold =
+        PropertyUtil.propertyAsInt(options, DELETE_FILE_THRESHOLD, DELETE_FILE_THRESHOLD_DEFAULT);
+    this.deleteRatioThreshold =
+        PropertyUtil.propertyAsDouble(
+            options, DELETE_RATIO_THRESHOLD, DELETE_RATIO_THRESHOLD_DEFAULT);
+
     List<String> columns;
     if (useIdentifierKeys) {
       Set<Integer> identifierFieldIds = table().schema().identifierFieldIds();
@@ -190,6 +208,7 @@ public class SmallFilesRewritePlanner
         LOG.info("SMALL_FILES [{}]: table has no identifier keys, using unsorted fallback", table().name());
         this.columnFieldIds = ImmutableList.of();
         this.columnTypes = ImmutableList.of();
+        this.useUuidPrefixBucketing = false;
         return;
       }
       // Sort by fieldId for stable ordering (same as SparkSmallFilesRewriteRunner)
@@ -225,25 +244,6 @@ public class SmallFilesRewritePlanner
           field.fieldId(),
           field.type());
     }
-
-    this.maxGroupSize =
-        PropertyUtil.propertyAsLong(
-            options, MAX_FILE_GROUP_SIZE_BYTES, MAX_FILE_GROUP_SIZE_BYTES_DEFAULT);
-    this.maxGroupInputFiles =
-        PropertyUtil.propertyAsLong(
-            options, MAX_FILE_GROUP_INPUT_FILES, MAX_FILE_GROUP_INPUT_FILES_DEFAULT);
-
-    this.lonerWriteMaxFileSize =
-        PropertyUtil.propertyAsLong(
-            options, LONER_TARGET_FILE_SIZE_BYTES, LONER_TARGET_FILE_SIZE_BYTES_DEFAULT);
-
-    this.deleteFilesOnly =
-        PropertyUtil.propertyAsBoolean(options, DELETE_FILES_ONLY, DELETE_FILES_ONLY_DEFAULT);
-    this.deleteFileThreshold =
-        PropertyUtil.propertyAsInt(options, DELETE_FILE_THRESHOLD, DELETE_FILE_THRESHOLD_DEFAULT);
-    this.deleteRatioThreshold =
-        PropertyUtil.propertyAsDouble(
-            options, DELETE_RATIO_THRESHOLD, DELETE_RATIO_THRESHOLD_DEFAULT);
 
     this.useUuidPrefixBucketing =
         PropertyUtil.propertyAsBoolean(options, USE_UUID_PREFIX_BUCKETING, false);
