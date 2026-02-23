@@ -376,6 +376,7 @@ public class RewriteTablePathUtil {
    * @param targetPrefix target prefix that will replace it
    * @param stagingLocation staging location for rewritten files (referred delete file will be
    *     rewritten here)
+   * @param posDeleteReaderWriter class to read and write position delete files
    * @return a copy plan of content files in the manifest that was rewritten
    */
   public static RewriteResult<DeleteFile> rewriteDeleteManifest(
@@ -387,7 +388,8 @@ public class RewriteTablePathUtil {
       Map<Integer, PartitionSpec> specsById,
       String sourcePrefix,
       String targetPrefix,
-      String stagingLocation)
+      String stagingLocation,
+      PositionDeleteReaderWriter posDeleteReaderWriter)
       throws IOException {
     PartitionSpec spec = specsById.get(manifestFile.partitionSpecId());
     try (ManifestWriter<DeleteFile> writer =
@@ -405,7 +407,9 @@ public class RewriteTablePathUtil {
                       sourcePrefix,
                       targetPrefix,
                       stagingLocation,
-                      writer))
+                      writer,
+                      io,
+                      posDeleteReaderWriter))
           .reduce(new RewriteResult<>(), RewriteResult::append);
     }
   }
@@ -445,14 +449,38 @@ public class RewriteTablePathUtil {
       String sourcePrefix,
       String targetPrefix,
       String stagingLocation,
-      ManifestWriter<DeleteFile> writer) {
-
+      ManifestWriter<DeleteFile> writer,
+      FileIO io,
+      PositionDeleteReaderWriter posDeleteReaderWriter) {
     DeleteFile file = entry.file();
     RewriteResult<DeleteFile> result = new RewriteResult<>();
 
     switch (file.content()) {
       case POSITION_DELETES:
-        DeleteFile posDeleteFile = newPositionDeleteEntry(file, spec, sourcePrefix, targetPrefix);
+        // FIX: write the physical file FIRST so we know its actual byte size, then record that
+        // size in the manifest entry. Previously the manifest was written with file_size_in_bytes
+        // copied from the original file (.copy(file)), but the rewritten file has different-length
+        // paths and therefore a different size. Spark does seek(size - 8) to find the Parquet
+        // footer PAR1 magic bytes, which instead landed inside path data producing bytes like
+        // "2d29" -> "Not a Parquet file" error.
+        String stagingFilePath = stagingPath(file.location(), sourcePrefix, stagingLocation);
+        OutputFile stagingOutputFile = io.newOutputFile(stagingFilePath);
+        try {
+          rewritePositionDeleteFile(
+              file,
+              stagingOutputFile,
+              io,
+              spec,
+              sourcePrefix,
+              targetPrefix,
+              posDeleteReaderWriter);
+        } catch (IOException e) {
+          throw new UncheckedIOException(
+              "Failed to rewrite position delete file " + file.location(), e);
+        }
+        long actualFileSize = io.newInputFile(stagingFilePath).getLength();
+        DeleteFile posDeleteFile =
+            newPositionDeleteEntry(file, spec, sourcePrefix, targetPrefix, actualFileSize);
         appendEntryWithFile(entry, writer, posDeleteFile);
         // keep the following entries in metadata but exclude them from copyPlan
         // 1) deleted position delete files
@@ -462,7 +490,7 @@ public class RewriteTablePathUtil {
               .copyPlan()
               .add(
                   Pair.of(
-                      stagingPath(file.location(), sourcePrefix, stagingLocation),
+                      stagingFilePath,
                       posDeleteFile.location()));
         }
         result.toRewrite().add(file);
@@ -530,11 +558,36 @@ public class RewriteTablePathUtil {
         "Expected delete file %s to start with prefix: %s",
         path,
         sourcePrefix);
-
     FileMetadata.Builder builder =
         FileMetadata.deleteFileBuilder(spec)
             .copy(file)
             .withPath(newPath(path, sourcePrefix, targetPrefix))
+            .withMetrics(ContentFileUtil.replacePathBounds(file, sourcePrefix, targetPrefix));
+    // Update referencedDataFile for DV files
+    String newReferencedDataFile =
+        rewriteReferencedDataFilePathForDV(file, sourcePrefix, targetPrefix);
+    if (newReferencedDataFile != null) {
+      builder.withReferencedDataFile(newReferencedDataFile);
+    }
+    return builder.build();
+  }
+  private static DeleteFile newPositionDeleteEntry(
+      DeleteFile file,
+      PartitionSpec spec,
+      String sourcePrefix,
+      String targetPrefix,
+      long actualFileSize) {
+    String path = file.location();
+    Preconditions.checkArgument(
+        path.startsWith(sourcePrefix),
+        "Expected delete file %s to start with prefix: %s",
+        path,
+        sourcePrefix);
+    FileMetadata.Builder builder =
+        FileMetadata.deleteFileBuilder(spec)
+            .copy(file)
+            .withPath(newPath(path, sourcePrefix, targetPrefix))
+            .withFileSizeInBytes(actualFileSize)
             .withMetrics(ContentFileUtil.replacePathBounds(file, sourcePrefix, targetPrefix));
 
     // Update referencedDataFile for DV files
