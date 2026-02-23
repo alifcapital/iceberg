@@ -73,7 +73,6 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.JobGroupInfo;
 import org.apache.iceberg.spark.source.SerializableTableWithSize;
 import org.apache.iceberg.util.Pair;
-import org.apache.spark.api.java.function.ForeachFunction;
 import org.apache.spark.api.java.function.MapFunction;
 import org.apache.spark.api.java.function.ReduceFunction;
 import org.apache.spark.broadcast.Broadcast;
@@ -182,10 +181,8 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
         !sourcePrefix.equals(targetPrefix),
         "Source prefix cannot be the same as target prefix (%s)",
         sourcePrefix);
-
     validateAndSetEndVersion();
     validateAndSetStartVersion();
-
     if (stagingDir == null) {
       stagingDir =
           getMetadataLocation(table)
@@ -199,7 +196,6 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
 
   private void validateAndSetEndVersion() {
     TableMetadata tableMetadata = ((HasTableOperations) table).operations().current();
-
     if (endVersionName == null) {
       LOG.info("No end version specified. Will stage all files to the latest table version.");
       Preconditions.checkNotNull(
@@ -212,7 +208,6 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
 
   private void validateAndSetStartVersion() {
     TableMetadata tableMetadata = ((HasTableOperations) table).operations().current();
-
     if (startVersionName != null) {
       this.startVersionName = validateVersion(tableMetadata, startVersionName);
     }
@@ -223,13 +218,11 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     if (versionInFilePath(tableMetadata.metadataFileLocation(), versionFileName)) {
       versionFile = tableMetadata.metadataFileLocation();
     }
-
     for (MetadataLogEntry log : tableMetadata.previousFiles()) {
       if (versionInFilePath(log.file(), versionFileName)) {
         versionFile = log.file();
       }
     }
-
     Preconditions.checkArgument(
         versionFile != null,
         "Cannot find provided version file %s in metadata log.",
@@ -257,16 +250,6 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     }
   }
 
-  /**
-   * Rebuild metadata in a staging location, with paths rewritten.
-   *
-   * <ul>
-   *   <li>Rebuild version files to staging
-   *   <li>Rebuild manifest list files to staging
-   *   <li>Rebuild manifest to staging
-   *   <li>Get all files needed to move
-   * </ul>
-   */
   private Result rebuildMetadata() {
     TableMetadata startMetadata =
         startVersionName != null
@@ -277,37 +260,30 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     TableMetadata endMetadata =
         ((HasTableOperations) newStaticTable(endVersionName, table.io())).operations().current();
 
-    // rebuild version files
     RewriteResult<Snapshot> rewriteVersionResult = rewriteVersionFiles(endMetadata);
     Set<Snapshot> deltaSnapshots = deltaSnapshots(startMetadata, rewriteVersionResult.toRewrite());
-
     Set<String> manifestsToRewrite = manifestsToRewrite(deltaSnapshots, startMetadata);
     Set<Snapshot> validSnapshots =
         Sets.difference(snapshotSet(endMetadata), snapshotSet(startMetadata));
 
-    // rebuild manifest-list files
     RewriteResult<ManifestFile> rewriteManifestListResult =
         validSnapshots.stream()
             .map(snapshot -> rewriteManifestList(snapshot, endMetadata, manifestsToRewrite))
             .reduce(new RewriteResult<>(), RewriteResult::append);
 
-    // rebuild manifest files
+    // Position delete files are written inline during manifest rewriting so that
+    // file_size_in_bytes in each manifest entry matches the actual written file.
     Set<ManifestFile> metaFiles = rewriteManifestListResult.toRewrite();
     RewriteContentFileResult rewriteManifestResult =
         rewriteManifests(deltaSnapshots, endMetadata, rewriteManifestListResult.toRewrite());
 
-    // rebuild position delete files
-    Set<DeleteFile> deleteFiles =
-        rewriteManifestResult.toRewrite().stream()
-            .filter(e -> e instanceof DeleteFile)
-            .map(e -> (DeleteFile) e)
-            .collect(Collectors.toSet());
-    rewritePositionDeletes(deleteFiles);
+    long rewrittenDeleteCount =
+        rewriteManifestResult.toRewrite().stream().filter(e -> e instanceof DeleteFile).count();
 
     ImmutableRewriteTablePath.Result.Builder builder =
         ImmutableRewriteTablePath.Result.builder()
             .stagingLocation(stagingDir)
-            .rewrittenDeleteFilePathsCount(deleteFiles.size())
+            .rewrittenDeleteFilePathsCount((int) rewrittenDeleteCount)
             .rewrittenManifestFilePathsCount(metaFiles.size())
             .latestVersion(RewriteTablePathUtil.fileName(endVersionName));
 
@@ -320,7 +296,6 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     copyPlan.addAll(rewriteManifestListResult.copyPlan());
     copyPlan.addAll(rewriteManifestResult.copyPlan());
     String fileListLocation = saveFileList(copyPlan);
-
     return builder.fileListLocation(fileListLocation).build();
   }
 
@@ -360,24 +335,20 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     RewriteResult<Snapshot> result = new RewriteResult<>();
     result.toRewrite().addAll(endMetadata.snapshots());
     result.copyPlan().addAll(rewriteVersionFile(endMetadata, endVersionName));
-
     List<MetadataLogEntry> versions = endMetadata.previousFiles();
     for (int i = versions.size() - 1; i >= 0; i--) {
       String versionFilePath = versions.get(i).file();
       if (versionFilePath.equals(startVersionName)) {
         break;
       }
-
       Preconditions.checkArgument(
           fileExist(versionFilePath),
           String.format("Version file %s doesn't exist", versionFilePath));
       TableMetadata tableMetadata =
           new StaticTableOperations(versionFilePath, table.io()).current();
-
       result.toRewrite().addAll(tableMetadata.snapshots());
       result.copyPlan().addAll(rewriteVersionFile(tableMetadata, versionFilePath));
     }
-
     return result;
   }
 
@@ -393,10 +364,7 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
         Pair.of(
             stagingPath,
             RewriteTablePathUtil.newPath(versionFilePath, sourcePrefix, targetPrefix)));
-
-    // include statistics files in copy plan
-    result.addAll(
-        statsFileCopyPlan(metadata.statisticsFiles(), newTableMetadata.statisticsFiles()));
+    result.addAll(statsFileCopyPlan(metadata.statisticsFiles(), newTableMetadata.statisticsFiles()));
     result.addAll(
         partitionStatsFileCopyPlan(
             metadata.partitionStatisticsFiles(), newTableMetadata.partitionStatisticsFiles()));
@@ -409,7 +377,6 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     if (beforeStats.isEmpty()) {
       return result;
     }
-
     Preconditions.checkArgument(
         beforeStats.size() == afterStats.size(),
         "Before and after path rewrite, statistic files count should be same");
@@ -430,7 +397,6 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     if (beforeStats.isEmpty()) {
       return result;
     }
-
     Preconditions.checkArgument(
         beforeStats.size() == afterStats.size(),
         "Before and after path rewrite, partition statistic files count should be same");
@@ -445,19 +411,9 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     return result;
   }
 
-  /**
-   * Rewrite a manifest list representing a snapshot.
-   *
-   * @param snapshot snapshot represented by the manifest list
-   * @param tableMetadata metadata of table
-   * @param manifestsToRewrite filter of manifests to rewrite.
-   * @return a result including a copy plan for the manifests contained in the manifest list, as
-   *     well as for the manifest list itself
-   */
   private RewriteResult<ManifestFile> rewriteManifestList(
       Snapshot snapshot, TableMetadata tableMetadata, Set<String> manifestsToRewrite) {
     RewriteResult<ManifestFile> result = new RewriteResult<>();
-
     String path = snapshot.manifestListLocation();
     String outputPath = RewriteTablePathUtil.stagingPath(path, sourcePrefix, stagingDir);
     RewriteResult<ManifestFile> rewriteResult =
@@ -470,9 +426,7 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
             targetPrefix,
             stagingDir,
             outputPath);
-
     result.append(rewriteResult);
-    // add the manifest list copy plan itself to the result
     result
         .copyPlan()
         .add(Pair.of(outputPath, RewriteTablePathUtil.newPath(path, sourcePrefix, targetPrefix)));
@@ -528,19 +482,17 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     }
   }
 
-  /** Rewrite manifest files in a distributed manner and return rewritten data files path pairs. */
   private RewriteContentFileResult rewriteManifests(
       Set<Snapshot> deltaSnapshots, TableMetadata tableMetadata, Set<ManifestFile> toRewrite) {
     if (toRewrite.isEmpty()) {
       return new RewriteContentFileResult();
     }
-
     Encoder<ManifestFile> manifestFileEncoder = Encoders.javaSerialization(ManifestFile.class);
     Dataset<ManifestFile> manifestDS =
         spark().createDataset(Lists.newArrayList(toRewrite), manifestFileEncoder);
     Set<Long> deltaSnapshotIds =
         deltaSnapshots.stream().map(Snapshot::snapshotId).collect(Collectors.toSet());
-
+    PositionDeleteReaderWriter posDeleteReaderWriter = new SparkPositionDeleteReaderWriter();
     return manifestDS
         .repartition(toRewrite.size())
         .map(
@@ -550,10 +502,9 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
                 stagingDir,
                 tableMetadata.formatVersion(),
                 sourcePrefix,
-                targetPrefix),
+                targetPrefix,
+                posDeleteReaderWriter),
             Encoders.bean(RewriteContentFileResult.class))
-        // duplicates are expected here as the same data file can have different statuses
-        // (e.g. added and deleted)
         .reduce((ReduceFunction<RewriteContentFileResult>) RewriteContentFileResult::append);
   }
 
@@ -563,32 +514,20 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
       String stagingLocation,
       int format,
       String sourcePrefix,
-      String targetPrefix) {
-
+      String targetPrefix,
+      PositionDeleteReaderWriter posDeleteReaderWriter) {
     return manifestFile -> {
       RewriteContentFileResult result = new RewriteContentFileResult();
       switch (manifestFile.content()) {
         case DATA:
           result.appendDataFile(
               writeDataManifest(
-                  manifestFile,
-                  table,
-                  deltaSnapshotIds,
-                  stagingLocation,
-                  format,
-                  sourcePrefix,
-                  targetPrefix));
+                  manifestFile, table, deltaSnapshotIds, stagingLocation, format, sourcePrefix, targetPrefix));
           break;
         case DELETES:
           result.appendDeleteFile(
               writeDeleteManifest(
-                  manifestFile,
-                  table,
-                  deltaSnapshotIds,
-                  stagingLocation,
-                  format,
-                  sourcePrefix,
-                  targetPrefix));
+                  manifestFile, table, deltaSnapshotIds, stagingLocation, format, sourcePrefix, targetPrefix, posDeleteReaderWriter));
           break;
         default:
           throw new UnsupportedOperationException(
@@ -614,14 +553,7 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
       Map<Integer, PartitionSpec> specsById = table.getValue().specs();
       Set<Long> deltaSnapshotIds = snapshotIds.value();
       return RewriteTablePathUtil.rewriteDataManifest(
-          manifestFile,
-          deltaSnapshotIds,
-          outputFile,
-          io,
-          format,
-          specsById,
-          sourcePrefix,
-          targetPrefix);
+          manifestFile, deltaSnapshotIds, outputFile, io, format, specsById, sourcePrefix, targetPrefix);
     } catch (IOException e) {
       throw new RuntimeIOException(e);
     }
@@ -634,7 +566,8 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
       String stagingLocation,
       int format,
       String sourcePrefix,
-      String targetPrefix) {
+      String targetPrefix,
+      PositionDeleteReaderWriter posDeleteReaderWriter) {
     try {
       String stagingPath =
           RewriteTablePathUtil.stagingPath(manifestFile.path(), sourcePrefix, stagingLocation);
@@ -643,78 +576,25 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
       Map<Integer, PartitionSpec> specsById = table.getValue().specs();
       Set<Long> deltaSnapshotIds = snapshotIds.value();
       return RewriteTablePathUtil.rewriteDeleteManifest(
-          manifestFile,
-          deltaSnapshotIds,
-          outputFile,
-          io,
-          format,
-          specsById,
-          sourcePrefix,
-          targetPrefix,
-          stagingLocation);
+          manifestFile, deltaSnapshotIds, outputFile, io, format, specsById,
+          sourcePrefix, targetPrefix, stagingLocation, posDeleteReaderWriter);
     } catch (IOException e) {
       throw new RuntimeIOException(e);
     }
   }
 
-  private void rewritePositionDeletes(Set<DeleteFile> toRewrite) {
-    if (toRewrite.isEmpty()) {
-      return;
-    }
-
-    Encoder<DeleteFile> deleteFileEncoder = Encoders.javaSerialization(DeleteFile.class);
-    Dataset<DeleteFile> deleteFileDs =
-        spark().createDataset(Lists.newArrayList(toRewrite), deleteFileEncoder);
-
-    PositionDeleteReaderWriter posDeleteReaderWriter = new SparkPositionDeleteReaderWriter();
-    deleteFileDs
-        .repartition(toRewrite.size())
-        .foreach(
-            rewritePositionDelete(
-                tableBroadcast(), sourcePrefix, targetPrefix, stagingDir, posDeleteReaderWriter));
-  }
-
   private static class SparkPositionDeleteReaderWriter implements PositionDeleteReaderWriter {
     @Override
-    public CloseableIterable<Record> reader(
-        InputFile inputFile, FileFormat format, PartitionSpec spec) {
+    public CloseableIterable<Record> reader(InputFile inputFile, FileFormat format, PartitionSpec spec) {
       return positionDeletesReader(inputFile, format, spec);
     }
 
     @Override
     public PositionDeleteWriter<Record> writer(
-        OutputFile outputFile,
-        FileFormat format,
-        PartitionSpec spec,
-        StructLike partition,
-        Schema rowSchema)
+        OutputFile outputFile, FileFormat format, PartitionSpec spec, StructLike partition, Schema rowSchema)
         throws IOException {
       return positionDeletesWriter(outputFile, format, spec, partition, rowSchema);
     }
-  }
-
-  private ForeachFunction<DeleteFile> rewritePositionDelete(
-      Broadcast<Table> tableArg,
-      String sourcePrefixArg,
-      String targetPrefixArg,
-      String stagingLocationArg,
-      PositionDeleteReaderWriter posDeleteReaderWriter) {
-    return deleteFile -> {
-      FileIO io = tableArg.getValue().io();
-      String newPath =
-          RewriteTablePathUtil.stagingPath(
-              deleteFile.location(), sourcePrefixArg, stagingLocationArg);
-      OutputFile outputFile = io.newOutputFile(newPath);
-      PartitionSpec spec = tableArg.getValue().specs().get(deleteFile.specId());
-      RewriteTablePathUtil.rewritePositionDeleteFile(
-          deleteFile,
-          outputFile,
-          io,
-          spec,
-          sourcePrefixArg,
-          targetPrefixArg,
-          posDeleteReaderWriter);
-    };
   }
 
   private static CloseableIterable<Record> positionDeletesReader(
@@ -727,32 +607,24 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
             .reuseContainers()
             .createReaderFunc(fileSchema -> PlannedDataReader.create(deleteSchema))
             .build();
-
       case PARQUET:
         return Parquet.read(inputFile)
             .project(deleteSchema)
             .reuseContainers()
-            .createReaderFunc(
-                fileSchema -> GenericParquetReaders.buildReader(deleteSchema, fileSchema))
+            .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(deleteSchema, fileSchema))
             .build();
-
       case ORC:
         return ORC.read(inputFile)
             .project(deleteSchema)
             .createReaderFunc(fileSchema -> GenericOrcReader.buildReader(deleteSchema, fileSchema))
             .build();
-
       default:
         throw new UnsupportedOperationException("Unsupported file format: " + format);
     }
   }
 
   private static PositionDeleteWriter<Record> positionDeletesWriter(
-      OutputFile outputFile,
-      FileFormat format,
-      PartitionSpec spec,
-      StructLike partition,
-      Schema rowSchema)
+      OutputFile outputFile, FileFormat format, PartitionSpec spec, StructLike partition, Schema rowSchema)
       throws IOException {
     switch (format) {
       case AVRO:
@@ -804,9 +676,7 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     if (lastIndex != -1) {
       metadataDir = currentMetadataPath.substring(0, lastIndex + 1);
     }
-
-    Preconditions.checkArgument(
-        !metadataDir.isEmpty(), "Failed to get the metadata file root directory");
+    Preconditions.checkArgument(!metadataDir.isEmpty(), "Failed to get the metadata file root directory");
     return metadataDir;
   }
 
@@ -815,7 +685,6 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     if (tableBroadcast == null) {
       this.tableBroadcast = sparkContext().broadcast(SerializableTableWithSize.copyOf(table));
     }
-
     return tableBroadcast;
   }
 }

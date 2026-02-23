@@ -17,7 +17,6 @@
  * under the License.
  */
 package org.apache.iceberg;
-
 import java.io.IOException;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
@@ -54,56 +53,27 @@ import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.iceberg.util.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 /** Utilities for Rewrite table path action. */
 public class RewriteTablePathUtil {
-
   private static final Logger LOG = LoggerFactory.getLogger(RewriteTablePathUtil.class);
-  // Use the POSIX separator instead of File.separator because File.separator is dependent on
-  // the client environment and not the target filesystem. POSIX is compatible with S3, GCS, etc
   public static final String FILE_SEPARATOR = "/";
-
   private RewriteTablePathUtil() {}
-
-  /**
-   * Rewrite result.
-   *
-   * @param <T> type of file to rewrite
-   */
   public static class RewriteResult<T> implements Serializable {
     private final Set<T> toRewrite = Sets.newHashSet();
     private final Set<Pair<String, String>> copyPlan = Sets.newHashSet();
-
     public RewriteResult() {}
-
     public RewriteResult<T> append(RewriteResult<T> r1) {
       toRewrite.addAll(r1.toRewrite);
       copyPlan.addAll(r1.copyPlan);
       return this;
     }
-
-    /** Returns next list of files to rewrite (discovered by rewriting this file) */
     public Set<T> toRewrite() {
       return toRewrite;
     }
-
-    /**
-     * Returns a copy plan of files whose metadata were rewritten, for each file a source and target
-     * location
-     */
     public Set<Pair<String, String>> copyPlan() {
       return copyPlan;
     }
   }
-
-  /**
-   * Create a new table metadata object, replacing path references
-   *
-   * @param metadata source table metadata
-   * @param sourcePrefix source prefix that will be replaced
-   * @param targetPrefix target prefix that will replace it
-   * @return copy of table metadata with paths replaced
-   */
   public static TableMetadata replacePaths(
       TableMetadata metadata, String sourcePrefix, String targetPrefix) {
     String newLocation = metadata.location().replaceFirst(sourcePrefix, targetPrefix);
@@ -114,7 +84,6 @@ public class RewriteTablePathUtil {
         metadata.currentSnapshot() == null ? -1 : metadata.currentSnapshot().snapshotId();
     Map<String, String> properties =
         updateProperties(metadata.properties(), sourcePrefix, targetPrefix);
-
     return new TableMetadata(
         null,
         metadata.formatVersion(),
@@ -144,7 +113,6 @@ public class RewriteTablePathUtil {
         metadata.encryptionKeys(),
         metadata.changes());
   }
-
   private static Map<String, String> updateProperties(
       Map<String, String> tableProperties, String sourcePrefix, String targetPrefix) {
     Map<String, String> properties = Maps.newHashMap(tableProperties);
@@ -155,10 +123,8 @@ public class RewriteTablePathUtil {
         properties, sourcePrefix, targetPrefix, TableProperties.WRITE_DATA_LOCATION);
     updatePathInProperty(
         properties, sourcePrefix, targetPrefix, TableProperties.WRITE_METADATA_LOCATION);
-
     return properties;
   }
-
   private static void updatePathInProperty(
       Map<String, String> properties,
       String sourcePrefix,
@@ -169,7 +135,6 @@ public class RewriteTablePathUtil {
           propertyName, newPath(properties.get(propertyName), sourcePrefix, targetPrefix));
     }
   }
-
   private static List<StatisticsFile> updatePathInStatisticsFiles(
       List<StatisticsFile> statisticsFiles, String sourcePrefix, String targetPrefix) {
     return statisticsFiles.stream()
@@ -183,21 +148,10 @@ public class RewriteTablePathUtil {
                     existing.blobMetadata()))
         .collect(Collectors.toList());
   }
-
-  /**
-   * This method updates the file paths in a list of PartitionStatisticsFile. It replaces the
-   * sourcePrefix in the file paths with the targetPrefix.
-   *
-   * @param partitionStatisticsFiles The list of PartitionStatisticsFile to update.
-   * @param sourcePrefix The prefix to be replaced in the file paths.
-   * @param targetPrefix The new prefix to replace the sourcePrefix in the file paths.
-   * @return A new list of PartitionStatisticsFile with updated file paths.
-   */
   private static List<PartitionStatisticsFile> updatePathInPartitionStatisticsFiles(
       List<PartitionStatisticsFile> partitionStatisticsFiles,
       String sourcePrefix,
       String targetPrefix) {
-
     return partitionStatisticsFiles.stream()
         .map(
             existing ->
@@ -208,7 +162,6 @@ public class RewriteTablePathUtil {
                     .build())
         .collect(Collectors.toList());
   }
-
   private static List<TableMetadata.MetadataLogEntry> updatePathInMetadataLogs(
       TableMetadata metadata, String sourcePrefix, String targetPrefix) {
     List<TableMetadata.MetadataLogEntry> metadataLogEntries =
@@ -222,7 +175,6 @@ public class RewriteTablePathUtil {
     }
     return metadataLogEntries;
   }
-
   private static List<Snapshot> updatePathInSnapshots(
       TableMetadata metadata, String sourcePrefix, String targetPrefix) {
     List<Snapshot> newSnapshots = Lists.newArrayListWithCapacity(metadata.snapshots().size());
@@ -246,21 +198,6 @@ public class RewriteTablePathUtil {
     }
     return newSnapshots;
   }
-
-  /**
-   * Rewrite a manifest list representing a snapshot, replacing path references.
-   *
-   * @param snapshot snapshot represented by the manifest list
-   * @param io file io
-   * @param tableMetadata metadata of table
-   * @param manifestsToRewrite a list of manifest files to filter for rewrite
-   * @param sourcePrefix source prefix that will be replaced
-   * @param targetPrefix target prefix that will replace it
-   * @param stagingDir staging directory
-   * @param outputPath location to write the manifest list
-   * @return a copy plan for manifest files whose metadata were contained in the rewritten manifest
-   *     list
-   */
   public static RewriteResult<ManifestFile> rewriteManifestList(
       Snapshot snapshot,
       FileIO io,
@@ -272,7 +209,6 @@ public class RewriteTablePathUtil {
       String outputPath) {
     RewriteResult<ManifestFile> result = new RewriteResult<>();
     OutputFile outputFile = io.newOutputFile(outputPath);
-
     List<ManifestFile> manifestFiles = manifestFilesInSnapshot(io, snapshot);
     manifestFiles.forEach(
         mf ->
@@ -281,12 +217,10 @@ public class RewriteTablePathUtil {
                 "Encountered manifest file %s not under the source prefix %s",
                 mf.path(),
                 sourcePrefix));
-
     EncryptionManager encryptionManager =
         (io instanceof EncryptingFileIO)
             ? ((EncryptingFileIO) io).encryptionManager()
             : PlaintextEncryptionManager.instance();
-
     try (FileAppender<ManifestFile> writer =
         ManifestLists.write(
             tableMetadata.formatVersion(),
@@ -296,12 +230,10 @@ public class RewriteTablePathUtil {
             snapshot.parentId(),
             snapshot.sequenceNumber(),
             snapshot.firstRowId())) {
-
       for (ManifestFile file : manifestFiles) {
         ManifestFile newFile = file.copy();
         ((StructLike) newFile).set(0, newPath(newFile.path(), sourcePrefix, targetPrefix));
         writer.add(newFile);
-
         if (manifestsToRewrite.contains(file.path())) {
           result.toRewrite().add(file);
           result
@@ -315,7 +247,6 @@ public class RewriteTablePathUtil {
           "Failed to rewrite the manifest list file " + snapshot.manifestListLocation(), e);
     }
   }
-
   private static List<ManifestFile> manifestFilesInSnapshot(FileIO io, Snapshot snapshot) {
     String path = snapshot.manifestListLocation();
     List<ManifestFile> manifestFiles = Lists.newLinkedList();
@@ -326,20 +257,6 @@ public class RewriteTablePathUtil {
     }
     return manifestFiles;
   }
-
-  /**
-   * Rewrite a data manifest, replacing path references.
-   *
-   * @param manifestFile source manifest file to rewrite
-   * @param snapshotIds snapshot ids for filtering returned data manifest entries
-   * @param outputFile output file to rewrite manifest file to
-   * @param io file io
-   * @param format format of the manifest file
-   * @param specsById map of partition specs by id
-   * @param sourcePrefix source prefix that will be replaced
-   * @param targetPrefix target prefix that will replace it
-   * @return a copy plan of content files in the manifest that was rewritten
-   */
   public static RewriteResult<DataFile> rewriteDataManifest(
       ManifestFile manifestFile,
       Set<Long> snapshotIds,
@@ -362,21 +279,13 @@ public class RewriteTablePathUtil {
           .reduce(new RewriteResult<>(), RewriteResult::append);
     }
   }
-
   /**
    * Rewrite a delete manifest, replacing path references.
    *
-   * @param manifestFile source delete manifest to rewrite
-   * @param snapshotIds snapshot ids for filtering returned delete manifest entries
-   * @param outputFile output file to rewrite manifest file to
-   * @param io file io
-   * @param format format of the manifest file
-   * @param specsById map of partition specs by id
-   * @param sourcePrefix source prefix that will be replaced
-   * @param targetPrefix target prefix that will replace it
-   * @param stagingLocation staging location for rewritten files (referred delete file will be
-   *     rewritten here)
-   * @return a copy plan of content files in the manifest that was rewritten
+   * <p>Position delete files are written inline (before the manifest entry) so that the actual
+   * file_size_in_bytes recorded in the manifest matches the physical file on disk. This fixes a
+   * bug where Spark's Parquet footer seek (seek(size-8)) landed in the middle of path data
+   * because the manifest carried the original file size instead of the rewritten one.
    */
   public static RewriteResult<DeleteFile> rewriteDeleteManifest(
       ManifestFile manifestFile,
@@ -387,7 +296,8 @@ public class RewriteTablePathUtil {
       Map<Integer, PartitionSpec> specsById,
       String sourcePrefix,
       String targetPrefix,
-      String stagingLocation)
+      String stagingLocation,
+      PositionDeleteReaderWriter posDeleteReaderWriter)
       throws IOException {
     PartitionSpec spec = specsById.get(manifestFile.partitionSpecId());
     try (ManifestWriter<DeleteFile> writer =
@@ -405,11 +315,12 @@ public class RewriteTablePathUtil {
                       sourcePrefix,
                       targetPrefix,
                       stagingLocation,
-                      writer))
+                      writer,
+                      io,
+                      posDeleteReaderWriter))
           .reduce(new RewriteResult<>(), RewriteResult::append);
     }
   }
-
   private static RewriteResult<DataFile> writeDataFileEntry(
       ManifestEntry<DataFile> entry,
       Set<Long> snapshotIds,
@@ -429,15 +340,19 @@ public class RewriteTablePathUtil {
     DataFile newDataFile =
         DataFiles.builder(spec).copy(entry.file()).withPath(targetDataFilePath).build();
     appendEntryWithFile(entry, writer, newDataFile);
-    // keep the following entries in metadata but exclude them from copyPlan
-    // 1) deleted data files
-    // 2) entries not changed by snapshotIds
     if (entry.isLive() && snapshotIds.contains(entry.snapshotId())) {
       result.copyPlan().add(Pair.of(sourceDataFilePath, newDataFile.location()));
     }
     return result;
   }
-
+  /**
+   * Write a single delete manifest entry.
+   *
+   * <p>For POSITION_DELETES: the physical file is rewritten first so its actual size is known,
+   * then the manifest entry is recorded with the correct file_size_in_bytes. Writing the manifest
+   * with the original size would cause Spark to seek to the wrong offset when reading the Parquet
+   * footer, resulting in a "Not a Parquet file" error (magic bytes read as e.g. "2d29" != "PAR1").
+   */
   private static RewriteResult<DeleteFile> writeDeleteFileEntry(
       ManifestEntry<DeleteFile> entry,
       Set<Long> snapshotIds,
@@ -445,48 +360,44 @@ public class RewriteTablePathUtil {
       String sourcePrefix,
       String targetPrefix,
       String stagingLocation,
-      ManifestWriter<DeleteFile> writer) {
-
+      ManifestWriter<DeleteFile> writer,
+      FileIO io,
+      PositionDeleteReaderWriter posDeleteReaderWriter) {
     DeleteFile file = entry.file();
     RewriteResult<DeleteFile> result = new RewriteResult<>();
-
     switch (file.content()) {
       case POSITION_DELETES:
-        DeleteFile posDeleteFile = newPositionDeleteEntry(file, spec, sourcePrefix, targetPrefix);
+        String stagingFilePath = stagingPath(file.location(), sourcePrefix, stagingLocation);
+        OutputFile stagingOutputFile = io.newOutputFile(stagingFilePath);
+        try {
+          rewritePositionDeleteFile(
+              file, stagingOutputFile, io, spec, sourcePrefix, targetPrefix, posDeleteReaderWriter);
+        } catch (IOException e) {
+          throw new UncheckedIOException(
+              "Failed to rewrite position delete file " + file.location(), e);
+        }
+        long actualFileSize = io.newInputFile(stagingFilePath).getLength();
+        DeleteFile posDeleteFile =
+            newPositionDeleteEntry(file, spec, sourcePrefix, targetPrefix, actualFileSize);
         appendEntryWithFile(entry, writer, posDeleteFile);
-        // keep the following entries in metadata but exclude them from copyPlan
-        // 1) deleted position delete files
-        // 2) entries not changed by snapshotIds
         if (entry.isLive() && snapshotIds.contains(entry.snapshotId())) {
-          result
-              .copyPlan()
-              .add(
-                  Pair.of(
-                      stagingPath(file.location(), sourcePrefix, stagingLocation),
-                      posDeleteFile.location()));
+          result.copyPlan().add(Pair.of(stagingFilePath, posDeleteFile.location()));
         }
         result.toRewrite().add(file);
         return result;
       case EQUALITY_DELETES:
         DeleteFile eqDeleteFile = newEqualityDeleteEntry(file, spec, sourcePrefix, targetPrefix);
         appendEntryWithFile(entry, writer, eqDeleteFile);
-        // keep the following entries in metadata but exclude them from copyPlan
-        // 1) deleted equality delete files
-        // 2) entries not changed by snapshotIds
         if (entry.isLive() && snapshotIds.contains(entry.snapshotId())) {
-          // No need to rewrite equality delete files as they do not contain absolute file paths.
           result.copyPlan().add(Pair.of(file.location(), eqDeleteFile.location()));
         }
         return result;
-
       default:
         throw new UnsupportedOperationException("Unsupported delete file type: " + file.content());
     }
   }
-
   private static <F extends ContentFile<F>> void appendEntryWithFile(
       ManifestEntry<F> entry, ManifestWriter<F> writer, F file) {
-
     switch (entry.status()) {
       case ADDED:
         writer.add(file);
@@ -500,93 +411,80 @@ public class RewriteTablePathUtil {
         break;
     }
   }
-
   private static DeleteFile newEqualityDeleteEntry(
       DeleteFile file, PartitionSpec spec, String sourcePrefix, String targetPrefix) {
     String path = file.location();
-
     if (!path.startsWith(sourcePrefix)) {
       throw new UnsupportedOperationException(
-          "Expected delete file to be under the source prefix: "
-              + sourcePrefix
-              + " but was "
-              + path);
+          "Expected delete file to be under the source prefix: " + sourcePrefix + " but was " + path);
     }
     int[] equalityFieldIds = file.equalityFieldIds().stream().mapToInt(Integer::intValue).toArray();
-    String newPath = newPath(path, sourcePrefix, targetPrefix);
     return FileMetadata.deleteFileBuilder(spec)
         .ofEqualityDeletes(equalityFieldIds)
         .copy(file)
-        .withPath(newPath)
+        .withPath(newPath(path, sourcePrefix, targetPrefix))
         .withSplitOffsets(file.splitOffsets())
         .build();
   }
-
   private static DeleteFile newPositionDeleteEntry(
       DeleteFile file, PartitionSpec spec, String sourcePrefix, String targetPrefix) {
     String path = file.location();
     Preconditions.checkArgument(
         path.startsWith(sourcePrefix),
-        "Expected delete file %s to start with prefix: %s",
-        path,
-        sourcePrefix);
-
+        "Expected delete file %s to start with prefix: %s", path, sourcePrefix);
     FileMetadata.Builder builder =
         FileMetadata.deleteFileBuilder(spec)
             .copy(file)
             .withPath(newPath(path, sourcePrefix, targetPrefix))
             .withMetrics(ContentFileUtil.replacePathBounds(file, sourcePrefix, targetPrefix));
-
-    // Update referencedDataFile for DV files
-    String newReferencedDataFile =
-        rewriteReferencedDataFilePathForDV(file, sourcePrefix, targetPrefix);
+    String newReferencedDataFile = rewriteReferencedDataFilePathForDV(file, sourcePrefix, targetPrefix);
     if (newReferencedDataFile != null) {
       builder.withReferencedDataFile(newReferencedDataFile);
     }
-
     return builder.build();
   }
-
-  /**
-   * Replace the referenced data file path for a DV (Deletion Vector) file.
-   *
-   * <p>For DV files, returns the updated path with the target prefix. For non-DV files or files
-   * without a referenced data file, returns null.
-   *
-   * @param deleteFile delete file to check
-   * @param sourcePrefix source prefix that will be replaced
-   * @param targetPrefix target prefix that will replace it
-   * @return updated referenced data file path, or null if not applicable
-   */
+  /** Build a position delete manifest entry with an explicit file size known after physical write. */
+  private static DeleteFile newPositionDeleteEntry(
+      DeleteFile file,
+      PartitionSpec spec,
+      String sourcePrefix,
+      String targetPrefix,
+      long actualFileSize) {
+    String path = file.location();
+    Preconditions.checkArgument(
+        path.startsWith(sourcePrefix),
+        "Expected delete file %s to start with prefix: %s", path, sourcePrefix);
+    FileMetadata.Builder builder =
+        FileMetadata.deleteFileBuilder(spec)
+            .copy(file)
+            .withPath(newPath(path, sourcePrefix, targetPrefix))
+            .withFileSizeInBytes(actualFileSize)
+            .withMetrics(ContentFileUtil.replacePathBounds(file, sourcePrefix, targetPrefix));
+    String newReferencedDataFile = rewriteReferencedDataFilePathForDV(file, sourcePrefix, targetPrefix);
+    if (newReferencedDataFile != null) {
+      builder.withReferencedDataFile(newReferencedDataFile);
+    }
+    return builder.build();
+  }
   private static String rewriteReferencedDataFilePathForDV(
       DeleteFile deleteFile, String sourcePrefix, String targetPrefix) {
     if (!ContentFileUtil.isDV(deleteFile) || deleteFile.referencedDataFile() == null) {
       return null;
     }
-
     String oldReferencedDataFile = deleteFile.referencedDataFile();
     if (oldReferencedDataFile.startsWith(sourcePrefix)) {
       return newPath(oldReferencedDataFile, sourcePrefix, targetPrefix);
     }
-
     return oldReferencedDataFile;
   }
-
   /** Class providing engine-specific methods to read and write position delete files. */
   public interface PositionDeleteReaderWriter extends Serializable {
     CloseableIterable<Record> reader(InputFile inputFile, FileFormat format, PartitionSpec spec);
-
     default PositionDeleteWriter<Record> writer(
         OutputFile outputFile, FileFormat format, PartitionSpec spec, StructLike partition)
         throws IOException {
       return writer(outputFile, format, spec, partition, null);
     }
-
-    /**
-     * @deprecated This method is deprecated as of version 1.11.0 and will be removed in 1.12.0.
-     *     Position deletes that include row data are no longer supported. Use {@link
-     *     #writer(OutputFile, FileFormat, PartitionSpec, StructLike)} instead.
-     */
     @Deprecated
     PositionDeleteWriter<Record> writer(
         OutputFile outputFile,
@@ -596,18 +494,6 @@ public class RewriteTablePathUtil {
         Schema rowSchema)
         throws IOException;
   }
-
-  /**
-   * Rewrite a position delete file, replacing path references.
-   *
-   * @param deleteFile source delete file to be rewritten
-   * @param outputFile output file to rewrite delete file to
-   * @param io file io
-   * @param spec spec of delete file
-   * @param sourcePrefix source prefix that will be replaced
-   * @param targetPrefix target prefix to replace it
-   * @param posDeleteReaderWriter class to read and write position delete files
-   */
   public static void rewritePositionDeleteFile(
       DeleteFile deleteFile,
       OutputFile outputFile,
@@ -622,33 +508,25 @@ public class RewriteTablePathUtil {
       throw new UnsupportedOperationException(
           String.format("Expected delete file %s to start with prefix: %s", path, sourcePrefix));
     }
-
-    // DV files (Puffin format for v3+) need special handling to rewrite internal blob metadata
     if (ContentFileUtil.isDV(deleteFile)) {
       rewriteDVFile(deleteFile, outputFile, io, sourcePrefix, targetPrefix);
       return;
     }
-
-    // For non-DV position delete files (v2), rewrite using the reader/writer
     InputFile sourceFile = io.newInputFile(path);
     try (CloseableIterable<Record> reader =
         posDeleteReaderWriter.reader(sourceFile, deleteFile.format(), spec)) {
       Record record = null;
       Schema rowSchema = null;
       CloseableIterator<Record> recordIt = reader.iterator();
-
       if (recordIt.hasNext()) {
         record = recordIt.next();
         rowSchema = record.get(2) != null ? spec.schema() : null;
       }
-
       if (record != null) {
         try (PositionDeleteWriter<Record> writer =
             posDeleteReaderWriter.writer(
                 outputFile, deleteFile.format(), spec, deleteFile.partition(), rowSchema)) {
-
           writer.write(newPositionDeleteRecord(record, sourcePrefix, targetPrefix));
-
           while (recordIt.hasNext()) {
             record = recordIt.next();
             if (record != null) {
@@ -659,16 +537,6 @@ public class RewriteTablePathUtil {
       }
     }
   }
-
-  /**
-   * Rewrite a DV (Deletion Vector) file, updating the referenced data file paths in blob metadata.
-   *
-   * @param deleteFile source DV file to be rewritten
-   * @param outputFile output file to write the rewritten DV to
-   * @param io file io
-   * @param sourcePrefix source prefix that will be replaced
-   * @param targetPrefix target prefix to replace it
-   */
   private static void rewriteDVFile(
       DeleteFile deleteFile,
       OutputFile outputFile,
@@ -678,21 +546,15 @@ public class RewriteTablePathUtil {
       throws IOException {
     List<Blob> rewrittenBlobs = Lists.newArrayList();
     try (PuffinReader reader = Puffin.read(io.newInputFile(deleteFile.location())).build()) {
-      // Read all blobs and rewrite them with updated referenced data file paths
       for (Pair<org.apache.iceberg.puffin.BlobMetadata, ByteBuffer> blobPair :
           reader.readAll(reader.fileMetadata().blobs())) {
         org.apache.iceberg.puffin.BlobMetadata blobMetadata = blobPair.first();
         ByteBuffer blobData = blobPair.second();
-
-        // Get the original properties and update the referenced data file path
         Map<String, String> properties = Maps.newHashMap(blobMetadata.properties());
         String referencedDataFile = properties.get("referenced-data-file");
         if (referencedDataFile != null && referencedDataFile.startsWith(sourcePrefix)) {
-          String newReferencedDataFile = newPath(referencedDataFile, sourcePrefix, targetPrefix);
-          properties.put("referenced-data-file", newReferencedDataFile);
+          properties.put("referenced-data-file", newPath(referencedDataFile, sourcePrefix, targetPrefix));
         }
-
-        // Create a new blob with updated properties
         rewrittenBlobs.add(
             new Blob(
                 blobMetadata.type(),
@@ -704,47 +566,28 @@ public class RewriteTablePathUtil {
                 properties));
       }
     }
-
     try (PuffinWriter writer =
         Puffin.write(outputFile).createdBy(IcebergBuild.fullVersion()).build()) {
       rewrittenBlobs.forEach(writer::write);
     }
   }
-
   private static PositionDelete newPositionDeleteRecord(
       Record record, String sourcePrefix, String targetPrefix) {
     PositionDelete delete = PositionDelete.create();
     String oldPath = (String) record.get(0);
     if (!oldPath.startsWith(sourcePrefix)) {
       throw new UnsupportedOperationException(
-          "Expected delete file to be under the source prefix: "
-              + sourcePrefix
-              + " but was "
-              + oldPath);
+          "Expected delete file to be under the source prefix: " + sourcePrefix + " but was " + oldPath);
     }
-    String newPath = newPath(oldPath, sourcePrefix, targetPrefix);
-    delete.set(newPath, (Long) record.get(1), record.get(2));
+    delete.set(newPath(oldPath, sourcePrefix, targetPrefix), (Long) record.get(1), record.get(2));
     return delete;
   }
-
-  /**
-   * Replace path reference
-   *
-   * @param path path reference
-   * @param sourcePrefix source prefix that will be replaced
-   * @param targetPrefix target prefix that will replace it
-   * @return new path reference
-   */
   public static String newPath(String path, String sourcePrefix, String targetPrefix) {
     return combinePaths(targetPrefix, relativize(path, sourcePrefix));
   }
-
-  /** Combine a base and relative path. */
   public static String combinePaths(String absolutePath, String relativePath) {
     return maybeAppendFileSeparator(absolutePath) + relativePath;
   }
-
-  /** Returns the file name of a path. */
   public static String fileName(String path) {
     String filename = path;
     int lastIndex = path.lastIndexOf(FILE_SEPARATOR);
@@ -753,8 +596,6 @@ public class RewriteTablePathUtil {
     }
     return filename;
   }
-
-  /** Relativize a path. */
   public static String relativize(String path, String prefix) {
     String toRemove = maybeAppendFileSeparator(prefix);
     if (!path.startsWith(toRemove)) {
@@ -763,22 +604,10 @@ public class RewriteTablePathUtil {
     }
     return path.substring(toRemove.length());
   }
-
   public static String maybeAppendFileSeparator(String path) {
     return path.endsWith(FILE_SEPARATOR) ? path : path + FILE_SEPARATOR;
   }
-
-  /**
-   * Construct a staging path under a given staging directory, preserving relative directory
-   * structure to avoid conflicts when multiple files have the same name but different paths.
-   *
-   * @param originalPath source path
-   * @param sourcePrefix source prefix to be replaced
-   * @param stagingDir staging directory
-   * @return a staging path under the staging directory that preserves the relative path structure
-   */
   public static String stagingPath(String originalPath, String sourcePrefix, String stagingDir) {
-    String relativePath = relativize(originalPath, sourcePrefix);
-    return combinePaths(stagingDir, relativePath);
+    return combinePaths(stagingDir, relativize(originalPath, sourcePrefix));
   }
 }
