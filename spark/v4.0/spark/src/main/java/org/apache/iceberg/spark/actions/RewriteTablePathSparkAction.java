@@ -73,7 +73,6 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.JobGroupInfo;
 import org.apache.iceberg.spark.source.SerializableTableWithSize;
 import org.apache.iceberg.util.Pair;
-import org.apache.spark.api.java.function.ForeachFunction;
 import org.apache.spark.api.java.function.MapFunction;
 import org.apache.spark.api.java.function.ReduceFunction;
 import org.apache.spark.broadcast.Broadcast;
@@ -263,7 +262,7 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
    * <ul>
    *   <li>Rebuild version files to staging
    *   <li>Rebuild manifest list files to staging
-   *   <li>Rebuild manifest to staging
+   *   <li>Rebuild manifest to staging (position delete files are rewritten inline)
    *   <li>Get all files needed to move
    * </ul>
    */
@@ -291,23 +290,21 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
             .map(snapshot -> rewriteManifestList(snapshot, endMetadata, manifestsToRewrite))
             .reduce(new RewriteResult<>(), RewriteResult::append);
 
-    // rebuild manifest files
+    // rebuild manifest files (position delete files are written inline during this step)
     Set<ManifestFile> metaFiles = rewriteManifestListResult.toRewrite();
     RewriteContentFileResult rewriteManifestResult =
         rewriteManifests(deltaSnapshots, endMetadata, rewriteManifestListResult.toRewrite());
 
-    // rebuild position delete files
-    Set<DeleteFile> deleteFiles =
+    // Count rewritten position delete files (they were already physically written inline above)
+    long rewrittenDeleteCount =
         rewriteManifestResult.toRewrite().stream()
             .filter(e -> e instanceof DeleteFile)
-            .map(e -> (DeleteFile) e)
-            .collect(Collectors.toSet());
-    rewritePositionDeletes(deleteFiles);
+            .count();
 
     ImmutableRewriteTablePath.Result.Builder builder =
         ImmutableRewriteTablePath.Result.builder()
             .stagingLocation(stagingDir)
-            .rewrittenDeleteFilePathsCount(deleteFiles.size())
+            .rewrittenDeleteFilePathsCount((int) rewrittenDeleteCount)
             .rewrittenManifestFilePathsCount(metaFiles.size())
             .latestVersion(RewriteTablePathUtil.fileName(endVersionName));
 
@@ -528,7 +525,11 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     }
   }
 
-  /** Rewrite manifest files in a distributed manner and return rewritten data files path pairs. */
+  /**
+   * Rewrite manifest files in a distributed manner and return rewritten data/delete file path
+   * pairs. Position delete files are physically rewritten inline during this step so that the
+   * manifest entry {@code file_size_in_bytes} is always accurate.
+   */
   private RewriteContentFileResult rewriteManifests(
       Set<Snapshot> deltaSnapshots, TableMetadata tableMetadata, Set<ManifestFile> toRewrite) {
     if (toRewrite.isEmpty()) {
@@ -541,6 +542,8 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
     Set<Long> deltaSnapshotIds =
         deltaSnapshots.stream().map(Snapshot::snapshotId).collect(Collectors.toSet());
 
+    PositionDeleteReaderWriter posDeleteReaderWriter = new SparkPositionDeleteReaderWriter();
+
     return manifestDS
         .repartition(toRewrite.size())
         .map(
@@ -550,7 +553,8 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
                 stagingDir,
                 tableMetadata.formatVersion(),
                 sourcePrefix,
-                targetPrefix),
+                targetPrefix,
+                posDeleteReaderWriter),
             Encoders.bean(RewriteContentFileResult.class))
         // duplicates are expected here as the same data file can have different statuses
         // (e.g. added and deleted)
@@ -563,7 +567,8 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
       String stagingLocation,
       int format,
       String sourcePrefix,
-      String targetPrefix) {
+      String targetPrefix,
+      PositionDeleteReaderWriter posDeleteReaderWriter) {
 
     return manifestFile -> {
       RewriteContentFileResult result = new RewriteContentFileResult();
@@ -588,7 +593,8 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
                   stagingLocation,
                   format,
                   sourcePrefix,
-                  targetPrefix));
+                  targetPrefix,
+                  posDeleteReaderWriter));
           break;
         default:
           throw new UnsupportedOperationException(
@@ -634,7 +640,8 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
       String stagingLocation,
       int format,
       String sourcePrefix,
-      String targetPrefix) {
+      String targetPrefix,
+      PositionDeleteReaderWriter posDeleteReaderWriter) {
     try {
       String stagingPath =
           RewriteTablePathUtil.stagingPath(manifestFile.path(), sourcePrefix, stagingLocation);
@@ -651,27 +658,11 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
           specsById,
           sourcePrefix,
           targetPrefix,
-          stagingLocation);
+          stagingLocation,
+          posDeleteReaderWriter);
     } catch (IOException e) {
       throw new RuntimeIOException(e);
     }
-  }
-
-  private void rewritePositionDeletes(Set<DeleteFile> toRewrite) {
-    if (toRewrite.isEmpty()) {
-      return;
-    }
-
-    Encoder<DeleteFile> deleteFileEncoder = Encoders.javaSerialization(DeleteFile.class);
-    Dataset<DeleteFile> deleteFileDs =
-        spark().createDataset(Lists.newArrayList(toRewrite), deleteFileEncoder);
-
-    PositionDeleteReaderWriter posDeleteReaderWriter = new SparkPositionDeleteReaderWriter();
-    deleteFileDs
-        .repartition(toRewrite.size())
-        .foreach(
-            rewritePositionDelete(
-                tableBroadcast(), sourcePrefix, targetPrefix, stagingDir, posDeleteReaderWriter));
   }
 
   private static class SparkPositionDeleteReaderWriter implements PositionDeleteReaderWriter {
@@ -691,30 +682,6 @@ public class RewriteTablePathSparkAction extends BaseSparkAction<RewriteTablePat
         throws IOException {
       return positionDeletesWriter(outputFile, format, spec, partition, rowSchema);
     }
-  }
-
-  private ForeachFunction<DeleteFile> rewritePositionDelete(
-      Broadcast<Table> tableArg,
-      String sourcePrefixArg,
-      String targetPrefixArg,
-      String stagingLocationArg,
-      PositionDeleteReaderWriter posDeleteReaderWriter) {
-    return deleteFile -> {
-      FileIO io = tableArg.getValue().io();
-      String newPath =
-          RewriteTablePathUtil.stagingPath(
-              deleteFile.location(), sourcePrefixArg, stagingLocationArg);
-      OutputFile outputFile = io.newOutputFile(newPath);
-      PartitionSpec spec = tableArg.getValue().specs().get(deleteFile.specId());
-      RewriteTablePathUtil.rewritePositionDeleteFile(
-          deleteFile,
-          outputFile,
-          io,
-          spec,
-          sourcePrefixArg,
-          targetPrefixArg,
-          posDeleteReaderWriter);
-    };
   }
 
   private static CloseableIterable<Record> positionDeletesReader(
