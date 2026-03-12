@@ -51,7 +51,11 @@ public class UuidBucketUtil {
     }
 
     long optimalFileCount = Math.max(1, totalSize / targetFileSize);
-    int power = Math.max(0, (int) Math.ceil(Math.log((double) optimalFileCount) / Math.log(2)));
+    int powerUp = Math.max(0, (int) Math.ceil(Math.log((double) optimalFileCount) / Math.log(2)));
+    int powerDown = Math.max(0, powerUp - 1);
+    long upper = 1L << powerUp;
+    long lower = 1L << powerDown;
+    int power = (optimalFileCount - lower <= upper - optimalFileCount) ? powerDown : powerUp;
     return Math.max(MIN_BUCKETS, Math.min(MAX_BUCKETS, 1 << power));
   }
 
