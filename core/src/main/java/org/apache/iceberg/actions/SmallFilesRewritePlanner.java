@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -32,6 +33,7 @@ import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.NullOrder;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
@@ -112,6 +114,15 @@ public class SmallFilesRewritePlanner
 
   public static final double DELETE_RATIO_THRESHOLD_DEFAULT = 0.3;
 
+  /**
+   * When set, files older than this many seconds bypass the min-input-files check.
+   * Uses dataSequenceNumber to determine file age via snapshot timestamps.
+   * Value of 0 disables this feature (default).
+   */
+  public static final String MERGE_OLDER_THAN = "merge-older-than";
+
+  public static final long MERGE_OLDER_THAN_DEFAULT = 0;
+
   private final Expression filter;
   private final Long snapshotId;
   private final boolean caseSensitive;
@@ -128,6 +139,8 @@ public class SmallFilesRewritePlanner
   private boolean useIdentifierKeys;
   private boolean useUuidPrefixBucketing;
   private int numBuckets;
+  private long mergeOlderThanMs;
+  private Map<Long, Long> seqToTimestamp;
 
   public SmallFilesRewritePlanner(Table table) {
     this(table, Expressions.alwaysTrue());
@@ -160,6 +173,7 @@ public class SmallFilesRewritePlanner
         .add(DELETE_FILES_ONLY)
         .add(DELETE_FILE_THRESHOLD)
         .add(DELETE_RATIO_THRESHOLD)
+        .add(MERGE_OLDER_THAN)
         .build();
   }
 
@@ -200,6 +214,18 @@ public class SmallFilesRewritePlanner
     this.deleteRatioThreshold =
         PropertyUtil.propertyAsDouble(
             options, DELETE_RATIO_THRESHOLD, DELETE_RATIO_THRESHOLD_DEFAULT);
+
+    long mergeOlderThanSec =
+        PropertyUtil.propertyAsLong(options, MERGE_OLDER_THAN, MERGE_OLDER_THAN_DEFAULT);
+    this.mergeOlderThanMs = mergeOlderThanSec * 1000;
+    if (mergeOlderThanMs > 0) {
+      this.seqToTimestamp = buildSeqToTimestamp();
+      LOG.info(
+          "SMALL_FILES [{}]: merge-older-than={}s, seqToTimestamp entries={}",
+          table().name(),
+          mergeOlderThanSec,
+          seqToTimestamp.size());
+    }
 
     List<String> columns;
     if (useIdentifierKeys) {
@@ -343,6 +369,58 @@ public class SmallFilesRewritePlanner
   /** Returns true if file has delete files that need processing. */
   private boolean hasDeletes(FileScanTask task) {
     return tooManyDeletes(task) || tooHighDeleteRatio(task);
+  }
+
+  /** Builds a map from data sequence number to snapshot timestamp. */
+  private Map<Long, Long> buildSeqToTimestamp() {
+    Map<Long, Long> map = new HashMap<>();
+    for (Snapshot snapshot : table().snapshots()) {
+      map.put(snapshot.sequenceNumber(), snapshot.timestampMillis());
+    }
+    return map;
+  }
+
+  /** Returns true if a file is older than merge-older-than threshold. */
+  private boolean isFileOld(FileScanTask task, long now) {
+    Long seq = task.file().dataSequenceNumber();
+    if (seq == null) {
+      return true; // v1 table or unknown sequence — treat as old
+    }
+
+    Long timestampMs = seqToTimestamp.get(seq);
+    if (timestampMs == null) {
+      return true; // snapshot expired — file is definitely old
+    }
+
+    return now - timestampMs >= mergeOlderThanMs;
+  }
+
+  /**
+   * Returns true if a group contains at least one file older than merge-older-than threshold.
+   */
+  private boolean oldEnough(List<FileScanTask> group) {
+    if (group.size() < 2 || mergeOlderThanMs <= 0 || seqToTimestamp == null) {
+      return false;
+    }
+
+    long now = System.currentTimeMillis();
+    for (FileScanTask task : group) {
+      if (isFileOld(task, now)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /** Counts files older than merge-older-than threshold. */
+  private long countOldFiles(List<FileScanTask> files) {
+    if (mergeOlderThanMs <= 0 || seqToTimestamp == null) {
+      return 0;
+    }
+
+    long now = System.currentTimeMillis();
+    return files.stream().filter(t -> isFileOld(t, now)).count();
   }
 
   @Override
@@ -529,7 +607,7 @@ public class SmallFilesRewritePlanner
     if (unsortedFallback) {
       // Unsorted fallback: group all small files without overlap analysis
       for (List<FileScanTask> group : groupFiles(smallFiles, targetFileSize)) {
-        if (enoughInputFiles(group)) {
+        if (enoughInputFiles(group) || oldEnough(group)) {
           long inputSize = inputSize(group);
           Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, targetFileSize);
           selectedGroups.add(
@@ -664,9 +742,11 @@ public class SmallFilesRewritePlanner
     List<List<FileScanTask>> lonerGroups = groupFiles(overlapResult.loners, lonerTargetFileSize);
 
     int overlapFilesCount = overlapResult.clusters.stream().mapToInt(List::size).sum();
+    long oldFilesCount = countOldFiles(smallFiles);
     LOG.info(
         "SMALL_FILES [{}]: partition={} | cleanZone: {} files -> {} groups | "
-            + "overlap: {} files ({} clusters) -> {} groups | loners: {} files -> {} groups",
+            + "overlap: {} files ({} clusters) -> {} groups | loners: {} files -> {} groups"
+            + " | old: {}/{}",
         table().name(),
         partition,
         cleanZoneFiles.size(),
@@ -675,11 +755,13 @@ public class SmallFilesRewritePlanner
         overlapResult.clusters.size(),
         overlapGroups.size(),
         overlapResult.loners.size(),
-        lonerGroups.size());
+        lonerGroups.size(),
+        oldFilesCount,
+        smallFiles.size());
 
     // Create groups for cleanZone and overlap files
     for (List<FileScanTask> group : cleanZoneGroups) {
-      if (enoughInputFiles(group)) {
+      if (enoughInputFiles(group) || oldEnough(group)) {
         long inputSize = inputSize(group);
         Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, targetFileSize);
         selectedGroups.add(
@@ -687,7 +769,7 @@ public class SmallFilesRewritePlanner
       }
     }
     for (List<FileScanTask> group : overlapGroups) {
-      if (enoughInputFiles(group)) {
+      if (enoughInputFiles(group) || oldEnough(group)) {
         long inputSize = inputSize(group);
         Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, targetFileSize);
         selectedGroups.add(
@@ -696,7 +778,7 @@ public class SmallFilesRewritePlanner
     }
     // Create groups for loners (smaller target so they grow gradually)
     for (List<FileScanTask> group : lonerGroups) {
-      if (enoughInputFiles(group)) {
+      if (enoughInputFiles(group) || oldEnough(group)) {
         long inputSize = inputSize(group);
         Integer groupSortOrderId = skipSorting ? null : getSortOrderIdForGroup(inputSize, lonerTargetFileSize);
         selectedGroups.add(
