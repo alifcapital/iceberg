@@ -711,22 +711,28 @@ public class SmallFilesRewritePlanner
     List<CoveredRange> coveredRanges = buildCoveredRanges(largeFiles);
 
     // Categorize small files into 3 groups:
-    // 1. Clean zone files - entirely outside large file bounds
+    // 1. Clean zone files - entirely inside one gap between large file bounds (keyed by gap index)
     // 2. Overlap files - inside large bounds but overlap with other small files
     // 3. Loners - inside large bounds, no overlap with other small files
-    List<FileScanTask> cleanZoneFiles = new ArrayList<>();
+    Map<Integer, List<FileScanTask>> cleanZoneFilesByGap = new java.util.TreeMap<>();
     List<FileScanTask> insideLargeFiles = new ArrayList<>();
+    int cleanZoneFilesCount = 0;
 
     for (FileScanTask task : smallFiles) {
-      if (isInCleanZone(task, coveredRanges)) {
-        cleanZoneFiles.add(task);
+      int gapIndex = cleanZoneGapIndex(task, coveredRanges);
+      if (gapIndex >= 0) {
+        cleanZoneFilesByGap.computeIfAbsent(gapIndex, k -> new ArrayList<>()).add(task);
+        cleanZoneFilesCount++;
       } else {
         insideLargeFiles.add(task);
       }
     }
 
-    // Group clean zone files using bin packing
-    List<List<FileScanTask>> cleanZoneGroups = groupFiles(cleanZoneFiles, targetFileSize);
+    // Bin pack each clean zone gap independently to avoid spanning across large bounds
+    List<List<FileScanTask>> cleanZoneGroups = new ArrayList<>();
+    for (List<FileScanTask> filesInGap : cleanZoneFilesByGap.values()) {
+      cleanZoneGroups.addAll(groupFiles(filesInGap, targetFileSize));
+    }
 
     // Group files inside large bounds by overlap clusters
     // Returns: list of clusters (overlapping files) + list of loners
@@ -744,12 +750,13 @@ public class SmallFilesRewritePlanner
     int overlapFilesCount = overlapResult.clusters.stream().mapToInt(List::size).sum();
     long oldFilesCount = countOldFiles(smallFiles);
     LOG.info(
-        "SMALL_FILES [{}]: partition={} | cleanZone: {} files -> {} groups | "
+        "SMALL_FILES [{}]: partition={} | cleanZone: {} files in {} gaps -> {} groups | "
             + "overlap: {} files ({} clusters) -> {} groups | loners: {} files -> {} groups"
             + " | old: {}/{}",
         table().name(),
         partition,
-        cleanZoneFiles.size(),
+        cleanZoneFilesCount,
+        cleanZoneFilesByGap.size(),
         cleanZoneGroups.size(),
         overlapFilesCount,
         overlapResult.clusters.size(),
@@ -867,18 +874,20 @@ public class SmallFilesRewritePlanner
   }
 
   /**
-   * Check if a small file fits entirely within a clean zone (gap between covered ranges).
+   * Returns the index of the clean zone gap that fully contains the file, or -1 if the file
+   * overlaps a large file.
    *
-   * <p>Clean zones are: (-∞, first.lower), (range1.upper, range2.lower), ..., (last.upper, +∞)
+   * <p>Gap indexing: 0 = (-∞, first.lower), i = (range[i-1].upper, range[i].lower) for 1..N-1,
+   * N = (last.upper, +∞). When there are no large files, all files are in gap 0.
    */
   @SuppressWarnings("unchecked")
-  private boolean isInCleanZone(FileScanTask task, List<CoveredRange> coveredRanges) {
+  private int cleanZoneGapIndex(FileScanTask task, List<CoveredRange> coveredRanges) {
     if (coveredRanges.isEmpty()) {
-      return true; // No large files - everything is clean
+      return 0; // No large files - everything is in the single open gap
     }
 
     if (columnFieldIds.isEmpty()) {
-      return false;
+      return -1;
     }
 
     int fieldId = columnFieldIds.get(0);
@@ -887,7 +896,7 @@ public class SmallFilesRewritePlanner
     ByteBuffer lowerBuf = task.file().lowerBounds().get(fieldId);
     ByteBuffer upperBuf = task.file().upperBounds().get(fieldId);
     if (lowerBuf == null || upperBuf == null) {
-      return false;
+      return -1;
     }
 
     Comparable<Object> fileLower =
@@ -895,31 +904,30 @@ public class SmallFilesRewritePlanner
     Comparable<Object> fileUpper =
         (Comparable<Object>) Conversions.fromByteBuffer(type, upperBuf);
 
-    // Check if file is before first covered range
+    // Gap 0: before first covered range
     CoveredRange first = coveredRanges.get(0);
     if (fileUpper.compareTo(first.lower) < 0) {
-      return true; // File is entirely before first large file
+      return 0;
     }
 
-    // Check if file is after last covered range
-    CoveredRange last = coveredRanges.get(coveredRanges.size() - 1);
+    // Gap N: after last covered range
+    int n = coveredRanges.size();
+    CoveredRange last = coveredRanges.get(n - 1);
     if (fileLower.compareTo(last.upper) > 0) {
-      return true; // File is entirely after last large file
+      return n;
     }
 
-    // Check if file fits in a gap between covered ranges
-    for (int i = 0; i < coveredRanges.size() - 1; i++) {
+    // Gaps 1..N-1: between range[i-1] and range[i]
+    for (int i = 0; i < n - 1; i++) {
       CoveredRange current = coveredRanges.get(i);
       CoveredRange next = coveredRanges.get(i + 1);
 
-      // Gap is (current.upper, next.lower)
-      // File fits if fileLower > current.upper AND fileUpper < next.lower
       if (fileLower.compareTo(current.upper) > 0 && fileUpper.compareTo(next.lower) < 0) {
-        return true;
+        return i + 1;
       }
     }
 
-    return false; // File overlaps with some large file
+    return -1; // overlaps a large file
   }
 
   /**
