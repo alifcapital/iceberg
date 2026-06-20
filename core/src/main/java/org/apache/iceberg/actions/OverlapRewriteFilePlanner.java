@@ -224,10 +224,9 @@ public class OverlapRewriteFilePlanner
     // UUID prefix bucketing
     this.useUuidPrefixBucketing =
         PropertyUtil.propertyAsBoolean(options, USE_UUID_PREFIX_BUCKETING, false);
-    if (useUuidPrefixBucketing) {
-      long totalSize = getTotalFilesSize();
-      this.numBuckets = UuidBucketUtil.computeBuckets(totalSize, targetFileSize());
-    }
+    // numBuckets is computed per-partition in plan() from each partition's own size.
+    // Deriving it from the whole-table total-files-size caps every partition at MAX_BUCKETS
+    // and shatters each partition into ~1024 tiny files regardless of its actual size.
   }
 
   @Override
@@ -268,6 +267,12 @@ public class OverlapRewriteFilePlanner
     for (Map.Entry<StructLike, List<FileScanTask>> entry : filesByPartition.entrySet()) {
       StructLike partition = entry.getKey();
       List<FileScanTask> partitionFiles = entry.getValue();
+
+      if (useUuidPrefixBucketing) {
+        // Size the UUID buckets by this partition's own size, not the whole table.
+        long partitionSize = partitionFiles.stream().mapToLong(FileScanTask::length).sum();
+        this.numBuckets = UuidBucketUtil.computeBuckets(partitionSize, targetFileSize());
+      }
 
       // Filter files that have bounds for all columns and are above min size
       List<FileScanTask> validFiles =
@@ -1547,25 +1552,6 @@ public class OverlapRewriteFilePlanner
         expectedOutputFiles);
   }
 
-  /** Gets total files size from snapshot summary. */
-  private long getTotalFilesSize() {
-    if (table().currentSnapshot() == null) {
-      return 0;
-    }
-
-    String totalSizeStr = table().currentSnapshot().summary().get("total-files-size");
-    if (totalSizeStr == null) {
-      return 0;
-    }
-
-    try {
-      return Long.parseLong(totalSizeStr);
-    } catch (NumberFormatException e) {
-      LOG.warn(
-          "OVERLAP [{}]: Cannot parse total-files-size: {}", table().name(), totalSizeStr, e);
-      return 0;
-    }
-  }
 
   /**
    * Get the bucket range [minBucket, maxBucket] for a file.

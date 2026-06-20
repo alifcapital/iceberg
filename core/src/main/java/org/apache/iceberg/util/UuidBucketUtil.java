@@ -50,7 +50,24 @@ public class UuidBucketUtil {
       return 0;
     }
 
-    long optimalFileCount = Math.max(1, totalSize / targetFileSize);
+    return bucketsFromFileCount(Math.max(1, totalSize / targetFileSize));
+  }
+
+  /**
+   * Computes the number of buckets from an already-known optimal output file count.
+   *
+   * <p>Returns the nearest power of 2, clamped to [MIN_BUCKETS, MAX_BUCKETS]. Use this when the
+   * desired number of output files is already known (e.g. per partition or per file group), instead
+   * of deriving it from a whole-table total size.
+   *
+   * @param optimalFileCount desired number of output files
+   * @return number of buckets, or 0 if input is invalid
+   */
+  public static int bucketsFromFileCount(long optimalFileCount) {
+    if (optimalFileCount <= 0) {
+      return 0;
+    }
+
     int powerUp = Math.max(0, (int) Math.ceil(Math.log((double) optimalFileCount) / Math.log(2)));
     int powerDown = Math.max(0, powerUp - 1);
     long upper = 1L << powerUp;

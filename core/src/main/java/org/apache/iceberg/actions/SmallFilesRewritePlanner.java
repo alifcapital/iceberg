@@ -273,10 +273,9 @@ public class SmallFilesRewritePlanner
 
     this.useUuidPrefixBucketing =
         PropertyUtil.propertyAsBoolean(options, USE_UUID_PREFIX_BUCKETING, false);
-    if (useUuidPrefixBucketing) {
-      long totalSize = getTotalFilesSize();
-      this.numBuckets = UuidBucketUtil.computeBuckets(totalSize, targetFileSize());
-    }
+    // numBuckets is computed per-partition in plan() from each partition's own size.
+    // Deriving it from the whole-table total-files-size caps every partition at MAX_BUCKETS
+    // and shatters each partition into ~1024 tiny files regardless of its actual size.
 
     // Initialize sort order when identifier keys are available
     if (useIdentifierKeys && !columnFieldIds.isEmpty()) {
@@ -456,6 +455,12 @@ public class SmallFilesRewritePlanner
     for (Map.Entry<StructLike, List<FileScanTask>> entry : filesByPartition.entrySet()) {
       StructLike partition = entry.getKey();
       List<FileScanTask> partitionFiles = entry.getValue();
+
+      if (useUuidPrefixBucketing) {
+        // Size the UUID buckets by this partition's own size, not the whole table.
+        long partitionSize = partitionFiles.stream().mapToLong(FileScanTask::length).sum();
+        this.numBuckets = UuidBucketUtil.computeBuckets(partitionSize, targetFileSize());
+      }
 
       List<FileScanTask> filesWithBounds;
       if (unsortedFallback) {
@@ -1129,24 +1134,6 @@ public class SmallFilesRewritePlanner
         inputSplitSize(inputSize),
         expectedOutputFiles(inputSize),
         sortOrderId);
-  }
-
-  /** Gets total files size from snapshot summary. */
-  private long getTotalFilesSize() {
-    if (table().currentSnapshot() == null) {
-      return 0;
-    }
-
-    String totalSizeStr = table().currentSnapshot().summary().get("total-files-size");
-    if (totalSizeStr == null) {
-      return 0;
-    }
-
-    try {
-      return Long.parseLong(totalSizeStr);
-    } catch (NumberFormatException e) {
-      return 0;
-    }
   }
 
   /**

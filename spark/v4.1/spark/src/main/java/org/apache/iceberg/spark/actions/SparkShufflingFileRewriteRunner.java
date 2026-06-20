@@ -102,7 +102,6 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
   private int numShufflePartitionsPerFile;
   private String rowGroupSizeBytes;
-  private int uuidBuckets;
   private boolean useUuidPrefixBucketingOption;
 
   protected SparkShufflingFileRewriteRunner(SparkSession spark, Table table) {
@@ -152,52 +151,8 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     super.init(options);
     this.numShufflePartitionsPerFile = numShufflePartitionsPerFile(options);
     this.rowGroupSizeBytes = options.get(TARGET_ROW_GROUP_SIZE_BYTES);
-    this.uuidBuckets = computeUuidBuckets(options);
     this.useUuidPrefixBucketingOption =
         Boolean.parseBoolean(options.getOrDefault(USE_UUID_PREFIX_BUCKETING, "false"));
-  }
-
-  /**
-   * Computes number of buckets for UUID prefix bucketing based on table size.
-   * Uses total-files-size from snapshot summary.
-   */
-  private int computeUuidBuckets(Map<String, String> options) {
-    if (table().currentSnapshot() == null) {
-      return 0;
-    }
-
-    String totalSizeStr = table().currentSnapshot().summary().get("total-files-size");
-    if (totalSizeStr == null) {
-      LOG.debug(
-          "{} [{}]: Cannot compute UUID buckets: total-files-size not in snapshot summary",
-          description(),
-          table().name());
-      return 0;
-    }
-
-    long totalSize;
-    try {
-      totalSize = Long.parseLong(totalSizeStr);
-    } catch (NumberFormatException e) {
-      LOG.warn(
-          "{} [{}]: Cannot parse total-files-size from snapshot summary: {}",
-          description(),
-          table().name(),
-          totalSizeStr,
-          e);
-      return 0;
-    }
-
-    long targetFileSize =
-        PropertyUtil.propertyAsLong(
-            options,
-            org.apache.iceberg.actions.RewriteDataFiles.TARGET_FILE_SIZE_BYTES,
-            PropertyUtil.propertyAsLong(
-                table().properties(),
-                org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
-                org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT));
-
-    return UuidBucketUtil.computeBuckets(totalSize, targetFileSize);
   }
 
   @Override
@@ -254,7 +209,10 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
     SortOrder[] ordering = Spark3Util.toOrdering(outputSortOrder(groupSortOrder, group, outputSpec));
     int numShufflePartitions = Math.max(1, expectedOutputFiles * numShufflePartitionsPerFile);
 
-    // Check if UUID prefix bucketing is enabled and applicable
+    // Check if UUID prefix bucketing is enabled and applicable.
+    // Buckets are sized from this group's own expected output file count, not the whole-table
+    // total-files-size (which capped every group at MAX_BUCKETS and produced tiny files).
+    int uuidBuckets = UuidBucketUtil.bucketsFromFileCount(expectedOutputFiles);
     if (useUuidPrefixBucketing() && uuidBuckets > 0) {
       org.apache.iceberg.SortOrder uuidSortOrder = uuidBucketingSortOrder(groupSortOrder);
       if (isFirstSortColumnUuid(uuidSortOrder, group)) {
